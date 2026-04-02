@@ -170,6 +170,14 @@ func (s *Server) Run(ctx context.Context) error {
 				continue
 			}
 		}
+		// Disable Nagle on every accepted connection. The VPN tunnel
+		// forwards inner TCP ACKs as small frames; Nagle would delay them
+		// by up to one RTT (~118 ms) and kill client throughput.
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+			_ = tc.SetReadBuffer(4 * 1024 * 1024)
+			_ = tc.SetWriteBuffer(4 * 1024 * 1024)
+		}
 		go s.handleConn(ctx, conn)
 	}
 }
