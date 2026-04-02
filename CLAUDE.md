@@ -277,3 +277,21 @@ Wire format: каждый пакет на utun предваряется 4-бай
 
 **Тесты:** 36 тестов, 100% pass  
 **Запуск:** `cd client && python3 -m pytest test_tun_macos.py -v`
+
+### ЗАДАЧА 13 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `client/dns.py`, `client/test_dns.py`
+
+Реализована DNS leak protection для macOS:
+- `InterfaceDNS{interface, servers, search_domains}` — сохранённая конфигурация DNS одного интерфейса
+- `DNSSnapshot{interfaces, resolv_conf}` — полный снимок DNS всех активных сетевых служб
+- `take_snapshot(interfaces)` — захват текущей конфигурации DNS через `networksetup`
+- `restore_snapshot(snapshot)` — восстановление оригинальной конфигурации + сброс кеша
+- `_get_active_interfaces()` — перечисление активных служб через `networksetup -listallnetworkservices`
+- `_get_interface_dns(iface)` / `_set_interface_dns(iface, servers, search_domains)` — чтение/запись DNS серверов и search domains
+- `_build_resolv_conf()` / `_read_resolv_conf()` / `_write_resolv_conf()` — управление `/etc/resolv.conf`
+- `_flush_dns_cache()` — сброс кеша через `dscacheutil -flushcache` + `killall -HUP mDNSResponder`
+- `DNSLeakProtection` — основной класс: `start()`, `stop()`, `update_servers()`, context manager, потокобезопасен
+- `dns_protection_for_vpn(gateway_ip)` — фабрика: создаёт DNSLeakProtection используя VPN gateway как DNS сервер
+
+**Тесты:** 45 тестов, все pass  
+**Запуск:** `cd client && python3 -m pytest test_dns.py -v`
