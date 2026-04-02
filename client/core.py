@@ -556,9 +556,11 @@ class MuxStream:
         self._read_lock = threading.Lock()
         self._closed = threading.Event()
         self._remote_fin = threading.Event()
-        # Queue for incoming data chunks; bounded to provide backpressure
+        # Queue for incoming data chunks; bounded to provide backpressure.
+        # 2048 × 1500-byte packets ≈ 3 MB — matches the 4 MB socket buffer
+        # so that the reader thread can drain without stalling the TCP window.
         import queue
-        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=512)
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=2048)
 
     def write(self, data: bytes) -> None:
         if self._closed.is_set():
