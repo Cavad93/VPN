@@ -65,6 +65,26 @@ func GenerateKeyPair() (*KeyPair, error) {
 	return kp, nil
 }
 
+// KeyPairFromPrivate derives a KeyPair from a raw 32-byte private key.
+// The public key is computed as X25519(privateKey, Basepoint).
+func KeyPairFromPrivate(priv []byte) (*KeyPair, error) {
+	if len(priv) != KeySize {
+		return nil, fmt.Errorf("crypto: private key must be %d bytes", KeySize)
+	}
+	kp := &KeyPair{}
+	copy(kp.PrivateKey[:], priv)
+	// RFC 7748 clamp
+	kp.PrivateKey[0] &= 248
+	kp.PrivateKey[31] &= 127
+	kp.PrivateKey[31] |= 64
+	pub, err := curve25519.X25519(kp.PrivateKey[:], curve25519.Basepoint)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: derive public key: %w", err)
+	}
+	copy(kp.PublicKey[:], pub)
+	return kp, nil
+}
+
 // DiffieHellman выполняет X25519 Diffie-Hellman операцию.
 // Возвращает общий секрет длиной KeySize байт.
 func DiffieHellman(privateKey, peerPublicKey [KeySize]byte) ([KeySize]byte, error) {

@@ -709,11 +709,15 @@ class ClientMux:
 
     def _read_loop(self) -> None:
         """Background thread: read mux frames and dispatch to streams."""
+        import socket as _socket
         while not self._closed.is_set():
             try:
                 frame_data = self._conn.read_message()
+            except (_socket.timeout, TimeoutError):
+                # Transient read timeout — not a connection error, keep going.
+                continue
             except Exception as exc:
-                logger.debug("mux_read_loop_error", error=str(exc))
+                logger.warning("mux_read_loop_error", error=str(exc))
                 self._closed.set()
                 # Signal all streams
                 with self._streams_lock:
@@ -826,14 +830,19 @@ class VPNClient:
         self._sock = socket.create_connection(
             (host, port), timeout=self._config.connect_timeout
         )
-        self._sock.settimeout(self._config.read_timeout)
-        # Disable Nagle: VPN packets must not be delayed by OS coalescing.
+        # TCP_NODELAY: disable Nagle — VPN forwards TCP ACKs from inner
+        # connections; Nagle would buffer them for up to one RTT (118 ms),
+        # preventing the remote server from advancing its send window and
+        # killing throughput 10-20×.
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        # 4 MB socket buffers: with Russia-Kazakhstan RTT ~100 ms the default
-        # 256 KB buffer caps throughput at ~2 Mbps (BDP = buffer / RTT).
+        # Large socket buffers: bandwidth-delay product for 30 Mbps × 118 ms
+        # ≈ 440 KB; use 4 MB to leave plenty of headroom.
         _BUF_SIZE = 4 * 1024 * 1024
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _BUF_SIZE)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _BUF_SIZE)
+        # After handshake switch to fully blocking reads so the mux read loop
+        # never receives spurious socket.timeout exceptions that close the conn.
+        self._sock.settimeout(None)
         self._log.debug("tcp_connected")
 
         # 2. TLS obfuscation
