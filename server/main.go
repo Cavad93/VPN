@@ -555,6 +555,16 @@ func writeHandshakeMsg(conn net.Conn, msg []byte) error {
 // 65535 payload + 16-byte ChaCha20-Poly1305 AEAD tag.
 const maxNoiseFrame = 65535 + 16
 
+// noiseWritePool pools the length-prefixed frame buffers used in
+// noiseConn.Write, eliminating one make() per transmitted packet.
+// Typical capacity: 2 (length header) + 1500 (IP MTU) + 16 (AEAD tag) = 1518.
+var noiseWritePool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 2+1500+16)
+		return &b
+	},
+}
+
 // noiseConn wraps a net.Conn with Noise session encryption.
 type noiseConn struct {
 	conn    net.Conn
@@ -579,10 +589,20 @@ func (nc *noiseConn) Write(p []byte) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("noiseConn encrypt: %w", err)
 	}
-	frame := make([]byte, 2+len(ciphertext))
+
+	// Borrow a frame buffer from the pool (avoids one make() per packet).
+	need := 2 + len(ciphertext)
+	bp := noiseWritePool.Get().(*[]byte)
+	if cap(*bp) < need {
+		*bp = make([]byte, need)
+	}
+	frame := (*bp)[:need]
 	binary.BigEndian.PutUint16(frame[:2], uint16(len(ciphertext)))
 	copy(frame[2:], ciphertext)
-	if _, err := nc.conn.Write(frame); err != nil {
+
+	_, err = nc.conn.Write(frame)
+	noiseWritePool.Put(bp)
+	if err != nil {
 		return 0, err
 	}
 	return len(p), nil
