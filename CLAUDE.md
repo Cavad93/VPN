@@ -235,3 +235,25 @@ Wire format: 7-байтный заголовок (streamID uint32 + type uint8 +
 
 **Тесты:** 24 теста, покрытие 85.3%  
 **Запуск:** `cd server && go test ./config/ -v -cover`
+
+### ЗАДАЧА 11 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `client/core.py`, `client/test_core.py`, `client/requirements.txt`
+
+Реализован Python клиент VPN — полный стек протокола:
+- `KeyPair` + `generate_key_pair()` + `load_key_pair_from_file(path)` — X25519 ключевые пары (RFC 7748)
+- `dh(priv, pub_bytes)` — X25519 Diffie-Hellman, защита от нулевого ключа
+- `noise_hkdf(ck, ikm, n)` — HKDF функция Noise протокола (HMAC-SHA256, 2 или 3 выхода)
+- `NoiseCipherState` — ChaCha20-Poly1305 с nonce = 4 нулевых байта + 8-байт LE счётчик
+- `NoiseSymmetricState` — mixHash, mixKey, encryptAndHash, decryptAndHash, split
+- `NoiseHandshake` — инициатор Noise_XX (write_message1, read_message2, write_message3)
+- `ObfsConn` — TLS-обфускация (client_handshake, server_handshake, read/write)
+- `NoiseConn` — шифрование трафика с 2-байт BE length prefix поверх ObfsConn
+- `MuxStream` — виртуальный поток (read, write, read_exactly, close, FIN handling)
+- `ClientMux` — мультиплексор с чётными stream ID (2,4,6…), фоновый read_loop
+- `RouteInfo` — IP assignment (assigned_ip, prefix_len, gateway, cidr, network)
+- `VPNConfig` + `VPNClient` — полный клиент (connect, disconnect, send_packet, recv_packet)
+
+Зависимости: `cryptography>=41.0.0`, `structlog>=23.0.0`
+
+**Тесты:** 58 тестов, покрытие 91%  
+**Запуск:** `cd client && python3 -m pytest test_core.py -v`

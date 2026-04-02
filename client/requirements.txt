@@ -1,0 +1,2 @@
+cryptography>=41.0.0
+structlog>=23.0.0
