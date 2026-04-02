@@ -834,6 +834,12 @@ func main() {
 	}
 	defer tun.Close()
 
+	if err := ConfigureTun("vpn0", cfg.TunCIDR); err != nil {
+		// Non-fatal: the interface may already be configured (e.g. after restart),
+		// or the admin may prefer to configure it manually via netsh / ip commands.
+		logger.Warn("TUN configuration failed — interface may need manual setup", "err", err)
+	}
+
 	srv, err := NewServer(cfg, kp, tun, nil, logger)
 	if err != nil {
 		logger.Error("failed to create server", "err", err)

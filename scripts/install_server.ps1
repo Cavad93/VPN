@@ -81,6 +81,12 @@ $Script:GoVersion     = "1.22.4"
 $Script:GoInstallerURL = "https://go.dev/dl/go${Script:GoVersion}.windows-amd64.msi"
 $Script:GitInstallerURL = "https://github.com/git-for-windows/git/releases/download/v2.45.2.windows.1/Git-2.45.2-64-bit.exe"
 $Script:LogFile       = Join-Path $InstallDir "install.log"
+# Wintun: kernel TUN driver used by the Go server (golang.zx2c4.com/wintun).
+# The zip contains wintun.dll for amd64; we extract it next to the binary.
+$Script:WintunVersion = "0.14.1"
+$Script:WintunURL     = "https://www.wintun.net/builds/wintun-$($Script:WintunVersion).zip"
+$Script:TunName       = "CavadVPN"      # Wintun adapter FriendlyName
+$Script:TunCIDRLocal  = $TunCIDR        # e.g. "10.8.0.1/24"
 
 # ─── Вспомогательные функции ──────────────────────────────────────────────────
 
@@ -275,6 +281,13 @@ function Build-Server {
         $env:GOARCH = "amd64"
         $env:CGO_ENABLED = "0"
 
+        # Обновляем зависимости (добавляет wintun в go.sum если отсутствует)
+        Write-Log "go mod tidy..."
+        go mod tidy 2>&1 | ForEach-Object { Write-Log $_ }
+        if ($LASTEXITCODE -ne 0) {
+            throw "go mod tidy завершился с ошибкой (exit code $LASTEXITCODE)"
+        }
+
         # Загружаем зависимости
         Write-Log "go mod download..."
         go mod download 2>&1 | ForEach-Object { Write-Log $_ }
@@ -427,24 +440,135 @@ function Enable-IPRouting {
     Write-Log "IP маршрутизация включена (вступит в силу после перезагрузки)." -Level SUCCESS
 }
 
-function Install-TAP {
+function Install-Wintun {
     <#
     .SYNOPSIS
-    Устанавливает TAP-Windows адаптер (OpenVPN/WireGuard TAP driver).
-    Требуется для TUN/TAP на Windows.
+    Скачивает wintun.dll и кладёт её рядом с бинарником сервера.
+    Wintun — высокопроизводительный TUN-драйвер ядра Windows (используется WireGuard).
+    Без wintun.dll сервер не сможет создать TUN-интерфейс.
     #>
-    Write-Log "Проверка TAP адаптера..."
-    $tapAdapter = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceDescription -like "*TAP*" }
-    if ($tapAdapter) {
-        Write-Log "TAP адаптер уже установлен: $($tapAdapter.Name)" -Level SUCCESS
+    param(
+        [string]$BinaryDir  # директория, куда положить wintun.dll
+    )
+
+    $dllPath = Join-Path $BinaryDir "wintun.dll"
+    if (Test-Path $dllPath) {
+        Write-Log "wintun.dll уже присутствует: $dllPath" -Level SUCCESS
         return
     }
 
-    Write-Log "TAP адаптер не найден." -Level WARN
-    Write-Log "Для полноценной работы TUN/TAP установите один из вариантов:" -Level WARN
-    Write-Log "  - Wintun:    https://www.wintun.net/" -Level WARN
-    Write-Log "  - TAP-Windows: входит в состав OpenVPN или WireGuard для Windows" -Level WARN
-    Write-Log "Сервер может работать без TUN на stub-платформах (только relay режим)." -Level WARN
+    Write-Log "Скачивание Wintun $($Script:WintunVersion)..."
+    $zipPath = Join-Path $env:TEMP "wintun.zip"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $Script:WintunURL -OutFile $zipPath -UseBasicParsing
+    }
+    catch {
+        Write-Log "Не удалось скачать Wintun: $_" -Level ERROR
+        Write-Log "Скачайте wintun.dll вручную с https://www.wintun.net/ и поместите в: $BinaryDir" -Level WARN
+        return
+    }
+
+    Write-Log "Распаковка wintun.dll (amd64)..."
+    $extractDir = Join-Path $env:TEMP "wintun_extract"
+    Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+    # Внутри архива: wintun/bin/amd64/wintun.dll
+    $srcDll = Join-Path $extractDir "wintun\bin\amd64\wintun.dll"
+    if (-not (Test-Path $srcDll)) {
+        # Некоторые версии архива используют другой путь — ищем рекурсивно
+        $srcDll = Get-ChildItem -Path $extractDir -Filter "wintun.dll" -Recurse |
+                  Where-Object { $_.FullName -like "*amd64*" } |
+                  Select-Object -ExpandProperty FullName -First 1
+    }
+
+    if ($srcDll -and (Test-Path $srcDll)) {
+        Copy-Item -Path $srcDll -Destination $dllPath -Force
+        Write-Log "wintun.dll установлена: $dllPath" -Level SUCCESS
+    }
+    else {
+        Write-Log "wintun.dll не найдена в архиве. Поместите её вручную в: $BinaryDir" -Level WARN
+    }
+
+    # Cleanup
+    Remove-Item $zipPath       -Force -ErrorAction SilentlyContinue
+    Remove-Item $extractDir    -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Configure-TunAdapter {
+    <#
+    .SYNOPSIS
+    Назначает IP-адрес TUN-адаптеру через netsh и создаёт правило NAT (NetNAT).
+    Вызывается после первого запуска сервиса, когда адаптер появляется в системе.
+    Если адаптер ещё не появился — завершается без ошибки (ConfigureTun в Go повторит настройку).
+    #>
+    param(
+        [string]$AdapterName,   # FriendlyName Wintun-адаптера (например "CavadVPN")
+        [string]$CIDR           # e.g. "10.8.0.1/24"
+    )
+
+    # Разбираем CIDR
+    $parts   = $CIDR -split "/"
+    $ip      = $parts[0]
+    $prefix  = [int]$parts[1]
+    $mask    = ConvertTo-IPv4Mask -PrefixLen $prefix
+
+    # Ждём появления адаптера (до 15 сек)
+    $adapter = $null
+    for ($i = 0; $i -lt 15; $i++) {
+        $adapter = Get-NetAdapter -ErrorAction SilentlyContinue |
+                   Where-Object { $_.InterfaceDescription -like "*$AdapterName*" -or $_.Name -eq $AdapterName }
+        if ($adapter) { break }
+        Start-Sleep -Seconds 1
+    }
+
+    if (-not $adapter) {
+        Write-Log "Адаптер '$AdapterName' не найден в системе (сервер настроит IP при запуске)." -Level WARN
+        return
+    }
+
+    Write-Log "Настройка IP $ip/$prefix на адаптере '$($adapter.Name)'..."
+    netsh interface ip set address name="$($adapter.Name)" static $ip $mask 2>&1 |
+        ForEach-Object { Write-Log $_ }
+
+    # NetNAT для выхода VPN-клиентов в интернет
+    $network = Get-IPv4Network -IP $ip -PrefixLen $prefix
+    $natName = "CavadVPN"
+    if (-not (Get-NetNat -Name $natName -ErrorAction SilentlyContinue)) {
+        Write-Log "Создание NetNAT для подсети $network/$prefix..."
+        New-NetNat -Name $natName -InternalIPInterfaceAddressPrefix "$network/$prefix" -ErrorAction SilentlyContinue |
+            Out-Null
+        Write-Log "NetNAT создан: $natName" -Level SUCCESS
+    }
+    else {
+        Write-Log "NetNAT '$natName' уже существует." -Level SUCCESS
+    }
+}
+
+function ConvertTo-IPv4Mask {
+    <#
+    .SYNOPSIS
+    Конвертирует длину префикса (например 24) в маску в dotted-decimal (255.255.255.0).
+    #>
+    param([int]$PrefixLen)
+    $mask = [uint32]([System.Math]::Pow(2, 32) - [System.Math]::Pow(2, 32 - $PrefixLen))
+    return "$([byte](($mask -shr 24) -band 0xFF)).$([byte](($mask -shr 16) -band 0xFF)).$([byte](($mask -shr 8) -band 0xFF)).$([byte]($mask -band 0xFF))"
+}
+
+function Get-IPv4Network {
+    <#
+    .SYNOPSIS
+    Возвращает адрес сети по IP и длине префикса.
+    #>
+    param([string]$IP, [int]$PrefixLen)
+    $ipBytes = ([System.Net.IPAddress]::Parse($IP)).GetAddressBytes()
+    [System.Array]::Reverse($ipBytes)
+    $ipUint  = [BitConverter]::ToUInt32($ipBytes, 0)
+    $maskUint = [uint32]([System.Math]::Pow(2, 32) - [System.Math]::Pow(2, 32 - $PrefixLen))
+    $netUint  = $ipUint -band $maskUint
+    $netBytes = [BitConverter]::GetBytes([uint32]$netUint)
+    [System.Array]::Reverse($netBytes)
+    return ([System.Net.IPAddress]::new($netBytes)).ToString()
 }
 
 function Start-VPNService {
@@ -494,6 +618,12 @@ function Uninstall-Server {
         Remove-NetFirewallRule -DisplayName $_ -ErrorAction SilentlyContinue
     }
 
+    # Удалить NetNAT если был создан
+    if (Get-NetNat -Name "CavadVPN" -ErrorAction SilentlyContinue) {
+        Write-Log "Удаление NetNAT CavadVPN..."
+        Remove-NetNat -Name "CavadVPN" -Confirm:$false -ErrorAction SilentlyContinue
+    }
+
     Write-Log "CavadVPN удалён." -Level SUCCESS
     Write-Log "Файлы в $InstallDir сохранены (ключи и конфиг)." -Level WARN
     Write-Log "Для полного удаления выполните: Remove-Item -Recurse -Force `"$InstallDir`"" -Level WARN
@@ -521,11 +651,15 @@ function Show-Summary {
     Write-Host "║  API адрес:    http://$APIAddr" -ForegroundColor Green
     Write-Host "║  API токен:    $Token" -ForegroundColor Yellow
     Write-Host "╠══════════════════════════════════════════════════════╣" -ForegroundColor Green
+    Write-Host "║  TUN адаптер:  $($Script:TunName) (Wintun)" -ForegroundColor Green
+    Write-Host "║  TUN подсеть:  $TunCIDR" -ForegroundColor Green
+    Write-Host "╠══════════════════════════════════════════════════════╣" -ForegroundColor Green
     Write-Host "║  Следующие шаги:                                     " -ForegroundColor Cyan
     Write-Host "║  1. Запишите API токен — он больше не отображается!  " -ForegroundColor Yellow
     Write-Host "║  2. Откройте http://$APIAddr в браузере" -ForegroundColor Cyan
     Write-Host "║  3. Добавьте публичный ключ клиента через веб-панель " -ForegroundColor Cyan
     Write-Host "║  4. Настройте клиент (client/core.py) на этот сервер " -ForegroundColor Cyan
+    Write-Host "║  5. Перезагрузите сервер для активации IP Forwarding " -ForegroundColor Yellow
     Write-Host "╚══════════════════════════════════════════════════════╝" -ForegroundColor Green
     Write-Host ""
     Write-Log "Установка завершена. Лог: $Script:LogFile" -Level SUCCESS
@@ -594,10 +728,10 @@ function Main {
         -KeyFilePath $keyFilePath `
         -Token       $Script:token
 
-    # 7. TAP адаптер (предупреждение)
-    Install-TAP
+    # 7. Wintun DLL — обязательна для работы TUN на Windows
+    Install-Wintun -BinaryDir $InstallDir
 
-    # 8. IP маршрутизация
+    # 8. IP маршрутизация (реестр + перезагрузка)
     Enable-IPRouting
 
     # 9. Установка Windows Service
@@ -615,7 +749,10 @@ function Main {
         Start-VPNService
     }
 
-    # 12. Итог
+    # 12. Настройка TUN-адаптера (IP + NAT) — после запуска сервиса адаптер появляется в системе
+    Configure-TunAdapter -AdapterName $Script:TunName -CIDR $TunCIDR
+
+    # 13. Итог
     Show-Summary -ConfigPath $configPath -Token $Script:token -KeyFilePath $keyFilePath
 }
 
