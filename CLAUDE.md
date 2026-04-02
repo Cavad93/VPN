@@ -29,8 +29,10 @@ cd server && go test ./crypto/ -v -cover
 server/
 ├── go.mod
 ├── crypto/
-│   ├── crypto.go       — X25519 DH + ChaCha20-Poly1305 AEAD
-│   ├── crypto_test.go  — 11 unit тестов (покрытие 81.6%)
+│   ├── crypto.go        — X25519 DH + ChaCha20-Poly1305 AEAD
+│   ├── crypto_test.go   — unit тесты crypto.go
+│   ├── handshake.go     — Noise_XX handshake протокол
+│   ├── handshake_test.go — unit тесты handshake
 │   └── README.md
 ```
 
@@ -50,3 +52,18 @@ server/
 **Тесты:** 11 тестов, покрытие 81.6%  
 **Зависимость:** `golang.org/x/crypto@v0.32.0`  
 **Запуск:** `cd server && go test ./crypto/ -v`
+
+### ЗАДАЧА 2 — ВЫПОЛНЕНО (2026-04-02)
+**Файл:** `server/crypto/handshake.go`
+
+Реализован Noise_XX handshake протокол (mutual authentication):
+- `NewHandshake(role, staticKP)` — создание HandshakeState для инициатора или ответчика
+- `WriteMessage1() / ReadMessage1(msg)` — обмен эфемерным ключом инициатора (-> e)
+- `WriteMessage2() / ReadMessage2(msg)` — ответчик отправляет ephemeral + encrypted static (<- e, ee, s, es)
+- `WriteMessage3() / ReadMessage3(msg)` — инициатор отправляет encrypted static + DH (-> s, se)
+- `Session{SendCipher, RecvCipher, RemoteStatic}` — результат handshake, независимые cipher states
+
+Внутренние компоненты: `noiseHKDF` (HMAC-SHA256), `noiseCipherState` (ChaCha20-Poly1305 + nonce counter), `noiseSymmetricState` (chaining key + transcript hash)
+
+**Тесты:** 22 теста суммарно, покрытие 80.4%  
+**Запуск:** `cd server && go test ./crypto/ -v -cover`
