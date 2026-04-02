@@ -414,7 +414,8 @@ class ObfsConn:
 
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
-        self._read_buf = b""
+        # Both buffers are bytearray: += is an in-place extend O(chunk), not O(total).
+        self._read_buf = bytearray()
         self._sock_buf = bytearray()  # bytearray avoids O(n) copy on each += unlike bytes
 
     def client_handshake(self) -> None:
@@ -441,9 +442,9 @@ class ObfsConn:
         """Read exactly n bytes, buffering across TLS records as needed."""
         while len(self._read_buf) < n:
             payload = self._read_record(TLS_RECORD_APPDATA)
-            self._read_buf += payload
-        result = self._read_buf[:n]
-        self._read_buf = self._read_buf[n:]
+            self._read_buf += payload  # bytearray += is O(chunk), not O(total)
+        result = bytes(self._read_buf[:n])
+        del self._read_buf[:n]  # in-place delete avoids creating a new bytearray
         return result
 
     def read_exactly(self, n: int) -> bytes:
