@@ -148,9 +148,11 @@ def browser_profile() -> TrafficProfile:
 
 
 def streaming_profile() -> TrafficProfile:
-    """Return a profile mimicking video streaming (Netflix/YouTube).
+    """Return a profile mimicking large file downloads and CDN traffic.
 
     Streaming traffic is very bursty with large payloads and short pauses.
+    Do NOT use Netflix/YouTube as reference — both are blocked in Russia and
+    DPI treating such patterns as suspicious.
     """
     buckets: List[SizeBucket] = [
         (512, 1400, 0.30),

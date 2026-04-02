@@ -25,9 +25,12 @@ import (
 // defaultSNIDomains is the built-in list of legitimate-looking domains.
 // These domains serve enormous global traffic volumes, making DPI fingerprinting
 // based on SNI alone ineffective.
+// NOTE: Only domains accessible in Russia are listed here.
+// Using blocked domains (youtube.com, netflix.com, instagram.com) as SNI
+// would make the traffic look suspicious to Russian DPI — those sites are
+// blocked, so any TLS handshake claiming to reach them is an anomaly.
 var defaultSNIDomains = []string{
 	"www.google.com",
-	"www.youtube.com",
 	"www.cloudflare.com",
 	"cdn.cloudflare.com",
 	"www.googleapis.com",
@@ -36,6 +39,7 @@ var defaultSNIDomains = []string{
 	"clients1.google.com",
 	"update.googleapis.com",
 	"www.gstatic.com",
+	"www.microsoft.com",
 }
 
 // SNISelector chooses the hostname to embed in the SNI extension of each

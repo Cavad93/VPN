@@ -96,7 +96,7 @@ CHROME_CIPHER_SUITES: list[int] = [
 # ---------------------------------------------------------------------------
 
 DOMAIN_POOL: list[str] = [
-    "www.youtube.com",
+    # Google (доступен в РФ)
     "www.google.com",
     "www.cloudflare.com",
     "www.googleapis.com",
@@ -104,28 +104,30 @@ DOMAIN_POOL: list[str] = [
     "ssl.gstatic.com",
     "www.gstatic.com",
     "accounts.google.com",
-    "www.instagram.com",
-    "www.facebook.com",
-    "static.cdninstagram.com",
-    "www.apple.com",
-    "cdn.apple.com",
-    "swdist.apple.com",
+    "ajax.googleapis.com",
+    # Microsoft (доступен в РФ)
     "www.microsoft.com",
     "login.microsoftonline.com",
     "www.office.com",
     "outlook.live.com",
+    "dl.delivery.mp.microsoft.com",
+    # Apple (доступен в РФ)
+    "www.apple.com",
+    "cdn.apple.com",
+    "swdist.apple.com",
+    "updates.cdn-apple.com",
+    # Cloudflare (доступен в РФ)
+    "cdn.cloudflare.com",
+    "ajax.cloudflare.com",
+    "1.1.1.1",
+    # Amazon AWS (доступен в РФ)
+    "www.amazon.com",
+    "s3.amazonaws.com",
+    "d1.awsstatic.com",
+    # GitHub (доступен в РФ)
     "www.github.com",
     "api.github.com",
     "objects.githubusercontent.com",
-    "www.netflix.com",
-    "assets.nflxext.com",
-    "www.twitch.tv",
-    "static.twitchsvc.net",
-    "cdn.cloudflare.com",
-    "ajax.cloudflare.com",
-    "www.amazon.com",
-    "images.amazon.com",
-    "www.bing.com",
 ]
 
 
