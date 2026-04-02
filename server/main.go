@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+
 	"golang.org/x/crypto/curve25519"
 
 	"github.com/cavad93/vpn/server/api"
@@ -169,6 +170,14 @@ func (s *Server) Run(ctx context.Context) error {
 				s.logger.Warn("accept error", "err", err)
 				continue
 			}
+		}
+		// Increase TCP socket buffers to match the bandwidth-delay product
+		// for Russia↔Kazakhstan (RTT ≈ 80-120 ms). Default Linux buffers
+		// (128-256 KB) cap throughput at ~2 Mbps; 4 MB allows ≥32 Mbps.
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetReadBuffer(4 << 20)  // 4 MB
+			tc.SetWriteBuffer(4 << 20) // 4 MB
+			tc.SetNoDelay(true)        // disable Nagle — VPN packets must not be coalesced by the OS
 		}
 		go s.handleConn(ctx, conn)
 	}
