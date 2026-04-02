@@ -23,6 +23,16 @@ import (
 	"sync"
 )
 
+// muxFramePool pools byte slices used to build mux frames and avoids a heap
+// allocation on every data packet.  Slices are returned with cap ≥ 1507 bytes
+// (7-byte header + 1500-byte typical IP MTU).
+var muxFramePool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, muxHeaderSize+1500)
+		return &b
+	},
+}
+
 // Frame types carried in the mux header.
 const (
 	FrameSYN  uint8 = 0x01 // open a new stream
@@ -131,20 +141,34 @@ func (m *Mux) Close() error {
 // the underlying NoiseConn encrypts them as a single message. This is
 // required for the Python client which expects one read_message() call to
 // return the complete frame (header + payload).
+//
+// The frame buffer is obtained from muxFramePool to avoid a heap allocation
+// on every data packet.
 func (m *Mux) writeFrame(streamID uint32, fType uint8, payload []byte) error {
-	frame := make([]byte, muxHeaderSize+len(payload))
+	need := muxHeaderSize + len(payload)
+
+	// Borrow a buffer from the pool, grow if needed.
+	bp := muxFramePool.Get().(*[]byte)
+	if cap(*bp) < need {
+		*bp = make([]byte, need)
+	}
+	frame := (*bp)[:need]
+
 	binary.BigEndian.PutUint32(frame[0:4], streamID)
 	frame[4] = fType
 	binary.BigEndian.PutUint16(frame[5:7], uint16(len(payload)))
 	copy(frame[muxHeaderSize:], payload)
 
 	m.writeMu.Lock()
-	defer m.writeMu.Unlock()
+	_, err := m.conn.Write(frame)
+	m.writeMu.Unlock()
 
-	if _, err := m.conn.Write(frame); err != nil {
-		return err
-	}
-	return nil
+	// Return the buffer to the pool only after Write completes; the buffer
+	// must not be reused while it may still be in the kernel send buffer.
+	// (conn.Write on a noiseConn copies into its own allocation.)
+	muxFramePool.Put(bp)
+
+	return err
 }
 
 // readLoop reads frames from the underlying connection and dispatches them to
