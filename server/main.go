@@ -399,10 +399,9 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 			continue
 		}
 
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
+		// tun.Write is a synchronous syscall; buf is safe to reuse after it returns.
 		cs.bytesIn.Add(uint64(n))
-		s.tun.Write(pkt) //nolint:errcheck
+		s.tun.Write(buf[:n]) //nolint:errcheck
 	}
 }
 
@@ -448,9 +447,9 @@ func (s *Server) routeFromTun(ctx context.Context) {
 			continue
 		}
 
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
-		if _, err := ds.Write(pkt); err == nil {
+		// ds.Write → mux.writeFrame already copies payload into a frame buffer,
+		// so we can pass buf[:n] directly without an extra allocation.
+		if _, err := ds.Write(buf[:n]); err == nil {
 			target.bytesOut.Add(uint64(n))
 		}
 	}

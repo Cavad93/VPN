@@ -194,10 +194,10 @@ func (m *Mux) readLoop() {
 
 		case FrameData:
 			if exists {
-				data := make([]byte, len(payload))
-				copy(data, payload)
+				// payload is a fresh allocation from readLoop — pass it directly,
+				// no extra copy needed.
 				select {
-				case s.readCh <- data:
+				case s.readCh <- payload:
 				default:
 					// Receive buffer full — drop the frame.
 					// The upper layer is responsible for flow control.

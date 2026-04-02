@@ -415,7 +415,7 @@ class ObfsConn:
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
         self._read_buf = b""
-        self._sock_buf = b""  # raw bytes not yet parsed into TLS records
+        self._sock_buf = bytearray()  # bytearray avoids O(n) copy on each += unlike bytes
 
     def client_handshake(self) -> None:
         """Send ClientHello, read ServerHello."""
@@ -461,13 +461,14 @@ class ObfsConn:
         # Fill the socket buffer in large 64 KB chunks so most calls return
         # from memory without a syscall.  Each recv(65536) typically delivers
         # ~45 complete TLS records at once.
+        # bytearray += is an in-place extend (O(chunk) not O(total)), unlike bytes.
         while len(self._sock_buf) < n:
             chunk = self._sock.recv(self._SOCK_RECV_SIZE)
             if not chunk:
                 raise ConnectionError("connection closed mid-read")
             self._sock_buf += chunk
-        result = self._sock_buf[:n]
-        self._sock_buf = self._sock_buf[n:]
+        result = bytes(self._sock_buf[:n])
+        del self._sock_buf[:n]
         return result
 
     def _read_record(self, want_type: int) -> bytes:
@@ -550,9 +551,9 @@ class MuxStream:
         self._read_lock = threading.Lock()
         self._closed = threading.Event()
         self._remote_fin = threading.Event()
-        # Queue for incoming data chunks
+        # Queue for incoming data chunks; bounded to provide backpressure
         import queue
-        self._queue: queue.Queue[bytes] = queue.Queue()
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=512)
 
     def write(self, data: bytes) -> None:
         if self._closed.is_set():
@@ -577,7 +578,7 @@ class MuxStream:
 
         while True:
             try:
-                data = self._queue.get(timeout=timeout if timeout is not None else 30.0)
+                data = self._queue.get(timeout=timeout if timeout is not None else 5.0)
                 return data
             except queue.Empty:
                 if self._remote_fin.is_set() or self._closed.is_set():
@@ -595,7 +596,7 @@ class MuxStream:
                 self._read_buf = self._read_buf[len(take):]
                 continue
             try:
-                data = self._queue.get(timeout=timeout if timeout is not None else 30.0)
+                data = self._queue.get(timeout=timeout if timeout is not None else 5.0)
                 if data == b"":
                     raise EOFError("stream closed before read_exactly completed")
                 self._read_buf = data

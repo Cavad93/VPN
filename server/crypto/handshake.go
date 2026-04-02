@@ -27,6 +27,7 @@
 package crypto
 
 import (
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
@@ -95,12 +96,18 @@ type noiseCipherState struct {
 	k      [KeySize]byte
 	n      uint64
 	hasKey bool
+	aead   cipher.AEAD // инициализируется один раз в initializeKey, переиспользуется для всех пакетов
 }
 
 func (cs *noiseCipherState) initializeKey(key [KeySize]byte) {
 	cs.k = key
 	cs.n = 0
 	cs.hasKey = true
+	aead, err := chacha20poly1305.New(cs.k[:])
+	if err != nil {
+		panic(fmt.Sprintf("noiseCipherState initializeKey: %v", err))
+	}
+	cs.aead = aead
 }
 
 // encryptWithAD шифрует plaintext с дополнительными данными.
@@ -111,15 +118,11 @@ func (cs *noiseCipherState) encryptWithAD(ad, plaintext []byte) ([]byte, error) 
 		copy(result, plaintext)
 		return result, nil
 	}
-	aead, err := chacha20poly1305.New(cs.k[:])
-	if err != nil {
-		return nil, fmt.Errorf("noiseCipherState encrypt: %w", err)
-	}
 	// Noise spec: nonce = 4 нулевых байта + 8-байтный little-endian счётчик
 	var nonce [NonceSize]byte
 	binary.LittleEndian.PutUint64(nonce[4:], cs.n)
 	cs.n++
-	return aead.Seal(nil, nonce[:], plaintext, ad), nil
+	return cs.aead.Seal(nil, nonce[:], plaintext, ad), nil
 }
 
 // decryptWithAD расшифровывает ciphertext с проверкой тега аутентификации.
@@ -129,14 +132,10 @@ func (cs *noiseCipherState) decryptWithAD(ad, ciphertext []byte) ([]byte, error)
 		copy(result, ciphertext)
 		return result, nil
 	}
-	aead, err := chacha20poly1305.New(cs.k[:])
-	if err != nil {
-		return nil, fmt.Errorf("noiseCipherState decrypt: %w", err)
-	}
 	var nonce [NonceSize]byte
 	binary.LittleEndian.PutUint64(nonce[4:], cs.n)
 	cs.n++
-	plaintext, err := aead.Open(nil, nonce[:], ciphertext, ad)
+	plaintext, err := cs.aead.Open(nil, nonce[:], ciphertext, ad)
 	if err != nil {
 		return nil, fmt.Errorf("noiseCipherState decrypt: аутентификация не прошла: %w", err)
 	}
