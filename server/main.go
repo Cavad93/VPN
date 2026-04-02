@@ -180,10 +180,11 @@ func (s *Server) Run(ctx context.Context) error {
 		// Increase TCP socket buffers to match the bandwidth-delay product
 		// for Russia↔Kazakhstan (RTT ≈ 80-120 ms). Default Linux buffers
 		// (128-256 KB) cap throughput at ~2 Mbps; 4 MB allows ≥32 Mbps.
+		// setForcedSocketBuffers uses SO_RCVBUFFORCE/SO_SNDBUFFORCE (Linux,
+		// CAP_NET_ADMIN) to bypass the net.core.rmem_max kernel limit.
 		if tc, ok := conn.(*net.TCPConn); ok {
-			tc.SetReadBuffer(4 << 20)  // 4 MB
-			tc.SetWriteBuffer(4 << 20) // 4 MB
-			tc.SetNoDelay(true)        // disable Nagle — VPN packets must not be coalesced by the OS
+			setForcedSocketBuffers(tc, 4<<20) // 4 MB, force-bypass rmem_max
+			tc.SetNoDelay(true)               // disable Nagle — VPN packets must not be coalesced
 		}
 		go s.handleConn(ctx, conn)
 	}
