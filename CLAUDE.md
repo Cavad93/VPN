@@ -216,3 +216,22 @@ Wire format: 7-байтный заголовок (streamID uint32 + type uint8 +
 
 **Тесты:** 9 тестов, покрытие 100%  
 **Запуск:** `cd server && go test ./service/ -v -cover`
+
+### ЗАДАЧА 10 — ВЫПОЛНЕНО (2026-04-02)
+**Файл:** `server/config/config.go`
+
+Реализована YAML-конфигурация сервера с генерацией ключей при первом запуске:
+- `ServerConfig{Listen, TunCIDR, PrivateKeyFile, AllowedKeys, API, Log}` — полная конфигурация сервера
+- `APIConfig{Listen, Token}` — настройки REST API
+- `LogConfig{Level, Format}` — настройки логирования (debug/info/warn/error, text/json)
+- `Default()` — значения по умолчанию (0.0.0.0:443, 10.8.0.1/24, info/text)
+- `Load(path)` — загрузка YAML файла; если файл отсутствует — создаёт его с defaults
+- `Save(path, cfg)` — сохранение конфигурации в YAML (режим 0600, создаёт директории)
+- `Validate()` — проверка корректности полей (listen, tun_cidr, log level/format, hex ключи)
+- `ParseAllowedKeys()` — декодирование AllowedKeys из hex строк в [][32]byte
+- `EnsureKeyFile(path)` — загрузка или генерация X25519 приватного ключа (RFC 7748 clamp, режим 0600)
+
+Зависимость: `gopkg.in/yaml.v3 v3.0.1`
+
+**Тесты:** 24 теста, покрытие 85.3%  
+**Запуск:** `cd server && go test ./config/ -v -cover`
