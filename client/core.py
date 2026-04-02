@@ -593,23 +593,33 @@ class MuxStream:
     def read_exactly(self, n: int, timeout: Optional[float] = None) -> bytes:
         """Read exactly n bytes, buffering across multiple chunks."""
         import queue
-        buf = b""
+        # bytearray accumulation is O(chunk) not O(total); no intermediate copies.
+        buf = bytearray()
+        pending = bytearray(self._read_buf)  # carry over any buffered tail
+        self._read_buf = b""
         while len(buf) < n:
-            if self._read_buf:
-                take = self._read_buf[:n - len(buf)]
-                buf += take
-                self._read_buf = self._read_buf[len(take):]
+            if pending:
+                need = n - len(buf)
+                if len(pending) <= need:
+                    buf += pending
+                    pending = bytearray()
+                else:
+                    buf += pending[:need]
+                    pending = pending[need:]
                 continue
             try:
                 data = self._queue.get(timeout=timeout if timeout is not None else 5.0)
                 if data == b"":
                     raise EOFError("stream closed before read_exactly completed")
-                self._read_buf = data
+                pending = bytearray(data)
             except queue.Empty:
                 if self._remote_fin.is_set() or self._closed.is_set():
                     raise EOFError("stream closed before read_exactly completed")
                 raise TimeoutError("stream read_exactly timeout")
-        return buf
+        # Save any unconsumed tail back to _read_buf
+        if pending:
+            self._read_buf = bytes(pending)
+        return bytes(buf)
 
     def close(self) -> None:
         if not self._closed.is_set():
