@@ -295,3 +295,25 @@ Wire format: каждый пакет на utun предваряется 4-бай
 
 **Тесты:** 45 тестов, все pass  
 **Запуск:** `cd client && python3 -m pytest test_dns.py -v`
+
+### ЗАДАЧА 14 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `client/killswitch.py`, `client/test_killswitch.py`
+
+Реализован VPN Kill Switch для macOS:
+- `KillSwitch` — основной класс управления блокировкой трафика
+- `KillSwitch.start(vpn_interface, server_ip)` — активация kill switch: загрузка PF anchor правил, блокировка всего трафика кроме разрешённых
+- `KillSwitch.stop()` — деактивация: очистка anchor, восстановление PF в исходное состояние
+- `KillSwitch.update(vpn_interface, server_ip)` — обновление правил без перезапуска
+- `KillSwitch.get_current_rules()` — чтение текущих правил из anchor
+- `create_kill_switch()` — фабричная функция
+
+Механизм: PF anchor `com.cavadvpn.killswitch` через `pfctl`. Разрешённый трафик при активном kill switch:
+- Loopback (lo0)
+- DHCP (UDP порты 67/68) для сохранения LAN адреса
+- Трафик к/от IP адреса VPN сервера (для переподключения)
+- Весь трафик через VPN tunnel интерфейс (utunX)
+
+Потокобезопасность: `threading.Lock`. Context manager: `with KillSwitch() as ks: ...`
+
+**Тесты:** 49 тестов, все pass  
+**Запуск:** `cd client && python3 -m pytest test_killswitch.py -v`
