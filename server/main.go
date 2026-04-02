@@ -185,6 +185,11 @@ func (s *Server) Run(ctx context.Context) error {
 		if tc, ok := conn.(*net.TCPConn); ok {
 			setForcedSocketBuffers(tc, 4<<20) // 4 MB, force-bypass rmem_max
 			tc.SetNoDelay(true)               // disable Nagle — VPN packets must not be coalesced
+			// TCP keepalive: probe idle connections every 30 s with 3 retries.
+			// Prevents ISP NAT/firewall from silently dropping "idle" VPN connections
+			// after a few minutes (common with Rostelecom / MTS stateful firewalls).
+			tc.SetKeepAlive(true)
+			tc.SetKeepAlivePeriod(30 * time.Second)
 		}
 		go s.handleConn(ctx, conn)
 	}
