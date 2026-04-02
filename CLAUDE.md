@@ -128,3 +128,21 @@ Wire format: TLS record header (5 байт: content_type + version 0x0303 + leng
 
 **Тесты:** 15 тестов, покрытие пакета transport 90.8%  
 **Запуск:** `cd server && go test ./transport/ -v -cover`
+
+### ЗАДАЧА 6 — ВЫПОЛНЕНО (2026-04-02)
+**Файл:** `server/transport/mux.go`
+
+Реализован мультиплексор виртуальных потоков:
+- `NewMux(conn, isClient)` — обёртка над net.Conn; клиент использует чётные stream ID (2,4,6…), сервер — нечётные (1,3,5…)
+- `Mux.OpenStream()` — открыть исходящий Stream (отправляет FrameSYN)
+- `Mux.AcceptStream(ctx)` — принять входящий Stream (блокирует до прихода SYN)
+- `Mux.Close()` — закрыть все Stream и соединение
+- `Stream.Write(p)` — запись данных (фрагментация при >65535 байт)
+- `Stream.Read(p)` — чтение данных; возвращает io.EOF при получении FrameFIN
+- `Stream.Close()` — отправляет FrameFIN, удаляет поток из карты
+
+Wire format: 7-байтный заголовок (streamID uint32 + type uint8 + length uint16) + payload.  
+Потокобезопасность: `writeMu` сериализует запись фреймов, `streamsMu` защищает карту потоков.
+
+**Тесты:** 14 тестов mux, покрытие пакета transport 90.0%  
+**Запуск:** `cd server && go test ./transport/ -v -cover`
