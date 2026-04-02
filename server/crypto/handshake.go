@@ -142,6 +142,23 @@ func (cs *noiseCipherState) decryptWithAD(ad, ciphertext []byte) ([]byte, error)
 	return plaintext, nil
 }
 
+// decryptWithADTo расшифровывает в предоставленный буфер dst[:0],
+// позволяя повторно использовать выделенную память.
+func (cs *noiseCipherState) decryptWithADTo(dst, ad, ciphertext []byte) ([]byte, error) {
+	if !cs.hasKey {
+		result := append(dst[:0], ciphertext...)
+		return result, nil
+	}
+	var nonce [NonceSize]byte
+	binary.LittleEndian.PutUint64(nonce[4:], cs.n)
+	cs.n++
+	plaintext, err := cs.aead.Open(dst[:0], nonce[:], ciphertext, ad)
+	if err != nil {
+		return nil, fmt.Errorf("noiseCipherState decrypt: аутентификация не прошла: %w", err)
+	}
+	return plaintext, nil
+}
+
 // noiseSymmetricState управляет chaining key и хешем во время handshake.
 type noiseSymmetricState struct {
 	cs noiseCipherState
@@ -249,6 +266,14 @@ func (sc *SessionCipher) Encrypt(plaintext, ad []byte) ([]byte, error) {
 // Decrypt расшифровывает ciphertext с проверкой аутентификации.
 func (sc *SessionCipher) Decrypt(ciphertext, ad []byte) ([]byte, error) {
 	return sc.cs.decryptWithAD(ad, ciphertext)
+}
+
+// DecryptTo расшифровывает ciphertext в предоставленный буфер dst,
+// избегая выделения памяти на каждый пакет. dst должен иметь достаточный
+// cap для plaintext (len(ciphertext) - 16 байт AEAD overhead).
+// Возвращает слайс plaintext из dst.
+func (sc *SessionCipher) DecryptTo(dst, ciphertext, ad []byte) ([]byte, error) {
+	return sc.cs.decryptWithADTo(dst, ad, ciphertext)
 }
 
 // NewHandshake создаёт новый HandshakeState для Noise_XX.

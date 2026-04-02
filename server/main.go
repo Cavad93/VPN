@@ -563,6 +563,9 @@ type noiseConn struct {
 	// recvBuf is a fixed-size scratch buffer reused for every Read call,
 	// eliminating per-packet heap allocations (≈800 allocs/s at 10 Mbps).
 	recvBuf [maxNoiseFrame]byte
+	// decryptBuf is a pre-allocated destination buffer for AEAD decryption,
+	// eliminating the make() call inside aead.Open on every received packet.
+	decryptBuf [65535]byte
 }
 
 // newNoiseConn creates a noiseConn wrapping conn with the given session.
@@ -622,9 +625,8 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 		return 0, err
 	}
 
-	// Decrypt in-place.  Cipher.Decrypt appends to dst=nil, returning a new
-	// slice, but the plaintext slice is short-lived; the copy below is O(n).
-	plaintext, err := nc.session.RecvCipher.Decrypt(nc.recvBuf[:frameLen], nil)
+	// Decrypt into pre-allocated buffer — zero allocation per packet.
+	plaintext, err := nc.session.RecvCipher.DecryptTo(nc.decryptBuf[:], nc.recvBuf[:frameLen], nil)
 	if err != nil {
 		return 0, fmt.Errorf("noiseConn decrypt: %w", err)
 	}

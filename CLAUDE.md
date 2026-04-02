@@ -541,7 +541,7 @@ Wire format обеспечивает статистическую неразли
 ### ОПТИМИЗАЦИЯ СКОРОСТИ — ВЫПОЛНЕНО (2026-04-02)
 **Файлы:** `server/sockopt_linux.go`, `server/tun_linux.go`, `server/main.go`, `server/transport/obfs.go`, `server/transport/mux.go`, `client/core.py`
 
-Проведено 9 циклов оптимизации для повышения пропускной способности VPN (базовые показатели: Down 2.6 Mbps, Up 3.3 Mbps, Ping 84ms):
+Проведено 10 циклов оптимизации для повышения пропускной способности VPN (базовые показатели: Down 2.6 Mbps, Up 3.3 Mbps, Ping 84ms):
 
 1. **DSCP CS1 → Default** — убрана маркировка "lower effort", ISP перестаёт деприоритизировать трафик
 2. **MTU 1420 → 1460** — увеличен полезный payload на 2.8% (safety margin 50→10 байт)
@@ -552,5 +552,6 @@ Wire format обеспечивает статистическую неразли
 7. **TCP_QUICKACK** — отключены delayed ACKs (−40ms per ACK), быстрее рост congestion window
 8. **atomic.Pointer[Stream]** — lock-free доступ к dataStream на hot path TUN→client
 9. **TCP BBR congestion control** — per-socket BBR вместо CUBIC, 2-5× throughput на high-latency линках
+10. **Zero-alloc AEAD decrypt** — pre-allocated decrypt buffer в noiseConn, устраняет heap alloc на каждый принятый пакет
 
 **Подробный лог:** `lodin.md`

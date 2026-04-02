@@ -50,6 +50,11 @@
 **Change:** Set TCP_CONGESTION="bbr" per socket (falls back to CUBIC if unavailable).
 **Impact:** HIGH — BBR probes actual bandwidth rather than relying on loss signals. On high-latency links (80-120ms), BBR typically achieves 2-5× throughput vs CUBIC because it doesn't halve the congestion window on random packet loss.
 
+### Cycle 10: Zero-alloc AEAD decrypt via pre-allocated buffer
+**Files:** `server/crypto/handshake.go`, `server/main.go`
+**Change:** Added `DecryptTo(dst, ciphertext, ad)` method to `SessionCipher` that decrypts into a caller-provided buffer. Added 65KB `decryptBuf` field to `noiseConn`. The hot-path `noiseConn.Read` now calls `DecryptTo` instead of `Decrypt`, passing `decryptBuf` as destination. This eliminates the `make([]byte, 0, len-16)` allocation inside `aead.Open` on every received packet.
+**Impact:** LOW-MEDIUM — At 10 Mbps with 1460-byte packets, eliminates ~860 heap allocations per second (~1.2 MB/s GC pressure removed). Reduces GC pause frequency and improves P99 latency.
+
 ---
 
 ## Expected Impact Summary
@@ -63,6 +68,7 @@
 | bufio.Reader + pools | +5-15% (reduced syscalls/GC) |
 | atomic.Pointer | +1-5% (lock contention removed) |
 | Client recv/queue | +5-10% (fewer client syscalls) |
+| Zero-alloc decrypt | +2-5% (reduced GC pressure) |
 
 ## Plan for Next Run
 1. **Verify BBR kernel module** — Check if `tcp_bbr` is loaded on the server. If not, load it via `modprobe tcp_bbr`.
@@ -70,5 +76,6 @@
 3. **Benchmark** — Run actual speedtest after deploying to see real numbers.
 4. **Consider TCP_CORK** — Batch multiple mux frames into one TCP segment when possible.
 5. **Consider GRO/GSO** — Enable Generic Receive/Send Offloading on TUN device.
-6. **noiseConn Decrypt allocation** — Pre-allocate decrypt destination buffer to eliminate per-packet allocation.
-7. **Client-side BBR** — Set TCP_CONGESTION on client socket (requires macOS equivalent).
+6. **Client-side BBR** — Set TCP_CONGESTION on client socket (requires macOS equivalent).
+7. **Zero-alloc Encrypt** — Same pattern for `SessionCipher.Encrypt` (pre-allocate write buffer).
+8. **Client-side zero-alloc** — Apply similar pre-allocated buffer pattern in Python client `NoiseConn.read`.
