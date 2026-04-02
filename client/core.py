@@ -679,11 +679,13 @@ class ClientMux:
             pass
 
     def _write_frame(self, stream_id: int, frame_type: int, payload: bytes) -> None:
-        hdr = struct.pack(">IBHB", stream_id, frame_type, len(payload), 0)
-        # Actually 7 bytes: streamID(4BE) + type(1) + payloadLen(2BE)
-        hdr = struct.pack(">I", stream_id) + bytes([frame_type]) + struct.pack(">H", len(payload))
+        # Build 7-byte mux header + payload in a single pre-sized bytearray to
+        # avoid three separate struct.pack calls and the hdr+payload concatenation.
+        frame = bytearray(7 + len(payload))
+        struct.pack_into(">IbH", frame, 0, stream_id, frame_type, len(payload))
+        frame[7:] = payload
         with self._write_lock:
-            self._conn.write_message(hdr + payload)
+            self._conn.write_message(bytes(frame))
 
     def _remove_stream(self, stream_id: int) -> None:
         with self._streams_lock:
