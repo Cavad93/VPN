@@ -146,3 +146,24 @@ Wire format: 7-байтный заголовок (streamID uint32 + type uint8 +
 
 **Тесты:** 14 тестов mux, покрытие пакета transport 90.0%  
 **Запуск:** `cd server && go test ./transport/ -v -cover`
+
+### ЗАДАЧА 7 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `server/main.go`, `server/tun_linux.go`, `server/tun_stub.go`
+
+Реализован VPN сервер:
+- `Server{cfg, staticKP, sessions, pool, tun}` — основная структура сервера
+- `NewServer(cfg, kp, tun, allowedKeys, logger)` — конструктор с валидацией
+- `Server.Run(ctx)` — TCP listener + routeFromTun + accept loop
+- `Server.Sessions()` — статистика активных сессий
+- `Server.DisconnectSession(id)` — принудительное отключение клиента
+- `handleConn(ctx, conn)` — ObfsConn.ServerHandshake → Noise_XX → noiseConn → Mux → stream loop
+- `handleControlStream` — протокол IP assignment (ctlHello/ctlAssign, 10 байт)
+- `handleDataStream` — чтение IP пакетов от клиента → TUN
+- `routeFromTun` — чтение пакетов из TUN → маршрутизация к клиенту по dst IP
+- `noiseConn` — net.Conn обёртка с Noise session шифрованием (SendCipher/RecvCipher + 2-byte framing)
+- `ipPool` — аллокатор IPv4 адресов из CIDR подсети
+- `loadOrGenerateKeyPair` — загрузка/генерация статического ключа сервера
+- `OpenTun` — Linux: /dev/net/tun + ioctl TUNSETIFF; stub для остальных платформ
+
+**Тесты:** покрытие 80.2%  
+**Запуск:** `cd server && go test . -v -cover`

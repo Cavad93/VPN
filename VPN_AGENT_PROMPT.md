@@ -98,7 +98,8 @@ git push -u origin claude/create-claude-md-zT6Gk
   > Выполнено: `server/transport/mux.go` + тесты (14 тестов mux, 90.0% coverage пакет transport). Реализованы: Mux (NewMux, OpenStream, AcceptStream, Close, writeFrame, readLoop), Stream (Write, Read, Close, ID). Клиент использует чётные stream ID (2,4,6…), сервер — нечётные (1,3,5…). Wire format: 7-байтный заголовок (streamID uint32 + type uint8 + length uint16). Фреймы: FrameSYN (открытие), FrameData (данные), FrameFIN (закрытие). Фрагментация больших сообщений (>65535 байт). Потокобезопасность: writeMu для записи, streamsMu для map. Запуск: `cd server && go test ./transport/ -v -cover`
 
 ### ФАЗА 3: Сервер Go
-- [ ] **ЗАДАЧА 7:** VPN сервер — принимает соединения, аутентифицирует, маршрутизирует трафик. `server/main.go`
+- [x] **ЗАДАЧА 7:** VPN сервер — принимает соединения, аутентифицирует, маршрутизирует трафик. `server/main.go`
+  > Выполнено: `server/main.go` + `server/tun_linux.go` + `server/tun_stub.go` + тесты (покрытие 80.2%). Реализованы: Server (Run, Sessions, DisconnectSession), handleConn (ObfsConn + Noise_XX handshake + noiseConn + Mux), handleControlStream (IP assignment с протоколом ctlHello/ctlAssign), handleDataStream (чтение IP пакетов → TUN), routeFromTun (TUN → client data stream), ipPool (аллокация/релиз IPv4 адресов), noiseConn (шифрование всего трафика через Noise session cipher), loadOrGenerateKeyPair. Linux TUN через /dev/net/tun + ioctl TUNSETIFF. Запуск: `cd server && go test . -v -cover`
 - [ ] **ЗАДАЧА 8:** Управление клиентами через REST API (добавление/удаление/статистика). `server/api/api.go`
 - [ ] **ЗАДАЧА 9:** Windows Service враппер — запуск как служба Windows. `server/service/windows_service.go`
 - [ ] **ЗАДАЧА 10:** Конфигурация через YAML, генерация ключей при первом запуске. `server/config/config.go`

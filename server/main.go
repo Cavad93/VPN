@@ -1,0 +1,822 @@
+// Package main implements the VPN server.
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"golang.org/x/crypto/curve25519"
+
+	"github.com/cavad93/vpn/server/crypto"
+	"github.com/cavad93/vpn/server/transport"
+)
+
+// Control message type constants.
+const (
+	ctlHello            = uint8(0x01) // client→server: request IP assignment
+	ctlAssign           = uint8(0x02) // server→client: IP assignment response
+	ctlError            = uint8(0x03) // server→client: error
+	ctlAssignPayloadLen = 9           // 4(ip) + 1(prefix_len) + 4(gateway)
+
+	noiseHandshakeMsgMaxSize = 4096
+)
+
+// TunDevice is the interface for reading/writing raw IP packets to/from a TUN device.
+type TunDevice interface {
+	Read([]byte) (int, error)
+	Write([]byte) (int, error)
+	Close() error
+}
+
+// Config holds the server configuration.
+type Config struct {
+	ListenAddr  string
+	TunCIDR     string
+	PrivKeyFile string
+}
+
+// DefaultConfig returns a Config populated with sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		ListenAddr:  "0.0.0.0:443",
+		TunCIDR:     "10.8.0.1/24",
+		PrivKeyFile: "server_privkey.hex",
+	}
+}
+
+// SessionStats holds read-only statistics for one client session.
+type SessionStats struct {
+	ID          uint64
+	RemoteKey   string
+	AssignedIP  string
+	BytesIn     uint64
+	BytesOut    uint64
+	ConnectedAt time.Time
+	Duration    string
+}
+
+// clientSession holds per-client runtime state.
+type clientSession struct {
+	id           uint64
+	remoteKey    [32]byte
+	noiseSession *crypto.Session
+	mux          *transport.Mux
+	assignedIP   net.IP
+	dataStream   *transport.Stream
+	dataMu       sync.Mutex
+	bytesIn      atomic.Uint64
+	bytesOut     atomic.Uint64
+	connectedAt  time.Time
+	cancel       context.CancelFunc
+}
+
+func (cs *clientSession) stats() SessionStats {
+	ip := ""
+	if cs.assignedIP != nil {
+		ip = cs.assignedIP.String()
+	}
+	dur := time.Since(cs.connectedAt).Round(time.Second).String()
+	return SessionStats{
+		ID:          cs.id,
+		RemoteKey:   hex.EncodeToString(cs.remoteKey[:]),
+		AssignedIP:  ip,
+		BytesIn:     cs.bytesIn.Load(),
+		BytesOut:    cs.bytesOut.Load(),
+		ConnectedAt: cs.connectedAt,
+		Duration:    dur,
+	}
+}
+
+// Server is the VPN server.
+type Server struct {
+	cfg         Config
+	staticKP    *crypto.KeyPair
+	logger      *slog.Logger
+	mu          sync.RWMutex
+	sessions    map[uint64]*clientSession
+	allowedKeys map[[32]byte]struct{}
+	tun         TunDevice
+	pool        *ipPool
+	nextIDMu    sync.Mutex
+	nextID      uint64
+}
+
+// NewServer creates a new Server. allowedKeys may be nil/empty to allow any key.
+func NewServer(cfg Config, kp *crypto.KeyPair, tun TunDevice, allowedKeys [][crypto.KeySize]byte, logger *slog.Logger) (*Server, error) {
+	if kp == nil {
+		return nil, errors.New("server: key pair is required")
+	}
+	if tun == nil {
+		return nil, errors.New("server: tun device is required")
+	}
+
+	pool, err := newIPPool(cfg.TunCIDR)
+	if err != nil {
+		return nil, fmt.Errorf("server: invalid TunCIDR: %w", err)
+	}
+
+	s := &Server{
+		cfg:      cfg,
+		staticKP: kp,
+		logger:   logger,
+		sessions: make(map[uint64]*clientSession),
+		tun:      tun,
+		pool:     pool,
+		nextID:   1,
+	}
+
+	if len(allowedKeys) > 0 {
+		s.allowedKeys = make(map[[32]byte]struct{}, len(allowedKeys))
+		for _, k := range allowedKeys {
+			s.allowedKeys[k] = struct{}{}
+		}
+	}
+
+	return s, nil
+}
+
+// Run starts the server and blocks until ctx is cancelled.
+func (s *Server) Run(ctx context.Context) error {
+	ln, err := net.Listen("tcp", s.cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("server: listen %s: %w", s.cfg.ListenAddr, err)
+	}
+	s.logger.Info("server listening", "addr", s.cfg.ListenAddr)
+
+	go s.routeFromTun(ctx)
+
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				s.logger.Warn("accept error", "err", err)
+				continue
+			}
+		}
+		go s.handleConn(ctx, conn)
+	}
+}
+
+// Sessions returns a snapshot of current session statistics.
+func (s *Server) Sessions() []SessionStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]SessionStats, 0, len(s.sessions))
+	for _, cs := range s.sessions {
+		out = append(out, cs.stats())
+	}
+	return out
+}
+
+// DisconnectSession cancels the session with the given ID.
+// Returns true if the session existed.
+func (s *Server) DisconnectSession(id uint64) bool {
+	s.mu.RLock()
+	cs, ok := s.sessions[id]
+	s.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	cs.cancel()
+	return true
+}
+
+// handleConn handles a newly accepted TCP connection.
+func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+
+	// TLS obfuscation handshake
+	obfs := transport.NewObfsConn(conn)
+	if err := obfs.ServerHandshake(); err != nil {
+		s.logger.Warn("obfs handshake failed", "err", err)
+		return
+	}
+
+	// Noise_XX handshake
+	session, err := s.doNoiseHandshake(obfs)
+	if err != nil {
+		s.logger.Warn("noise handshake failed", "err", err)
+		return
+	}
+
+	// Check if this key is allowed
+	if !s.isKeyAllowed(session.RemoteStatic) {
+		s.logger.Warn("key not allowed", "key", hex.EncodeToString(session.RemoteStatic[:]))
+		return
+	}
+
+	// Wrap in encrypted noise conn
+	nc := newNoiseConn(obfs, session)
+
+	// Create mux (server = not client)
+	mux := transport.NewMux(nc, false)
+
+	// Register session
+	connCtx, cancel := context.WithCancel(ctx)
+	cs := &clientSession{
+		id:           s.nextSessionID(),
+		remoteKey:    session.RemoteStatic,
+		noiseSession: session,
+		mux:          mux,
+		connectedAt:  time.Now(),
+		cancel:       cancel,
+	}
+
+	s.mu.Lock()
+	s.sessions[cs.id] = cs
+	s.mu.Unlock()
+
+	defer func() {
+		cancel()
+		mux.Close()
+		s.mu.Lock()
+		delete(s.sessions, cs.id)
+		s.mu.Unlock()
+		if cs.assignedIP != nil {
+			s.pool.release(cs.assignedIP)
+		}
+		s.logger.Info("session closed", "id", cs.id)
+	}()
+
+	s.logger.Info("new session", "id", cs.id, "key", hex.EncodeToString(session.RemoteStatic[:]))
+
+	// Accept stream loop
+	for {
+		stream, err := mux.AcceptStream(connCtx)
+		if err != nil {
+			return
+		}
+		go s.handleStream(connCtx, cs, stream)
+	}
+}
+
+// handleStream dispatches a stream to the appropriate handler.
+func (s *Server) handleStream(ctx context.Context, cs *clientSession, stream *transport.Stream) {
+	cs.dataMu.Lock()
+	hasIP := cs.assignedIP != nil
+	cs.dataMu.Unlock()
+
+	if !hasIP {
+		if err := s.handleControlStream(ctx, cs, stream); err != nil {
+			s.logger.Warn("control stream error", "id", cs.id, "err", err)
+		}
+	} else {
+		s.handleDataStream(ctx, cs, stream)
+	}
+}
+
+// handleControlStream processes the control stream for IP assignment.
+func (s *Server) handleControlStream(ctx context.Context, cs *clientSession, stream *transport.Stream) error {
+	defer stream.Close()
+
+	// Read control byte
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(stream, buf); err != nil {
+		return fmt.Errorf("read control byte: %w", err)
+	}
+	if buf[0] != ctlHello {
+		// Send error and return
+		stream.Write([]byte{ctlError}) //nolint:errcheck
+		return fmt.Errorf("expected ctlHello (0x%02x), got 0x%02x", ctlHello, buf[0])
+	}
+
+	// Allocate IP
+	ip, err := s.pool.allocate()
+	if err != nil {
+		stream.Write([]byte{ctlError}) //nolint:errcheck
+		return fmt.Errorf("ip allocation failed: %w", err)
+	}
+
+	cs.dataMu.Lock()
+	cs.assignedIP = ip
+	cs.dataMu.Unlock()
+
+	// Build 10-byte response: ctlAssign + ip[4] + prefixLen[1] + gw[4]
+	resp := make([]byte, 1+ctlAssignPayloadLen)
+	resp[0] = ctlAssign
+	ip4 := ip.To4()
+	copy(resp[1:5], ip4)
+	resp[5] = byte(s.pool.prefixLen())
+	gw := s.pool.serverIP().To4()
+	copy(resp[6:10], gw)
+
+	if _, err := stream.Write(resp); err != nil {
+		return fmt.Errorf("write assign response: %w", err)
+	}
+
+	s.logger.Info("assigned IP", "id", cs.id, "ip", ip.String())
+	return nil
+}
+
+// handleDataStream relays data between the stream and the TUN device.
+func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream *transport.Stream) {
+	cs.dataMu.Lock()
+	cs.dataStream = stream
+	cs.dataMu.Unlock()
+
+	defer func() {
+		cs.dataMu.Lock()
+		if cs.dataStream == stream {
+			cs.dataStream = nil
+		}
+		cs.dataMu.Unlock()
+		stream.Close()
+	}()
+
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+		if n < 20 {
+			// Too short to be a valid IPv4 packet
+			continue
+		}
+
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		cs.bytesIn.Add(uint64(n))
+		s.tun.Write(pkt) //nolint:errcheck
+	}
+}
+
+// routeFromTun reads packets from the TUN device and routes them to clients.
+func (s *Server) routeFromTun(ctx context.Context) {
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		n, err := s.tun.Read(buf)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				s.logger.Warn("tun read error", "err", err)
+				continue
+			}
+		}
+		if n < 20 {
+			continue
+		}
+
+		// Parse destination IP from IPv4 header bytes[16:20]
+		dstIP := net.IP(buf[16:20])
+
+		// Find matching session
+		s.mu.RLock()
+		var target *clientSession
+		for _, cs := range s.sessions {
+			cs.dataMu.Lock()
+			ip := cs.assignedIP
+			cs.dataMu.Unlock()
+			if ip != nil && ip.Equal(dstIP) {
+				target = cs
+				break
+			}
+		}
+		s.mu.RUnlock()
+
+		if target == nil {
+			continue
+		}
+
+		target.dataMu.Lock()
+		ds := target.dataStream
+		target.dataMu.Unlock()
+
+		if ds == nil {
+			continue
+		}
+
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		if _, err := ds.Write(pkt); err == nil {
+			target.bytesOut.Add(uint64(n))
+		}
+	}
+}
+
+// doNoiseHandshake performs the server-side Noise_XX handshake over conn.
+func (s *Server) doNoiseHandshake(conn net.Conn) (*crypto.Session, error) {
+	hs, err := crypto.NewHandshake(crypto.Responder, s.staticKP)
+	if err != nil {
+		return nil, fmt.Errorf("noise: new handshake: %w", err)
+	}
+
+	// Read message 1
+	msg1, err := readHandshakeMsg(conn)
+	if err != nil {
+		return nil, fmt.Errorf("noise: read msg1: %w", err)
+	}
+	if err := hs.ReadMessage1(msg1); err != nil {
+		return nil, fmt.Errorf("noise: process msg1: %w", err)
+	}
+
+	// Write message 2
+	msg2, err := hs.WriteMessage2()
+	if err != nil {
+		return nil, fmt.Errorf("noise: write msg2: %w", err)
+	}
+	if err := writeHandshakeMsg(conn, msg2); err != nil {
+		return nil, fmt.Errorf("noise: send msg2: %w", err)
+	}
+
+	// Read message 3
+	msg3, err := readHandshakeMsg(conn)
+	if err != nil {
+		return nil, fmt.Errorf("noise: read msg3: %w", err)
+	}
+	session, err := hs.ReadMessage3(msg3)
+	if err != nil {
+		return nil, fmt.Errorf("noise: process msg3: %w", err)
+	}
+
+	return session, nil
+}
+
+// isKeyAllowed returns true if the key is permitted or no allowlist is configured.
+func (s *Server) isKeyAllowed(key [32]byte) bool {
+	if len(s.allowedKeys) == 0 {
+		return true
+	}
+	_, ok := s.allowedKeys[key]
+	return ok
+}
+
+// nextSessionID returns the next monotonically increasing session ID.
+func (s *Server) nextSessionID() uint64 {
+	s.nextIDMu.Lock()
+	defer s.nextIDMu.Unlock()
+	id := s.nextID
+	s.nextID++
+	return id
+}
+
+// readHandshakeMsg reads a length-prefixed handshake message (2-byte big-endian length).
+func readHandshakeMsg(conn net.Conn) ([]byte, error) {
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		return nil, fmt.Errorf("read handshake length: %w", err)
+	}
+	length := binary.BigEndian.Uint16(lenBuf[:])
+	if length == 0 || int(length) > noiseHandshakeMsgMaxSize {
+		return nil, fmt.Errorf("handshake message size %d out of range", length)
+	}
+	msg := make([]byte, length)
+	if _, err := io.ReadFull(conn, msg); err != nil {
+		return nil, fmt.Errorf("read handshake payload: %w", err)
+	}
+	return msg, nil
+}
+
+// writeHandshakeMsg writes a length-prefixed handshake message (2-byte big-endian length).
+func writeHandshakeMsg(conn net.Conn, msg []byte) error {
+	if len(msg) > noiseHandshakeMsgMaxSize {
+		return fmt.Errorf("handshake message too large: %d", len(msg))
+	}
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(msg)))
+	if _, err := conn.Write(lenBuf[:]); err != nil {
+		return fmt.Errorf("write handshake length: %w", err)
+	}
+	if _, err := conn.Write(msg); err != nil {
+		return fmt.Errorf("write handshake payload: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// noiseConn — encrypts/decrypts data using a Noise Session
+// ---------------------------------------------------------------------------
+
+// noiseConn wraps a net.Conn with Noise session encryption.
+type noiseConn struct {
+	conn    net.Conn
+	session *crypto.Session
+	readBuf []byte
+}
+
+// newNoiseConn creates a noiseConn wrapping conn with the given session.
+func newNoiseConn(conn net.Conn, session *crypto.Session) *noiseConn {
+	return &noiseConn{conn: conn, session: session}
+}
+
+// Write encrypts p and writes it with a 2-byte big-endian length prefix.
+func (nc *noiseConn) Write(p []byte) (int, error) {
+	ciphertext, err := nc.session.SendCipher.Encrypt(p, nil)
+	if err != nil {
+		return 0, fmt.Errorf("noiseConn encrypt: %w", err)
+	}
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(ciphertext)))
+	if _, err := nc.conn.Write(lenBuf[:]); err != nil {
+		return 0, err
+	}
+	if _, err := nc.conn.Write(ciphertext); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// Read decrypts the next frame into p.
+func (nc *noiseConn) Read(p []byte) (int, error) {
+	// Drain buffered remainder first.
+	if len(nc.readBuf) > 0 {
+		n := copy(p, nc.readBuf)
+		nc.readBuf = nc.readBuf[n:]
+		return n, nil
+	}
+
+	// Read 2-byte length prefix.
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(nc.conn, lenBuf[:]); err != nil {
+		return 0, err
+	}
+	frameLen := binary.BigEndian.Uint16(lenBuf[:])
+
+	// Read the encrypted frame.
+	frame := make([]byte, frameLen)
+	if _, err := io.ReadFull(nc.conn, frame); err != nil {
+		return 0, err
+	}
+
+	// Decrypt.
+	plaintext, err := nc.session.RecvCipher.Decrypt(frame, nil)
+	if err != nil {
+		return 0, fmt.Errorf("noiseConn decrypt: %w", err)
+	}
+
+	n := copy(p, plaintext)
+	if n < len(plaintext) {
+		tail := make([]byte, len(plaintext)-n)
+		copy(tail, plaintext[n:])
+		nc.readBuf = tail
+	}
+	return n, nil
+}
+
+func (nc *noiseConn) Close() error                       { return nc.conn.Close() }
+func (nc *noiseConn) LocalAddr() net.Addr                { return nc.conn.LocalAddr() }
+func (nc *noiseConn) RemoteAddr() net.Addr               { return nc.conn.RemoteAddr() }
+func (nc *noiseConn) SetDeadline(t time.Time) error      { return nc.conn.SetDeadline(t) }
+func (nc *noiseConn) SetReadDeadline(t time.Time) error  { return nc.conn.SetReadDeadline(t) }
+func (nc *noiseConn) SetWriteDeadline(t time.Time) error { return nc.conn.SetWriteDeadline(t) }
+
+// ---------------------------------------------------------------------------
+// ipPool — allocates client IPs from a CIDR subnet
+// ---------------------------------------------------------------------------
+
+type ipPool struct {
+	mu      sync.Mutex
+	network *net.IPNet
+	server  net.IP
+	used    map[uint32]bool
+}
+
+// newIPPool parses cidr and returns an ipPool. The host address in cidr is the
+// server IP and is pre-marked as used along with the network address.
+func newIPPool(cidr string) (*ipPool, error) {
+	ip, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, fmt.Errorf("ipPool: parse CIDR %q: %w", cidr, err)
+	}
+
+	serverIP := ip.To4()
+	if serverIP == nil {
+		return nil, errors.New("ipPool: only IPv4 CIDRs are supported")
+	}
+
+	p := &ipPool{
+		network: network,
+		server:  cloneIP(serverIP),
+		used:    make(map[uint32]bool),
+	}
+
+	// Pre-mark network address and server address as used.
+	networkAddr := network.IP.To4()
+	if networkAddr != nil {
+		p.used[ipToUint32(networkAddr)] = true
+	}
+	p.used[ipToUint32(serverIP)] = true
+
+	return p, nil
+}
+
+// allocate returns the next available IP in the subnet.
+func (p *ipPool) allocate() (net.IP, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Iterate subnet starting from network address + 1
+	current := cloneIP(p.network.IP.To4())
+	incrementIP(current)
+
+	for p.network.Contains(current) {
+		if isBroadcast(current, p.network) {
+			break
+		}
+		key := ipToUint32(current)
+		if !p.used[key] {
+			p.used[key] = true
+			return cloneIP(current), nil
+		}
+		incrementIP(current)
+	}
+	return nil, errors.New("ipPool: address space exhausted")
+}
+
+// release marks ip as available again.
+func (p *ipPool) release(ip net.IP) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ip4 := ip.To4()
+	if ip4 != nil {
+		delete(p.used, ipToUint32(ip4))
+	}
+}
+
+// serverIP returns the server's IP address in the subnet.
+func (p *ipPool) serverIP() net.IP {
+	return cloneIP(p.server)
+}
+
+// prefixLen returns the network prefix length.
+func (p *ipPool) prefixLen() int {
+	ones, _ := p.network.Mask.Size()
+	return ones
+}
+
+// ipToUint32 converts a 4-byte IPv4 address to a uint32.
+func ipToUint32(ip net.IP) uint32 {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return 0
+	}
+	return binary.BigEndian.Uint32(ip4)
+}
+
+// cloneIP returns a 4-byte copy of ip.
+func cloneIP(ip net.IP) net.IP {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return nil
+	}
+	out := make(net.IP, 4)
+	copy(out, ip4)
+	return out
+}
+
+// incrementIP increments ip in place (big-endian).
+func incrementIP(ip net.IP) {
+	for i := len(ip) - 1; i >= 0; i-- {
+		ip[i]++
+		if ip[i] != 0 {
+			break
+		}
+	}
+}
+
+// isBroadcast returns true if ip is the broadcast address for network.
+func isBroadcast(ip net.IP, network *net.IPNet) bool {
+	ip4 := ip.To4()
+	netIP := network.IP.To4()
+	mask := network.Mask
+	if ip4 == nil || netIP == nil {
+		return false
+	}
+	for i := 0; i < 4; i++ {
+		if ip4[i] != netIP[i]|^mask[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// Key pair loading / generation
+// ---------------------------------------------------------------------------
+
+// loadOrGenerateKeyPair loads a hex-encoded private key from path, or generates
+// and saves a new one if the file does not exist.
+func loadOrGenerateKeyPair(path string, logger *slog.Logger) (*crypto.KeyPair, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("loadOrGenerateKeyPair: read %s: %w", path, err)
+		}
+
+		// Generate new key pair.
+		kp, genErr := crypto.GenerateKeyPair()
+		if genErr != nil {
+			return nil, fmt.Errorf("loadOrGenerateKeyPair: generate: %w", genErr)
+		}
+
+		hexKey := hex.EncodeToString(kp.PrivateKey[:])
+		if writeErr := os.WriteFile(path, []byte(hexKey), 0600); writeErr != nil {
+			return nil, fmt.Errorf("loadOrGenerateKeyPair: write %s: %w", path, writeErr)
+		}
+
+		logger.Info("generated new key pair", "path", path, "public_key", hex.EncodeToString(kp.PublicKey[:]))
+		return kp, nil
+	}
+
+	// Load existing private key.
+	hexStr := strings.TrimSpace(string(data))
+	privBytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, fmt.Errorf("loadOrGenerateKeyPair: decode hex from %s: %w", path, err)
+	}
+	if len(privBytes) != crypto.KeySize {
+		return nil, fmt.Errorf("loadOrGenerateKeyPair: private key must be %d bytes, got %d", crypto.KeySize, len(privBytes))
+	}
+
+	kp := &crypto.KeyPair{}
+	copy(kp.PrivateKey[:], privBytes)
+
+	pub, err := curve25519.X25519(kp.PrivateKey[:], curve25519.Basepoint)
+	if err != nil {
+		return nil, fmt.Errorf("loadOrGenerateKeyPair: compute public key: %w", err)
+	}
+	copy(kp.PublicKey[:], pub)
+
+	logger.Info("loaded key pair", "path", path, "public_key", hex.EncodeToString(kp.PublicKey[:]))
+	return kp, nil
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+func main() {
+	cfg := DefaultConfig()
+
+	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
+	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
+	flag.StringVar(&cfg.PrivKeyFile, "privkey", cfg.PrivKeyFile, "path to hex-encoded private key file")
+	flag.Parse()
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	kp, err := loadOrGenerateKeyPair(cfg.PrivKeyFile, logger)
+	if err != nil {
+		logger.Error("failed to load key pair", "err", err)
+		os.Exit(1)
+	}
+
+	tun, err := OpenTun("vpn0")
+	if err != nil {
+		logger.Error("failed to open TUN device", "err", err)
+		os.Exit(1)
+	}
+	defer tun.Close()
+
+	srv, err := NewServer(cfg, kp, tun, nil, logger)
+	if err != nil {
+		logger.Error("failed to create server", "err", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := srv.Run(ctx); err != nil {
+		logger.Error("server error", "err", err)
+		os.Exit(1)
+	}
+}
