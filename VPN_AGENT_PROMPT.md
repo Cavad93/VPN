@@ -86,7 +86,8 @@ git push -u origin claude/create-claude-md-zT6Gk
   > Выполнено: `server/crypto/crypto.go` + тесты (11 тестов, покрытие 81.6%). Функции: GenerateKeyPair, DiffieHellman, NewCipher, Encrypt, Decrypt, GenerateNonce. Зависимость: golang.org/x/crypto@v0.32.0. Запуск: `go test ./crypto/ -v`
 - [x] **ЗАДАЧА 2:** Noise_XX handshake протокол. Mutual authentication сервер↔клиент. `server/crypto/handshake.go`
   > Выполнено: `server/crypto/handshake.go` + тесты (22 теста суммарно, покрытие 80.4%). Реализован полный Noise_XX паттерн (-> e, <- e,ee,s,es, -> s,se) с mutual authentication. Функции: NewHandshake, WriteMessage1/2/3, ReadMessage1/2/3. Возвращает Session с SendCipher/RecvCipher для двунаправленного шифрования. Запуск: `cd server && go test ./crypto/ -v -cover`
-- [ ] **ЗАДАЧА 3:** Защита от replay атак (nonce + timestamp window 90s). `server/crypto/replay.go`
+- [x] **ЗАДАЧА 3:** Защита от replay атак (nonce + timestamp window 90s). `server/crypto/replay.go`
+  > Выполнено: `server/crypto/replay.go` + тесты (19 тестов replay, 41 тест суммарно, покрытие 82.9%). Реализованы: PacketHeader (timestamp + nonce, encode/decode), ReplayFilter с скользящим окном ±90с. Потокобезопасен (sync.Mutex). Автоочистка устаревших bucket'ов. Запуск: `cd server && go test ./crypto/ -v -cover`
 
 ### ФАЗА 2: Транспорт (Transport Layer)
 - [ ] **ЗАДАЧА 4:** UDP транспорт с надёжностью (ACK, retransmit, ordering, congestion control). `server/transport/udp.go`

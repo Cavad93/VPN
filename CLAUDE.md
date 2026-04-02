@@ -33,6 +33,8 @@ server/
 │   ├── crypto_test.go   — unit тесты crypto.go
 │   ├── handshake.go     — Noise_XX handshake протокол
 │   ├── handshake_test.go — unit тесты handshake
+│   ├── replay.go        — защита от replay атак (nonce + timestamp window)
+│   ├── replay_test.go   — unit тесты replay.go
 │   └── README.md
 ```
 
@@ -66,4 +68,21 @@ server/
 Внутренние компоненты: `noiseHKDF` (HMAC-SHA256), `noiseCipherState` (ChaCha20-Poly1305 + nonce counter), `noiseSymmetricState` (chaining key + transcript hash)
 
 **Тесты:** 22 теста суммарно, покрытие 80.4%  
+**Запуск:** `cd server && go test ./crypto/ -v -cover`
+
+### ЗАДАЧА 3 — ВЫПОЛНЕНО (2026-04-02)
+**Файл:** `server/crypto/replay.go`
+
+Реализована защита от replay атак:
+- `PacketHeader{Timestamp, Nonce}` — заголовок пакета (20 байт: 8 timestamp + 12 nonce)
+- `NewPacketHeader()` — создание заголовка с текущим временем и случайным nonce
+- `PacketHeader.Encode()` — сериализация в байты (big-endian)
+- `DecodePacketHeader(data)` — десериализация заголовка
+- `ReplayFilter` — потокобезопасный фильтр с скользящим окном ±90 секунд
+- `NewReplayFilter()` — конструктор фильтра
+- `ReplayFilter.Check(header)` — проверка и регистрация пакета; отклоняет устаревшие/будущие/повторные
+
+Алгоритм: nonce хранятся в map[timestamp_second → set[nonce]], автоочистка устаревших bucket'ов при каждом Check.
+
+**Тесты:** 41 тест суммарно, покрытие 82.9%  
 **Запуск:** `cd server && go test ./crypto/ -v -cover`
