@@ -11,20 +11,32 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.cavadvpn.config.RouteInfo
 import com.cavadvpn.config.VpnConfig
+import com.cavadvpn.ui.MainActivity
 import kotlinx.coroutines.*
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicLong
 
 /** Starts the VPN tunnel. Required extras: EXTRA_SERVER_HOST, EXTRA_PRIVATE_KEY. */
 const val ACTION_CONNECT    = "com.cavadvpn.CONNECT"
 /** Stops the VPN tunnel. */
 const val ACTION_DISCONNECT = "com.cavadvpn.DISCONNECT"
+/** Broadcast: periodic stats update. */
+const val ACTION_STATS_UPDATE = "com.cavadvpn.STATS_UPDATE"
+/** Broadcast: VPN connection state changed. */
+const val ACTION_VPN_STATE_CHANGED = "com.cavadvpn.VPN_STATE_CHANGED"
 
 const val EXTRA_SERVER_HOST       = "server_host"
 const val EXTRA_SERVER_PORT       = "server_port"
 const val EXTRA_PRIVATE_KEY       = "private_key_hex"
 const val EXTRA_SERVER_PUBLIC_KEY = "server_public_key_hex"
+
+const val EXTRA_STATE               = "state"
+const val EXTRA_STATS_BYTES_IN      = "bytes_in"
+const val EXTRA_STATS_BYTES_OUT     = "bytes_out"
+const val EXTRA_STATS_CONNECTED_SINCE = "connected_since_ms"
+const val EXTRA_STATS_ASSIGNED_IP   = "assigned_ip"
 
 private const val TAG = "CavadVpnService"
 private const val NOTIFICATION_CHANNEL_ID = "cavadvpn_channel"
@@ -43,6 +55,11 @@ class CavadVpnService : VpnService() {
     private var vpnClient: VpnClient? = null
     private var tunFd: ParcelFileDescriptor? = null
     private var serviceScope: CoroutineScope? = null
+
+    private val bytesIn  = AtomicLong(0L)
+    private val bytesOut = AtomicLong(0L)
+    private var connectedSinceMs = 0L
+    private var assignedIp = ""
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -82,6 +99,12 @@ class CavadVpnService : VpnService() {
 
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Connecting…"))
+        broadcastState("CONNECTING")
+
+        bytesIn.set(0L)
+        bytesOut.set(0L)
+        connectedSinceMs = 0L
+        assignedIp = ""
 
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         serviceScope = scope
@@ -98,10 +121,26 @@ class CavadVpnService : VpnService() {
                 val fd = setupTunnel(route, config)
                 tunFd = fd
 
+                connectedSinceMs = System.currentTimeMillis()
+                assignedIp = route.assignedIp
+
                 updateNotification("Connected — ${route.assignedIp}")
+                broadcastState("CONNECTED")
+
+                // Start stats broadcast coroutine
+                launch {
+                    while (isActive) {
+                        delay(1000L)
+                        broadcastStats()
+                        val statsText = "↓ ${formatBytes(bytesIn.get())}  ↑ ${formatBytes(bytesOut.get())}"
+                        updateNotification("${route.assignedIp}  $statsText")
+                    }
+                }
+
                 runTunnel(fd, client)
             } catch (e: Exception) {
                 Log.e(TAG, "VPN connection failed: ${e.message}", e)
+                broadcastState("ERROR")
                 stopVpn()
             }
         }
@@ -117,8 +156,14 @@ class CavadVpnService : VpnService() {
         try { tunFd?.close() } catch (_: Exception) {}
         tunFd = null
 
+        bytesIn.set(0L)
+        bytesOut.set(0L)
+        connectedSinceMs = 0L
+        assignedIp = ""
+
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+        broadcastState("DISCONNECTED")
         Log.i(TAG, "VPN stopped")
     }
 
@@ -164,6 +209,7 @@ class CavadVpnService : VpnService() {
                         val len = tunIn.read(buf)
                         if (len <= 0) break
                         client.sendPacket(buf.copyOf(len))
+                        bytesOut.addAndGet(len.toLong())
                     }
                 } catch (e: Exception) {
                     if (isActive) Log.e(TAG, "TUN→server error: ${e.message}")
@@ -177,6 +223,7 @@ class CavadVpnService : VpnService() {
                         val pkt = client.recvPacket()
                         if (pkt.isEmpty()) break
                         tunOut.write(pkt)
+                        bytesIn.addAndGet(pkt.size.toLong())
                     }
                 } catch (e: Exception) {
                     if (isActive) Log.e(TAG, "server→TUN error: ${e.message}")
@@ -187,6 +234,29 @@ class CavadVpnService : VpnService() {
             tunToServer.invokeOnCompletion  { serverToTun.cancel() }
             serverToTun.invokeOnCompletion  { tunToServer.cancel() }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Broadcast helpers
+    // -----------------------------------------------------------------------
+
+    private fun broadcastStats() {
+        val intent = Intent(ACTION_STATS_UPDATE).apply {
+            putExtra(EXTRA_STATS_BYTES_IN,        bytesIn.get())
+            putExtra(EXTRA_STATS_BYTES_OUT,       bytesOut.get())
+            putExtra(EXTRA_STATS_CONNECTED_SINCE, connectedSinceMs)
+            putExtra(EXTRA_STATS_ASSIGNED_IP,     assignedIp)
+            setPackage(packageName)
+        }
+        sendBroadcast(intent)
+    }
+
+    private fun broadcastState(state: String) {
+        val intent = Intent(ACTION_VPN_STATE_CHANGED).apply {
+            putExtra(EXTRA_STATE, state)
+            setPackage(packageName)
+        }
+        sendBroadcast(intent)
     }
 
     // -----------------------------------------------------------------------
@@ -206,13 +276,19 @@ class CavadVpnService : VpnService() {
     }
 
     private fun buildNotification(text: String): Notification {
-        val disconnectIntent = Intent(this, CavadVpnService::class.java).apply {
-            action = ACTION_DISCONNECT
-        }
         val pendingFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         else PendingIntent.FLAG_UPDATE_CURRENT
 
+        // Tap notification → open MainActivity
+        val mainIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val mainPi = PendingIntent.getActivity(this, 1, mainIntent, pendingFlags)
+
+        val disconnectIntent = Intent(this, CavadVpnService::class.java).apply {
+            action = ACTION_DISCONNECT
+        }
         val disconnectPi = PendingIntent.getService(this, 0, disconnectIntent, pendingFlags)
 
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -226,6 +302,7 @@ class CavadVpnService : VpnService() {
             .setContentTitle("CavadVPN")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(mainPi)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", disconnectPi)
             .build()
     }

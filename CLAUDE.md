@@ -511,3 +511,29 @@ Wire format обеспечивает статистическую неразли
 
 **Тесты:** 39 тестов (CryptoCoreTest×11, NoiseHandshakeTest×9, ReplayFilterTest×9, ObfsConnTest×5, MuxConnTest×5)  
 **Запуск:** `cd android && ./gradlew test`
+
+### ЗАДАЧА 24 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `android/app/src/main/java/com/cavadvpn/ui/`, `android/app/src/main/java/com/cavadvpn/config/ConfigStore.kt`, `android/app/src/main/java/com/cavadvpn/config/QrConfig.kt`, `android/app/src/main/java/com/cavadvpn/vpn/VpnStats.kt`, `android/app/src/main/java/com/cavadvpn/vpn/VpnConnectionState.kt`
+
+Реализован Android UI стек:
+- `VpnConnectionState` — sealed class: `Disconnected`, `Connecting`, `Connected(stats: VpnStats)`, `Error(message: String)`
+- `VpnStats` — data class (bytesIn, bytesOut, connectedSinceMs, assignedIp); `formatBytes()` top-level функция (0 B / 1.5 KB / 1.0 MB / 1.0 GB); `formatUptime()` → "HH:MM:SS"; `EMPTY` константа
+- `ConfigStore` — SharedPreferences обёртка: `save(prefs, config)`, `load(prefs): VpnConfig?`, `clear(prefs)`; ключи: server_host, server_port, private_key_hex, server_public_key_hex, dns_server, mtu
+- `QrConfig` — парсер QR конфигурации (JSON и URI `cavadvpn://config?...` форматы): `parseQrCode(text)` → VpnConfig, `toQrJson(config)` → String; встроенный JSON парсер без Android зависимостей; валидация hex ключа (64 символа), host:port, диапазон порта
+- `MainActivity` — экран подключения: статус-индикатор, большая кнопка Connect/Disconnect, карточки трафика (↓ bytesIn, ↑ bytesOut, аптайм, assigned IP), кнопки Settings и Scan QR; VPN permission flow через `ActivityResultLauncher<Intent>` (VpnService.prepare()); слушает `ACTION_STATS_UPDATE` и `ACTION_VPN_STATE_CHANGED` broadcasts
+- `SettingsActivity` — настройки: поля Server Host, Port, Private Key (hex), Server Public Key (hex, опц.), DNS; кнопка "Generate Key" (X25519 через BouncyCastle); загрузка/сохранение через ConfigStore
+- `QrScanActivity` — QR сканер: CameraX PreviewView + ImageAnalysis, ZXing `MultiFormatReader` для декодирования, запрос разрешения CAMERA через `ActivityResultLauncher`, результат через setResult(RESULT_OK) с extras
+
+В `CavadVpnService` добавлены:
+- `bytesIn: AtomicLong`, `bytesOut: AtomicLong` — счётчики без блокировок (обновление per-packet в runTunnel)
+- Периодический корутин (каждые 1000 мс) → `sendBroadcast(ACTION_STATS_UPDATE)` с extras: bytes_in, bytes_out, assigned_ip, connected_since_ms
+- `ACTION_VPN_STATE_CHANGED` broadcasts при старте/стопе/ошибке
+- Нотификация → PendingIntent открывает MainActivity при тапе
+- `ACTION_STATS_UPDATE`, `ACTION_VPN_STATE_CHANGED`, `EXTRA_STATE`, `EXTRA_*` константы
+
+Зависимости (все без Google Play Services): lifecycle-viewmodel-ktx:2.7.0, activity-ktx:1.8.2, appcompat:1.6.1, material:1.11.0, camera-core/camera2/lifecycle/view:1.3.1, zxing:core:3.5.3. ViewBinding включён.
+
+**Проверка производительности:** AtomicLong обновления без блокировок — нет замедления в data path. Broadcast только раз в секунду. VpnStatsTest проверяет корректность formatBytes при нагрузке.
+
+**Тесты:** 32 теста (ConfigStoreTest×9, QrConfigTest×11, VpnStatsTest×12), все pass  
+**Запуск:** `cd android/test-runner && mvn -s mvn-settings.xml test`
