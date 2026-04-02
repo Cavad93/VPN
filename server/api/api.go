@@ -79,6 +79,7 @@ type APIServer struct {
 	srv    ServerIface
 	logger *slog.Logger
 	mux    *http.ServeMux
+	logBuf *LogBuffer
 }
 
 // NewAPIServer creates a new APIServer and registers all routes.
@@ -136,6 +137,9 @@ func (a *APIServer) Run(ctx context.Context) error {
 // ---------------------------------------------------------------------------
 
 func (a *APIServer) registerRoutes() {
+	// Web dashboard and logs.
+	a.registerDashboardRoutes()
+
 	// Health — no authentication.
 	a.mux.HandleFunc("GET /api/v1/health", a.handleHealth)
 

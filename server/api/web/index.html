@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CavadVPN — Панель управления</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+.header{background:#1e293b;border-bottom:1px solid #334155;padding:1rem 1.5rem;display:flex;align-items:center;justify-content:space-between}
+.header h1{font-size:1.25rem;font-weight:700;color:#f1f5f9}
+.header h1 span{color:#38bdf8}
+.status-dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px}
+.status-ok{background:#22c55e;box-shadow:0 0 6px #22c55e}
+.status-err{background:#ef4444;box-shadow:0 0 6px #ef4444}
+.status-unknown{background:#94a3b8}
+.auth-bar{display:flex;gap:8px;align-items:center}
+.auth-bar input{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:6px 10px;border-radius:6px;font-size:0.875rem;width:280px}
+.auth-bar input::placeholder{color:#64748b}
+.btn{padding:6px 14px;border-radius:6px;border:none;cursor:pointer;font-size:0.875rem;font-weight:500;transition:opacity .15s}
+.btn-primary{background:#0284c7;color:#fff}
+.btn-primary:hover{opacity:.85}
+.btn-danger{background:#dc2626;color:#fff}
+.btn-danger:hover{opacity:.85}
+.btn-sm{padding:3px 10px;font-size:0.8rem}
+.btn-success{background:#16a34a;color:#fff}
+.btn-success:hover{opacity:.85}
+.main{padding:1.5rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:1.5rem}
+.card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:1.25rem}
+.card-title{font-size:0.75rem;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8;margin-bottom:.5rem}
+.card-value{font-size:1.75rem;font-weight:700;color:#f1f5f9}
+.card-sub{font-size:0.75rem;color:#64748b;margin-top:.25rem}
+.section{background:#1e293b;border:1px solid #334155;border-radius:10px;margin-bottom:1.5rem}
+.section-header{padding:1rem 1.25rem;border-bottom:1px solid #334155;display:flex;align-items:center;justify-content:space-between}
+.section-title{font-weight:600;color:#f1f5f9}
+.section-body{padding:1.25rem}
+table{width:100%;border-collapse:collapse;font-size:0.875rem}
+th{text-align:left;padding:8px 12px;color:#94a3b8;font-weight:500;font-size:0.75rem;text-transform:uppercase;border-bottom:1px solid #334155}
+td{padding:8px 12px;border-bottom:1px solid #1e293b;color:#cbd5e1}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#0f172a}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.7rem;font-weight:600}
+.badge-green{background:#14532d;color:#4ade80}
+.badge-red{background:#450a0a;color:#f87171}
+.mono{font-family:monospace;font-size:0.8rem}
+.key-input-row{display:flex;gap:8px;margin-bottom:1rem}
+.key-input-row input{flex:1;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:8px 12px;border-radius:6px;font-size:0.875rem;font-family:monospace}
+.key-input-row input::placeholder{color:#64748b}
+.logs-container{max-height:400px;overflow-y:auto;font-family:monospace;font-size:0.8rem;background:#0f172a;border-radius:6px;padding:1rem}
+.log-entry{display:flex;gap:12px;padding:3px 0;border-bottom:1px solid #1e293b}
+.log-entry:last-child{border-bottom:none}
+.log-time{color:#64748b;white-space:nowrap;flex-shrink:0}
+.log-level{width:40px;flex-shrink:0;font-weight:600}
+.log-level.info{color:#38bdf8}
+.log-level.warn{color:#fbbf24}
+.log-level.error{color:#f87171}
+.log-level.debug{color:#94a3b8}
+.log-msg{color:#cbd5e1;word-break:break-all}
+.log-attrs{color:#64748b;margin-left:4px}
+.empty-state{text-align:center;padding:2rem;color:#64748b}
+.refresh-toggle{display:flex;align-items:center;gap:8px;font-size:0.875rem;color:#94a3b8}
+.refresh-toggle input[type=checkbox]{cursor:pointer}
+.error-msg{color:#f87171;font-size:0.875rem;padding:8px;background:#450a0a;border-radius:6px;margin-top:8px;display:none}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span>Cavad</span>VPN — Панель управления</h1>
+  <div class="auth-bar">
+    <span id="serverStatus"><span class="status-dot status-unknown"></span>–</span>
+    <input type="password" id="apiToken" placeholder="API токен (если задан)" />
+    <button class="btn btn-primary" onclick="refreshAll()">Обновить</button>
+    <label class="refresh-toggle">
+      <input type="checkbox" id="autoRefresh" checked onchange="toggleAutoRefresh()"> Авто
+    </label>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- Stats cards -->
+  <div class="grid">
+    <div class="card">
+      <div class="card-title">Активные сессии</div>
+      <div class="card-value" id="statSessions">–</div>
+      <div class="card-sub">клиентов онлайн</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Трафик входящий</div>
+      <div class="card-value" id="statBytesIn">–</div>
+      <div class="card-sub">получено от клиентов</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Трафик исходящий</div>
+      <div class="card-value" id="statBytesOut">–</div>
+      <div class="card-sub">отправлено клиентам</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Разрешённых ключей</div>
+      <div class="card-value" id="statKeys">–</div>
+      <div class="card-sub">в белом списке</div>
+    </div>
+  </div>
+
+  <!-- Sessions -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">Активные сессии</span>
+    </div>
+    <div class="section-body" style="padding:0;overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Назначенный IP</th>
+            <th>Публичный ключ</th>
+            <th>Входящий</th>
+            <th>Исходящий</th>
+            <th>Подключён</th>
+            <th>Длительность</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="sessionsBody">
+          <tr><td colspan="8" class="empty-state">Загрузка…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Keys -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">Разрешённые ключи</span>
+    </div>
+    <div class="section-body">
+      <div class="key-input-row">
+        <input type="text" id="newKeyInput" placeholder="X25519 публичный ключ (64 hex символа)" maxlength="64" />
+        <button class="btn btn-success" onclick="addKey()">Добавить</button>
+      </div>
+      <div id="keyError" class="error-msg"></div>
+      <table>
+        <thead>
+          <tr><th>#</th><th>Ключ (hex)</th><th>Онлайн</th><th></th></tr>
+        </thead>
+        <tbody id="keysBody">
+          <tr><td colspan="4" class="empty-state">Загрузка…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Logs -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">Журнал сервера</span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="logLevel" style="background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:4px 8px;border-radius:6px;font-size:0.875rem">
+          <option value="">Все уровни</option>
+          <option value="error">Только ошибки</option>
+          <option value="warn">Warn+</option>
+          <option value="info">Info+</option>
+        </select>
+        <button class="btn btn-primary btn-sm" onclick="loadLogs()">Обновить</button>
+      </div>
+    </div>
+    <div class="section-body" style="padding:0">
+      <div class="logs-container" id="logsContainer">
+        <div class="empty-state">Загрузка…</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const BASE = '';
+let autoRefreshTimer = null;
+
+function token() { return document.getElementById('apiToken').value.trim(); }
+
+function headers() {
+  const h = { 'Content-Type': 'application/json' };
+  const t = token();
+  if (t) h['Authorization'] = 'Bearer ' + t;
+  return h;
+}
+
+async function apiFetch(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign(headers(), opts.headers || {});
+  const r = await fetch(BASE + path, opts);
+  return r;
+}
+
+function formatBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024*1024) return (n/1024).toFixed(1) + ' KiB';
+  if (n < 1024*1024*1024) return (n/1024/1024).toFixed(2) + ' MiB';
+  return (n/1024/1024/1024).toFixed(2) + ' GiB';
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+async function loadHealth() {
+  try {
+    const r = await fetch(BASE + '/api/v1/health');
+    const el = document.getElementById('serverStatus');
+    if (r.ok) {
+      el.innerHTML = '<span class="status-dot status-ok"></span>Онлайн';
+    } else {
+      el.innerHTML = '<span class="status-dot status-err"></span>Ошибка';
+    }
+  } catch {
+    document.getElementById('serverStatus').innerHTML = '<span class="status-dot status-err"></span>Недоступен';
+  }
+}
+
+async function loadStats() {
+  try {
+    const r = await apiFetch('/api/v1/stats');
+    if (!r.ok) return;
+    const d = await r.json();
+    document.getElementById('statSessions').textContent = d.active_sessions ?? '–';
+    document.getElementById('statBytesIn').textContent = formatBytes(d.total_bytes_in || 0);
+    document.getElementById('statBytesOut').textContent = formatBytes(d.total_bytes_out || 0);
+  } catch {}
+}
+
+async function loadSessions() {
+  try {
+    const r = await apiFetch('/api/v1/sessions');
+    if (!r.ok) { renderSessionsError(); return; }
+    const sessions = await r.json();
+    const tbody = document.getElementById('sessionsBody');
+    if (!sessions.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty-state">Нет активных сессий</td></tr>';
+      return;
+    }
+    tbody.innerHTML = sessions.map(s => `
+      <tr>
+        <td>${escHtml(s.id)}</td>
+        <td><span class="badge badge-green">${escHtml(s.assigned_ip || '–')}</span></td>
+        <td class="mono" title="${escHtml(s.remote_key)}">${escHtml((s.remote_key||'').substring(0,16))}…</td>
+        <td>${formatBytes(s.bytes_in||0)}</td>
+        <td>${formatBytes(s.bytes_out||0)}</td>
+        <td>${escHtml(s.connected_at ? new Date(s.connected_at).toLocaleString('ru') : '–')}</td>
+        <td>${escHtml(s.duration||'–')}</td>
+        <td><button class="btn btn-danger btn-sm" onclick="disconnectSession(${escHtml(s.id)})">Отключить</button></td>
+      </tr>`).join('');
+  } catch { renderSessionsError(); }
+}
+
+function renderSessionsError() {
+  document.getElementById('sessionsBody').innerHTML = '<tr><td colspan="8" class="empty-state">Ошибка загрузки</td></tr>';
+}
+
+async function disconnectSession(id) {
+  if (!confirm('Отключить сессию #' + id + '?')) return;
+  try {
+    await apiFetch('/api/v1/sessions/' + id, { method: 'DELETE' });
+    await loadSessions();
+    await loadStats();
+  } catch {}
+}
+
+async function loadKeys() {
+  try {
+    const r = await apiFetch('/api/v1/keys');
+    if (!r.ok) {
+      document.getElementById('keysBody').innerHTML = '<tr><td colspan="4" class="empty-state">Ошибка или список открытый</td></tr>';
+      document.getElementById('statKeys').textContent = '–';
+      return;
+    }
+    const d = await r.json();
+    const keys = d.keys || [];
+    document.getElementById('statKeys').textContent = keys.length;
+
+    // Get active sessions to highlight online keys
+    let activeSessions = [];
+    try {
+      const sr = await apiFetch('/api/v1/sessions');
+      if (sr.ok) activeSessions = await sr.json();
+    } catch {}
+    const activeKeys = new Set(activeSessions.map(s => s.remote_key));
+
+    const tbody = document.getElementById('keysBody');
+    if (!keys.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty-state">Список ключей пуст (открытый доступ)</td></tr>';
+      return;
+    }
+    tbody.innerHTML = keys.map((k, i) => `
+      <tr>
+        <td>${i+1}</td>
+        <td class="mono">${escHtml(k)}</td>
+        <td>${activeKeys.has(k) ? '<span class="badge badge-green">онлайн</span>' : '<span class="badge" style="background:#1e293b;color:#64748b">оффлайн</span>'}</td>
+        <td><button class="btn btn-danger btn-sm" onclick="removeKey('${escHtml(k)}')">Удалить</button></td>
+      </tr>`).join('');
+  } catch {
+    document.getElementById('keysBody').innerHTML = '<tr><td colspan="4" class="empty-state">Ошибка загрузки</td></tr>';
+  }
+}
+
+async function addKey() {
+  const val = document.getElementById('newKeyInput').value.trim();
+  const errEl = document.getElementById('keyError');
+  errEl.style.display = 'none';
+  if (val.length !== 64) {
+    errEl.textContent = 'Ключ должен быть 64 hex символа (32 байта X25519)';
+    errEl.style.display = 'block';
+    return;
+  }
+  try {
+    const r = await apiFetch('/api/v1/keys', { method:'POST', body: JSON.stringify({key: val}) });
+    if (!r.ok) {
+      const d = await r.json();
+      errEl.textContent = d.error || 'Ошибка добавления ключа';
+      errEl.style.display = 'block';
+      return;
+    }
+    document.getElementById('newKeyInput').value = '';
+    await loadKeys();
+  } catch (e) {
+    errEl.textContent = 'Ошибка: ' + e.message;
+    errEl.style.display = 'block';
+  }
+}
+
+async function removeKey(key) {
+  if (!confirm('Удалить ключ ' + key.substring(0,16) + '…?')) return;
+  try {
+    await apiFetch('/api/v1/keys/' + encodeURIComponent(key), { method: 'DELETE' });
+    await loadKeys();
+  } catch {}
+}
+
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+
+async function loadLogs() {
+  const container = document.getElementById('logsContainer');
+  try {
+    const r = await apiFetch('/api/v1/logs?limit=200');
+    if (!r.ok) {
+      container.innerHTML = '<div class="empty-state">Ошибка загрузки логов</div>';
+      return;
+    }
+    const entries = await r.json();
+    if (!entries || !entries.length) {
+      container.innerHTML = '<div class="empty-state">Журнал пуст</div>';
+      return;
+    }
+
+    const filterLevel = document.getElementById('logLevel').value;
+    const minLevel = filterLevel ? (LOG_LEVELS[filterLevel] ?? 0) : 0;
+
+    const filtered = entries.filter(e => (LOG_LEVELS[e.level] ?? 0) >= minLevel);
+    if (!filtered.length) {
+      container.innerHTML = '<div class="empty-state">Нет записей с выбранным уровнем</div>';
+      return;
+    }
+
+    const wasAtBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 5;
+
+    container.innerHTML = filtered.map(e => {
+      const t = e.time ? new Date(e.time).toLocaleTimeString('ru') : '';
+      const attrs = e.attrs && Object.keys(e.attrs).length
+        ? ' ' + Object.entries(e.attrs).map(([k,v]) => escHtml(k)+'='+escHtml(String(v))).join(' ')
+        : '';
+      return `<div class="log-entry">
+        <span class="log-time">${escHtml(t)}</span>
+        <span class="log-level ${escHtml(e.level)}">${escHtml((e.level||'').toUpperCase().substring(0,4))}</span>
+        <span class="log-msg">${escHtml(e.message)}<span class="log-attrs">${attrs}</span></span>
+      </div>`;
+    }).join('');
+
+    if (wasAtBottom) container.scrollTop = container.scrollHeight;
+  } catch {
+    container.innerHTML = '<div class="empty-state">Ошибка загрузки логов</div>';
+  }
+}
+
+async function refreshAll() {
+  await Promise.all([loadHealth(), loadStats(), loadSessions(), loadKeys(), loadLogs()]);
+}
+
+function toggleAutoRefresh() {
+  const checked = document.getElementById('autoRefresh').checked;
+  if (checked) {
+    autoRefreshTimer = setInterval(refreshAll, 5000);
+  } else {
+    clearInterval(autoRefreshTimer);
+  }
+}
+
+// Initial load
+refreshAll();
+autoRefreshTimer = setInterval(refreshAll, 5000);
+
+// Refresh logs when filter changes
+document.getElementById('logLevel').addEventListener('change', loadLogs);
+</script>
+</body>
+</html>
