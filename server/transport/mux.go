@@ -127,22 +127,22 @@ func (m *Mux) Close() error {
 }
 
 // writeFrame serialises and sends a single mux frame. Thread-safe.
+// Header and payload are concatenated into one slice before writing so that
+// the underlying NoiseConn encrypts them as a single message. This is
+// required for the Python client which expects one read_message() call to
+// return the complete frame (header + payload).
 func (m *Mux) writeFrame(streamID uint32, fType uint8, payload []byte) error {
-	hdr := make([]byte, muxHeaderSize)
-	binary.BigEndian.PutUint32(hdr[0:4], streamID)
-	hdr[4] = fType
-	binary.BigEndian.PutUint16(hdr[5:7], uint16(len(payload)))
+	frame := make([]byte, muxHeaderSize+len(payload))
+	binary.BigEndian.PutUint32(frame[0:4], streamID)
+	frame[4] = fType
+	binary.BigEndian.PutUint16(frame[5:7], uint16(len(payload)))
+	copy(frame[muxHeaderSize:], payload)
 
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
 
-	if _, err := m.conn.Write(hdr); err != nil {
+	if _, err := m.conn.Write(frame); err != nil {
 		return err
-	}
-	if len(payload) > 0 {
-		if _, err := m.conn.Write(payload); err != nil {
-			return err
-		}
 	}
 	return nil
 }
