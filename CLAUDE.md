@@ -461,3 +461,35 @@ Wire format обеспечивает статистическую неразли
 **Тесты (Pester 5.x):** `scripts/install_server.Tests.ps1` — тесты всех вспомогательных функций без реальной установки  
 **Запуск установщика:** `.\install_server.ps1` (от имени администратора)  
 **Запуск тестов:** `Invoke-Pester .\scripts\install_server.Tests.ps1 -Output Detailed`
+
+### ЗАДАЧА 22 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `scripts/install_client.sh`, `scripts/macos_pkg/`, `client/cavadvpn_cli.py`
+
+Реализован macOS .pkg установщик VPN клиента:
+- `install_client.sh` — основной bash скрипт сборки .pkg (требует macOS + Xcode CLT)
+- `parse_args` — разбор аргументов: `--version`, `--output-dir`, `--repo-path`, `--sign-identity`, `--notarize`, `--apple-id`, `--apple-password`, `--team-id`
+- `validate_args` — валидация: проверка наличия client/ директории, обязательных полей для нотаризации
+- `prepare_dirs` — создание временных директорий payload/scripts/resources
+- `copy_client_files` — копирование Python модулей клиента в `/Applications/CavadVPN/`
+- `build_component_pkg` — `pkgbuild` — компонентный пакет с payload + scripts
+- `build_distribution_pkg` — `productbuild` — финальный .pkg с UI ресурсами
+- `notarize_pkg` — `xcrun notarytool submit` + `xcrun stapler staple` (опционально)
+- `verify_pkg` — `pkgutil --check-signature` + листинг содержимого
+
+**Инсталляционные скрипты** (`scripts/macos_pkg/scripts/`):
+- `preinstall` — проверяет macOS 12+, arch x86_64/arm64, Python 3.11+
+- `postinstall` — создаёт venv, `pip install -r requirements.txt`, CLI wrapper `/usr/local/bin/cavadvpn`, LaunchAgent `~/Library/LaunchAgents/com.cavadvpn.client.plist`
+- `preuninstall` — выгружает LaunchAgent, удаляет CLI wrapper, останавливает процессы
+
+**Ресурсы установщика** (`scripts/macos_pkg/resources/`):
+- `welcome.html`, `readme.html`, `license.html`, `conclusion.html` — экраны installer GUI
+- `distribution.xml` — описание пакета для productbuild (минимальная macOS 12, x86_64+arm64)
+
+**CLI точка входа** (`client/cavadvpn_cli.py`):
+- Команды: `connect [--server HOST:PORT]`, `disconnect`, `status`, `config [--set KEY=VAL]`, `version`
+- Читает/пишет конфиг `~/.config/cavadvpn/config.yaml`
+- PID-файл для отслеживания активного соединения
+
+**Тесты:** 70 тестов, все pass (работают на Linux без macOS-специфичных инструментов)  
+**Запуск тестов:** `bash scripts/test_install_client.sh`  
+**Сборка .pkg (только macOS):** `bash scripts/install_client.sh --version 1.0.0`

@@ -1,0 +1,34 @@
+#!/bin/bash
+# preuninstall — CavadVPN macOS client pre-uninstall cleanup
+# Stops running processes and removes LaunchAgent before files are deleted.
+
+set -euo pipefail
+
+PLIST_NAME="com.cavadvpn.client.plist"
+CLI_LINK="/usr/local/bin/cavadvpn"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(dscl . -read "/Users/$REAL_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || echo "$HOME")
+PLIST_PATH="$REAL_HOME/Library/LaunchAgents/$PLIST_NAME"
+
+# ── Unload LaunchAgent ───────────────────────────────────────────────────────
+if [[ -f "$PLIST_PATH" ]]; then
+    log "Unloading LaunchAgent ..."
+    sudo -u "$REAL_USER" launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    rm -f "$PLIST_PATH"
+    log "LaunchAgent removed."
+fi
+
+# ── Remove CLI wrapper ────────────────────────────────────────────────────────
+if [[ -L "$CLI_LINK" || -f "$CLI_LINK" ]]; then
+    rm -f "$CLI_LINK"
+    log "CLI wrapper removed: $CLI_LINK"
+fi
+
+# ── Kill any running cavadvpn processes ───────────────────────────────────────
+pkill -f "cavadvpn" 2>/dev/null || true
+
+log "Pre-uninstall cleanup complete."
+exit 0

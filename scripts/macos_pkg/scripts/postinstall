@@ -1,0 +1,128 @@
+#!/bin/bash
+# postinstall — CavadVPN macOS client post-installation setup
+# Runs after files are copied to DSTROOT. Sets up Python venv,
+# installs dependencies, creates CLI wrapper, and installs LaunchAgent.
+
+set -euo pipefail
+
+INSTALL_DIR="/Applications/CavadVPN"
+VENV_DIR="$INSTALL_DIR/venv"
+CLI_LINK="/usr/local/bin/cavadvpn"
+LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+PLIST_NAME="com.cavadvpn.client.plist"
+LOG_FILE="/var/log/cavadvpn_install.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+# ── Find Python ──────────────────────────────────────────────────────────────
+PYTHON=""
+for candidate in python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" &>/dev/null; then
+        minor=$("$candidate" -c 'import sys; print(sys.version_info[1])' 2>/dev/null || true)
+        if [[ -n "$minor" && "$minor" -ge 11 ]]; then
+            PYTHON="$candidate"
+            break
+        fi
+    fi
+done
+
+if [[ -z "$PYTHON" ]]; then
+    log "ERROR: Python 3.11+ not found after installation. Aborting."
+    exit 1
+fi
+
+log "Using Python: $PYTHON ($("$PYTHON" --version))"
+
+# ── Create virtual environment ───────────────────────────────────────────────
+log "Creating virtual environment at $VENV_DIR ..."
+"$PYTHON" -m venv "$VENV_DIR"
+VENV_PYTHON="$VENV_DIR/bin/python3"
+VENV_PIP="$VENV_DIR/bin/pip"
+
+# ── Install dependencies ─────────────────────────────────────────────────────
+log "Installing Python dependencies ..."
+"$VENV_PIP" install --quiet --upgrade pip
+"$VENV_PIP" install --quiet -r "$INSTALL_DIR/requirements.txt"
+
+# ── Create CLI wrapper at /usr/local/bin/cavadvpn ────────────────────────────
+log "Creating CLI wrapper at $CLI_LINK ..."
+mkdir -p /usr/local/bin
+cat > "$CLI_LINK" <<'WRAPPER'
+#!/bin/bash
+# CavadVPN CLI launcher
+exec "/Applications/CavadVPN/venv/bin/python3" "/Applications/CavadVPN/cavadvpn_cli.py" "$@"
+WRAPPER
+chmod 755 "$CLI_LINK"
+
+# ── Create menubar launcher script ───────────────────────────────────────────
+LAUNCHER="$INSTALL_DIR/launch_menubar.sh"
+cat > "$LAUNCHER" <<'LAUNCHER_SCRIPT'
+#!/bin/bash
+exec "/Applications/CavadVPN/venv/bin/python3" "/Applications/CavadVPN/menubar_main.py" "$@"
+LAUNCHER_SCRIPT
+chmod 755 "$LAUNCHER"
+
+# ── Install LaunchAgent (per-user) ───────────────────────────────────────────
+# Determine the installing user (macOS pkg installs as root, SUDO_USER is set)
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(dscl . -read "/Users/$REAL_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || echo "$HOME")
+LAUNCH_AGENTS_DIR="$REAL_HOME/Library/LaunchAgents"
+
+mkdir -p "$LAUNCH_AGENTS_DIR"
+PLIST_PATH="$LAUNCH_AGENTS_DIR/$PLIST_NAME"
+
+log "Installing LaunchAgent to $PLIST_PATH ..."
+cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cavadvpn.client</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/CavadVPN/launch_menubar.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>$REAL_HOME/Library/Logs/CavadVPN/menubar.log</string>
+    <key>StandardErrorPath</key>
+    <string>$REAL_HOME/Library/Logs/CavadVPN/menubar_error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
+PLIST
+
+# Fix ownership so user (not root) owns the plist
+chown "$REAL_USER" "$PLIST_PATH"
+chmod 644 "$PLIST_PATH"
+
+# Create log directory
+mkdir -p "$REAL_HOME/Library/Logs/CavadVPN"
+chown -R "$REAL_USER" "$REAL_HOME/Library/Logs/CavadVPN"
+
+# ── Fix ownership of install directory ───────────────────────────────────────
+chown -R root:wheel "$INSTALL_DIR"
+chmod -R 755 "$INSTALL_DIR"
+# venv is user-writable
+chmod -R 755 "$VENV_DIR"
+
+log "Installation complete."
+log ""
+log "To use CavadVPN:"
+log "  CLI:    cavadvpn --help"
+log "  Menubar: open /Applications/CavadVPN/CavadVPN.app"
+log ""
+log "Config file location: ~/.config/cavadvpn/config.yaml"
+
+exit 0
