@@ -41,6 +41,10 @@ server/
 │   ├── udp_test.go      — unit + integration тесты транспорта
 │   ├── obfs.go          — TLS-обфускация трафика (DPI bypass, fake TLS 1.3 records)
 │   └── obfs_test.go     — unit тесты ObfsConn
+├── service/
+│   ├── windows_service.go — Windows SCM интеграция (build: windows)
+│   ├── service_stub.go    — заглушка для не-Windows платформ (build: !windows)
+│   └── service_test.go    — unit тесты
 ```
 
 ## Прогресс задач
@@ -192,3 +196,23 @@ Wire format: 7-байтный заголовок (streamID uint32 + type uint8 +
 
 **Тесты:** 27 тестов api + 7 новых тестов main, покрытие api 87.2%, main 80.4%  
 **Запуск:** `cd server && go test ./api/ -v -cover`
+
+### ЗАДАЧА 9 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `server/service/windows_service.go`, `server/service/service_stub.go`
+
+Реализован Windows Service враппер:
+- `RunFunc` — тип функции запуска VPN сервера `func(ctx context.Context) error`
+- `vpnService` — реализует `svc.Handler`, мост между Windows SCM и context-based shutdown
+- `RunAsService(name, run, logger)` — запуск под управлением Windows SCM (блокирует до остановки)
+- `IsWindowsService()` — определяет, запущен ли процесс как служба Windows
+- `Install(name, displayName, description, exePath)` — регистрация службы в SCM (требует admin)
+- `Remove(name)` — удаление службы из SCM (требует admin)
+- `ErrNotWindows` — sentinel error для не-Windows платформ
+
+Логика `Execute`: SCM → Stop/Shutdown → отмена context → ожидание завершения сервера (таймаут 30с). Ошибка сервера → Win32 exit code 1. SCM → Interrogate → echo текущего статуса.
+Константы: `DefaultServiceName="CavadVPN"`, `DefaultDisplayName`, `DefaultDescription`.
+
+На не-Windows платформах `service_stub.go` (build: !windows) возвращает `ErrNotWindows` для всех операций SCM.
+
+**Тесты:** 9 тестов, покрытие 100%  
+**Запуск:** `cd server && go test ./service/ -v -cover`
