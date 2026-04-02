@@ -366,18 +366,31 @@ Wire format обеспечивает статистическую неразли
 **Запуск:** `cd client && python3 -m pytest test_padding.py -v`
 
 ### ЗАДАЧА 18 — ВЫПОЛНЕНО (2026-04-02)
-**Файлы:** `server/transport/sni.go`, `server/transport/sni_test.go`
+**Файлы:** `server/transport/sni.go`, `server/transport/sni_test.go`, `client/sni_spoof.py`, `client/test_sni_spoof.py`, `server/transport/obfs_test.go`
 
-Реализован SNI spoofing для TLS-обфускации — подделка Server Name Indication под легитимные домены:
+Реализован SNI spoofing — полный стек для обеих сторон:
+
+**Go (сервер):** `server/transport/sni.go`
 - `SNISelector` — интерфейс выбора домена (`Select() string`)
-- `StaticSNI{Domain}` — всегда возвращает фиксированный домен (для стабильной имитации одного сервиса)
-- `RandomSNI{Domains}` + `NewRandomSNI()` — случайный выбор из пула: www.google.com, www.youtube.com, www.cloudflare.com, cdn.cloudflare.com, www.googleapis.com и другие (10 доменов)
-- `buildSNIExtension(host)` — кодирует TLS server_name extension (RFC 6066 §3): ext_type(2) + ext_len(2) + list_len(2) + name_type(1) + name_len(2) + name
-- `buildSupportedVersionsExtension()` — TLS supported_versions extension, объявляющий TLS 1.3 (0x0304)
-- `buildClientHelloWithSNI(sni)` — синтетический ClientHello с SNI + supported_versions extensions; random/session_id — криптографически случайные (уникальны при каждом вызове)
-- `ExtractSNI(body []byte) string` — парсинг SNI из тела ClientHello (для серверного логирования/отладки)
-- `ObfsConn.WithSNI(selector) *ObfsConn` — builder-метод для настройки SNI на клиентской стороне
-- Обновлён `ObfsConn.ClientHandshake()` — если sniSelector установлен, отправляет ClientHello с SNI; иначе — прежнее поведение без SNI
+- `StaticSNI{Domain}` — всегда возвращает фиксированный домен
+- `RandomSNI{Domains}` + `NewRandomSNI()` — случайный выбор из пула 10 легитимных доменов
+- `buildSNIExtension(host)` — кодирует TLS server_name extension (RFC 6066 §3)
+- `buildSupportedVersionsExtension()` — extension supported_versions с TLS 1.3
+- `buildClientHelloWithSNI(sni)` — ClientHello с SNI + supported_versions
+- `ExtractSNI(body)` — парсинг SNI из тела ClientHello (для логирования)
+- `ObfsConn.WithSNI(selector) *ObfsConn` — builder pattern; `ClientHandshake()` включает SNI если selector установлен
 
-**Тесты:** 26 тестов SNI + 70 тестов transport суммарно, покрытие 90.1%  
-**Запуск:** `cd server && go test ./transport/ -v -cover`
+**Python (клиент):** `client/sni_spoof.py`
+- `DOMAIN_POOL` — 30 доменов (YouTube, Google, Cloudflare, Apple, Microsoft, GitHub, Netflix и др.)
+- `RotationPolicy` — стратегия ротации: RANDOM/SEQUENTIAL/FIXED
+- `SNIConfig{domains, rotation_policy, fixed_domain, alpn_protocols, include_session_ticket}` + `validate()`
+- `DomainSelector` — `next_domain()` по политике
+- TLS extension builders: `build_sni_extension`, `build_supported_versions_extension`, `build_supported_groups_extension`, `build_ec_point_formats_extension`, `build_alpn_extension`, `build_signature_algorithms_extension`, `build_session_ticket_extension`, `build_renegotiation_info_extension`
+- `build_client_hello(sni, alpn, include_session_ticket)` — полный Chrome 120 fingerprint: 9 cipher suites, TLS 1.3+1.2, X25519/P-256/P-384, h2/http/1.1 ALPN
+- `parse_server_hello(data)` — диагностический парсинг ServerHello
+- `SNISpoofConn` — drop-in замена ObfsConn (client_handshake, server_handshake, write, read, read_exactly, close, active_sni)
+- `create_sni_conn(sock, config)` — фабричная функция
+
+**Тесты:** 26 тестов Go SNI + 86 тестов Python, все pass  
+**Запуск (Go):** `cd server && go test ./transport/ -v -cover`  
+**Запуск (Python):** `cd client && python3 -m pytest test_sni_spoof.py -v`

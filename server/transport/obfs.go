@@ -212,10 +212,11 @@ func buildAppDataRecord(payload []byte) []byte {
 // buildClientHello returns a synthetic TLS 1.3 ClientHello record.
 // The 32-byte random and 32-byte session_id are filled with fresh random bytes
 // so that every connection produces a unique on-wire byte sequence.
+// Use NewObfsConn(conn).WithSNI(selector) to add an SNI extension.
 func buildClientHello() []byte {
 	var random [32]byte
 	var sessionID [32]byte
-	rand.Read(random[:])   //nolint:errcheck — rand.Read never errors on Linux
+	rand.Read(random[:])    //nolint:errcheck — rand.Read never errors on Linux
 	rand.Read(sessionID[:]) //nolint:errcheck
 
 	// Construct the ClientHello body following RFC 8446 §4.1.2 (simplified).

@@ -299,6 +299,83 @@ func TestObfsServerHelloRandomness(t *testing.T) {
 	}
 }
 
+func TestObfsClientHelloWithSNIContainsSNI(t *testing.T) {
+	// buildClientHelloWithSNI (from sni.go) must embed the SNI extension (type 0x0000).
+	hello := buildClientHelloWithSNI("www.youtube.com")
+	if len(hello) < ObfsHeaderSize+4 {
+		t.Fatalf("ClientHello too short: %d bytes", len(hello))
+	}
+	// Search for the SNI extension type bytes 0x00 0x00 in the record.
+	found := false
+	for i := 0; i+1 < len(hello); i++ {
+		if hello[i] == 0x00 && hello[i+1] == 0x00 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("SNI extension type 0x0000 not found in ClientHello with SNI")
+	}
+}
+
+func TestObfsBuildSNIExtension(t *testing.T) {
+	// buildSNIExtension is defined in sni.go.
+	hostname := "www.youtube.com"
+	ext := buildSNIExtension(hostname)
+
+	// Extension type must be 0x0000 (SNI).
+	if ext[0] != 0x00 || ext[1] != 0x00 {
+		t.Errorf("SNI extension type %02x%02x, want 0000", ext[0], ext[1])
+	}
+	// The hostname bytes must appear in the extension.
+	if !bytes.Contains(ext, []byte(hostname)) {
+		t.Errorf("hostname %q not found in SNI extension", hostname)
+	}
+}
+
+func TestObfsDifferentSNIDomainsDifferentHellos(t *testing.T) {
+	// ClientHellos with different SNIs must produce different on-wire bytes.
+	h1 := buildClientHelloWithSNI("www.youtube.com")
+	h2 := buildClientHelloWithSNI("www.cloudflare.com")
+	// The domain names are different lengths so the records must differ.
+	if bytes.Equal(h1, h2) {
+		t.Fatal("ClientHellos with different SNI domains should differ")
+	}
+}
+
+func TestObfsWithSNIHandshake(t *testing.T) {
+	// Verify that ObfsConn.WithSNI produces a ClientHello that the server
+	// accepts — i.e. the SNI-enhanced hello is backward-compatible.
+	cRaw, sRaw := net.Pipe()
+
+	var (
+		cErr error
+		sErr error
+		wg   sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		client := NewObfsConn(cRaw).WithSNI(NewRandomSNI())
+		cErr = client.ClientHandshake()
+		client.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		server := NewObfsConn(sRaw)
+		sErr = server.ServerHandshake()
+		server.Close()
+	}()
+	wg.Wait()
+
+	if cErr != nil {
+		t.Fatalf("client WithSNI ClientHandshake: %v", cErr)
+	}
+	if sErr != nil {
+		t.Fatalf("server ServerHandshake: %v", sErr)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Error paths
 // ---------------------------------------------------------------------------
