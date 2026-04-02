@@ -317,3 +317,19 @@ Wire format: каждый пакет на utun предваряется 4-бай
 
 **Тесты:** 49 тестов, все pass  
 **Запуск:** `cd client && python3 -m pytest test_killswitch.py -v`
+
+### ЗАДАЧА 15 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `client/reconnect.py`, `client/test_reconnect.py`
+
+Реализован авто-реконнект с exponential backoff и health check:
+- `ReconnectConfig{initial_delay, max_delay, backoff_factor, jitter, max_attempts, health_check_interval, health_check_timeout}` — конфигурация
+- `ConnectionState` — перечисление состояний (DISCONNECTED/CONNECTING/CONNECTED/RECONNECTING/STOPPED)
+- `ExponentialBackoff` — вычисление задержки с экспоненциальным ростом, кэпом и jitter; методы `next_delay()`, `reset()`
+- `HealthChecker` — фоновый поток, каждые interval секунд проверяет `_connected`, `_mux._closed`, `_data_stream._closed`; при сбое вызывает `on_failure`
+- `AutoReconnect` — главный класс: `start()`, `stop()`, `wait_connected(timeout)`, `state`, `route_info`; колбэки `on_connected`, `on_disconnected`, `on_reconnecting`; потокобезопасное управление состоянием; автоматический перезапуск при потере соединения
+- `create_auto_reconnect(server_addr, ...)` — фабричная функция
+
+Алгоритм: при обрыве соединения (health check failure или закрытие mux) — HealthChecker останавливается, VPNClient отключается, запускается цикл переподключения с exponential backoff (с jitter). При успехе — backoff сбрасывается, запускается новый HealthChecker.
+
+**Тесты:** 37 тестов, все pass  
+**Запуск:** `cd client && python3 -m pytest test_reconnect.py -v`
