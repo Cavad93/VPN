@@ -409,9 +409,14 @@ class ObfsConn:
     Call client_handshake() before read/write.
     """
 
+    # Large socket-level read buffer: one recv(65536) fills ~45 TLS records,
+    # so most _recv_exactly() calls return instantly from memory with zero syscalls.
+    _SOCK_RECV_SIZE = 65536
+
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
         self._read_buf = b""
+        self._sock_buf = b""  # raw bytes not yet parsed into TLS records
 
     def client_handshake(self) -> None:
         """Send ClientHello, read ServerHello."""
@@ -454,13 +459,17 @@ class ObfsConn:
     # -- internal helpers ---------------------------------------------------
 
     def _recv_exactly(self, n: int) -> bytes:
-        buf = b""
-        while len(buf) < n:
-            chunk = self._sock.recv(n - len(buf))
+        # Fill the socket buffer in large 64 KB chunks so most calls return
+        # from memory without a syscall.  Each recv(65536) typically delivers
+        # ~45 complete TLS records at once.
+        while len(self._sock_buf) < n:
+            chunk = self._sock.recv(self._SOCK_RECV_SIZE)
             if not chunk:
                 raise ConnectionError("connection closed mid-read")
-            buf += chunk
-        return buf
+            self._sock_buf += chunk
+        result = self._sock_buf[:n]
+        self._sock_buf = self._sock_buf[n:]
+        return result
 
     def _read_record(self, want_type: int) -> bytes:
         hdr = self._recv_exactly(5)
