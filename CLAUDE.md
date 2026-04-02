@@ -333,3 +333,18 @@ Wire format: каждый пакет на utun предваряется 4-бай
 
 **Тесты:** 37 тестов, все pass  
 **Запуск:** `cd client && python3 -m pytest test_reconnect.py -v`
+
+### ЗАДАЧА 16 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `client/traffic_shaping.py`, `client/test_traffic_shaping.py`
+
+Реализован traffic shaping модуль для Anti-DPI — имитация паттернов браузерного HTTPS трафика:
+- `TrafficProfile{name, size_buckets, min/max_inter_chunk_ms, burst_count, burst_pause_min/max_ms, padding_probability, max_padding_bytes}` — конфигурация профиля трафика
+- `_sample_from_buckets(buckets)` — взвешенная случайная выборка размера пакета из кумулятивных вероятностных bucket'ов
+- `encode_chunk(data, padding)` / `decode_chunk(chunk)` — wire format с 2-байтным BE заголовком длины padding; обе стороны используют одинаковый формат
+- `TrafficShaper` — основной класс: `fragment(data)` фрагментирует данные согласно профилю, `encode_with_padding(chunk)` добавляет случайный padding, `shape_outgoing(data)` = fragment + encode для всех чанков, `inter_chunk_delay()` возвращает задержку с burst logic (межчанковая пауза или пауза после burst), `wait_inter_chunk()` выполняет sleep, `reset_burst()` сбрасывает счётчик, `stats()` — статистика; потокобезопасен
+- `ShapedConn` — прозрачная обёртка над socket-like соединением: `write(data)` фрагментирует + кодирует + отправляет с опциональным timing, `read(max_size)` читает один shaped chunk и снимает padding, `close()` закрывает соединение
+- Три встроенных профиля: `browser_profile()` (Chrome/Firefox HTTPS: 64–16383 байт, задержки 1–15 мс, burst по 8 чанков), `streaming_profile()` (YouTube/Netflix: крупные пакеты 512–16383 байт, паузы 10–50 мс), `idle_profile()` (keep-alive: 32–512 байт, паузы 500–5000 мс)
+- `create_shaper(name)` — фабричная функция по имени профиля ("browser"/"streaming"/"idle")
+
+**Тесты:** 57 тестов, все pass  
+**Запуск:** `cd client && python3 -m pytest test_traffic_shaping.py -v`
