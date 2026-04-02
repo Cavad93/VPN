@@ -102,7 +102,12 @@ type Server struct {
 	logger      *slog.Logger
 	mu          sync.RWMutex
 	sessions    map[uint64]*clientSession
-	ipIndex     map[uint32]*clientSession // O(1) lookup: packed IPv4 → session
+	// ipIndex maps packed uint32 IPv4 → *clientSession.
+	// sync.Map is used instead of a plain map+RWMutex because routeFromTun
+	// performs a read on every outgoing packet (read-heavy) while writes
+	// happen only on connect/disconnect (rare).  sync.Map avoids any lock
+	// in the steady-state read path via an atomic pointer swap.
+	ipIndex     sync.Map
 	allowedKeys map[[32]byte]struct{}
 	tun         TunDevice
 	pool        *ipPool
@@ -129,7 +134,6 @@ func NewServer(cfg Config, kp *crypto.KeyPair, tun TunDevice, allowedKeys [][cry
 		staticKP: kp,
 		logger:   logger,
 		sessions: make(map[uint64]*clientSession),
-		ipIndex:  make(map[uint32]*clientSession),
 		tun:      tun,
 		pool:     pool,
 		nextID:   1,
@@ -292,9 +296,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		s.mu.Unlock()
 		if cs.assignedIP != nil {
 			packed := binary.BigEndian.Uint32(cs.assignedIP.To4())
-			s.mu.Lock()
-			delete(s.ipIndex, packed)
-			s.mu.Unlock()
+			s.ipIndex.Delete(packed)
 			s.pool.release(cs.assignedIP)
 		}
 		s.logger.Info("session closed", "id", cs.id)
@@ -355,9 +357,7 @@ func (s *Server) handleControlStream(ctx context.Context, cs *clientSession, str
 
 	// Register in O(1) reverse IP index so routeFromTun avoids O(n) scan.
 	packed := binary.BigEndian.Uint32(ip.To4())
-	s.mu.Lock()
-	s.ipIndex[packed] = cs
-	s.mu.Unlock()
+	s.ipIndex.Store(packed, cs)
 
 	// Build 10-byte response: ctlAssign + ip[4] + prefixLen[1] + gw[4]
 	resp := make([]byte, 1+ctlAssignPayloadLen)
@@ -441,15 +441,13 @@ func (s *Server) routeFromTun(ctx context.Context) {
 			continue
 		}
 
-		// O(1) lookup via reverse IP index (packed uint32 key)
+		// Lock-free O(1) lookup via sync.Map (read-optimised for the hot path).
 		dstKey := binary.BigEndian.Uint32(buf[16:20])
-		s.mu.RLock()
-		target := s.ipIndex[dstKey]
-		s.mu.RUnlock()
-
-		if target == nil {
+		val, ok := s.ipIndex.Load(dstKey)
+		if !ok {
 			continue
 		}
+		target := val.(*clientSession)
 
 		target.dataMu.Lock()
 		ds := target.dataStream
