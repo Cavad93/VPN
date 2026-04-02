@@ -162,6 +162,8 @@ func (s *Server) Run(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		ln.Close()
+		// Close TUN to unblock the blocking tun.Read() in routeFromTun.
+		s.tun.Close()
 	}()
 
 	for {
@@ -391,14 +393,11 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 		stream.Close()
 	}()
 
+	// stream.Read() blocks until data arrives or the mux/conn is closed.
+	// Context cancellation closes the mux (see handleConn defer), which
+	// unblocks Read() with an error — no per-iteration select needed.
 	buf := make([]byte, 65536)
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
 		n, err := stream.Read(buf)
 		if err != nil {
 			return
@@ -415,20 +414,14 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 }
 
 // routeFromTun reads packets from the TUN device and routes them to clients.
+// Termination: the Run() goroutine closes the TUN device when ctx is cancelled,
+// which causes tun.Read() to return an error and this loop to exit.
 func (s *Server) routeFromTun(ctx context.Context) {
-	// 64 KB is the maximum single IP packet, but Linux TUN may coalesce
-	// multiple packets via GRO into a single read() up to ~65535 bytes.
-	// Using a full 64 KB buffer ensures we always capture complete packets.
 	buf := make([]byte, 65536)
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
 		n, err := s.tun.Read(buf)
 		if err != nil {
+			// Normal shutdown path: ctx cancelled → TUN closed → read error.
 			select {
 			case <-ctx.Done():
 				return
