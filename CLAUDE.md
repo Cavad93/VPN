@@ -434,3 +434,30 @@ Wire format обеспечивает статистическую неразли
 
 **Тесты:** 36 новых тестов (63 суммарно), покрытие пакета api 89.1%  
 **Запуск:** `cd server && go test ./api/ -v -cover`
+
+### ЗАДАЧА 21 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `scripts/install_server.ps1`, `scripts/install_server.Tests.ps1`
+
+Реализован PowerShell автоустановщик VPN сервера для Windows Server 2019/2022:
+- `Write-Log` — структурированное логирование в консоль + файл (уровни INFO/WARN/ERROR/SUCCESS)
+- `Test-AdminRights` — проверка прав администратора через WindowsPrincipal
+- `Get-RandomToken` — криптографически случайный hex-токен (RNGCryptoServiceProvider)
+- `Test-CommandExists` — проверка наличия команды в PATH
+- `Install-Go` — тихая установка Go 1.22 (MSI `/qn`) с обновлением PATH сессии
+- `Install-Git` — тихая установка Git (`/VERYSILENT`) с обновлением PATH
+- `Get-Repository` — git clone или git reset --hard для обновления репозитория
+- `Build-Server` — компиляция сервера (`go build`, `GOOS=windows GOARCH=amd64 CGO_ENABLED=0`, с `-ldflags "-s -w"`)
+- `New-ServerConfig` — генерация `config.yaml` с параметрами; не перезаписывает существующий файл
+- `Install-Service` — `sc.exe create` + автозапуск + failure actions (restart 30/60/120 сек)
+- `Set-FirewallRules` — `New-NetFirewallRule` для портов 443 TCP, 443 UDP, 8080 TCP
+- `Enable-IPRouting` — `IPEnableRouter=1` в реестре для пересылки пакетов через TUN
+- `Install-TAP` — проверка наличия TAP адаптера + предупреждение об установке Wintun/TAP-Windows
+- `Start-VPNService` — запуск сервиса с проверкой статуса
+- `Uninstall-Server` — stop + `sc.exe delete` + удаление правил фаервола (файлы сохраняются)
+- `Show-Summary` — итоговый вывод: директория, конфиг, токен, инструкции для следующих шагов
+
+Параметры командной строки: `-InstallDir`, `-RepoURL`, `-ListenAddr`, `-TunCIDR`, `-APIAddr`, `-APIToken`, `-SkipBuild`, `-Uninstall`. Поддерживает `-WhatIf` (SupportsShouldProcess).
+
+**Тесты (Pester 5.x):** `scripts/install_server.Tests.ps1` — тесты всех вспомогательных функций без реальной установки  
+**Запуск установщика:** `.\install_server.ps1` (от имени администратора)  
+**Запуск тестов:** `Invoke-Pester .\scripts\install_server.Tests.ps1 -Output Detailed`
