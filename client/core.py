@@ -804,6 +804,13 @@ class VPNClient:
             (host, port), timeout=self._config.connect_timeout
         )
         self._sock.settimeout(self._config.read_timeout)
+        # Disable Nagle: VPN packets must not be delayed by OS coalescing.
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # 4 MB socket buffers: with Russia-Kazakhstan RTT ~100 ms the default
+        # 256 KB buffer caps throughput at ~2 Mbps (BDP = buffer / RTT).
+        _BUF_SIZE = 4 * 1024 * 1024
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _BUF_SIZE)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _BUF_SIZE)
         self._log.debug("tcp_connected")
 
         # 2. TLS obfuscation
