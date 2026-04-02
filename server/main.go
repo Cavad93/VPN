@@ -101,6 +101,7 @@ type Server struct {
 	logger      *slog.Logger
 	mu          sync.RWMutex
 	sessions    map[uint64]*clientSession
+	ipIndex     map[uint32]*clientSession // O(1) lookup: packed IPv4 → session
 	allowedKeys map[[32]byte]struct{}
 	tun         TunDevice
 	pool        *ipPool
@@ -127,6 +128,7 @@ func NewServer(cfg Config, kp *crypto.KeyPair, tun TunDevice, allowedKeys [][cry
 		staticKP: kp,
 		logger:   logger,
 		sessions: make(map[uint64]*clientSession),
+		ipIndex:  make(map[uint32]*clientSession),
 		tun:      tun,
 		pool:     pool,
 		nextID:   1,
@@ -280,6 +282,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		delete(s.sessions, cs.id)
 		s.mu.Unlock()
 		if cs.assignedIP != nil {
+			packed := binary.BigEndian.Uint32(cs.assignedIP.To4())
+			s.mu.Lock()
+			delete(s.ipIndex, packed)
+			s.mu.Unlock()
 			s.pool.release(cs.assignedIP)
 		}
 		s.logger.Info("session closed", "id", cs.id)
@@ -337,6 +343,12 @@ func (s *Server) handleControlStream(ctx context.Context, cs *clientSession, str
 	cs.dataMu.Lock()
 	cs.assignedIP = ip
 	cs.dataMu.Unlock()
+
+	// Register in O(1) reverse IP index so routeFromTun avoids O(n) scan.
+	packed := binary.BigEndian.Uint32(ip.To4())
+	s.mu.Lock()
+	s.ipIndex[packed] = cs
+	s.mu.Unlock()
 
 	// Build 10-byte response: ctlAssign + ip[4] + prefixLen[1] + gw[4]
 	resp := make([]byte, 1+ctlAssignPayloadLen)
@@ -418,21 +430,10 @@ func (s *Server) routeFromTun(ctx context.Context) {
 			continue
 		}
 
-		// Parse destination IP from IPv4 header bytes[16:20]
-		dstIP := net.IP(buf[16:20])
-
-		// Find matching session
+		// O(1) lookup via reverse IP index (packed uint32 key)
+		dstKey := binary.BigEndian.Uint32(buf[16:20])
 		s.mu.RLock()
-		var target *clientSession
-		for _, cs := range s.sessions {
-			cs.dataMu.Lock()
-			ip := cs.assignedIP
-			cs.dataMu.Unlock()
-			if ip != nil && ip.Equal(dstIP) {
-				target = cs
-				break
-			}
-		}
+		target := s.ipIndex[dstKey]
 		s.mu.RUnlock()
 
 		if target == nil {

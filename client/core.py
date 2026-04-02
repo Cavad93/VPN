@@ -145,6 +145,7 @@ class NoiseCipherState:
             raise ValueError(f"key must be {KEY_SIZE} bytes")
         self._key = key
         self._n = 0
+        self._aead = ChaCha20Poly1305(key)  # create once, reuse for all packets
 
     @property
     def has_key(self) -> bool:
@@ -159,16 +160,14 @@ class NoiseCipherState:
             return plaintext
         nonce = self._make_nonce()
         self._n += 1
-        aead = ChaCha20Poly1305(self._key)
-        return aead.encrypt(nonce, plaintext, ad)
+        return self._aead.encrypt(nonce, plaintext, ad)
 
     def decrypt_with_ad(self, ad: bytes, ciphertext: bytes) -> bytes:
         if not self.has_key:
             return ciphertext
         nonce = self._make_nonce()
         self._n += 1
-        aead = ChaCha20Poly1305(self._key)
-        return aead.decrypt(nonce, ciphertext, ad)
+        return self._aead.decrypt(nonce, ciphertext, ad)
 
 
 # ---------------------------------------------------------------------------
