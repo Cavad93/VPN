@@ -257,3 +257,23 @@ Wire format: 7-байтный заголовок (streamID uint32 + type uint8 +
 
 **Тесты:** 58 тестов, покрытие 91%  
 **Запуск:** `cd client && python3 -m pytest test_core.py -v`
+
+### ЗАДАЧА 12 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `client/tun_macos.py`, `client/test_tun_macos.py`
+
+Реализован TUN интерфейс для macOS:
+- `TunInterface.open(unit)` — открытие utun устройства через AF_SYSTEM/SYSPROTO_CONTROL socket + CTLIOCGINFO ioctl + connect(sockaddr_ctl). Ядро автоматически присваивает имя интерфейса (utun0, utun1, …)
+- `TunInterface.configure(local_ip, peer_ip, prefix_len, mtu)` — конфигурация интерфейса через `ifconfig <name> <local> <peer> mtu <mtu> up`
+- `TunInterface.read_packet(max_size)` — чтение raw IPv4 пакета; снимает 4-байтный utun-заголовок (AF_INET = 0x00000002 big-endian)
+- `TunInterface.write_packet(packet)` — запись raw IPv4 пакета с добавлением utun-заголовка
+- `TunInterface.add_route(network, gateway)` / `delete_route(...)` — управление маршрутами через `route -n add/delete -net ... -netmask ... gateway`
+- `TunInterface.add_default_route(gateway)` / `delete_default_route(gateway)` — перенаправление всего трафика через VPN
+- `get_default_gateway()` — парсинг текущего шлюза по умолчанию из вывода `netstat -rn`
+- `get_interface_mtu(iface)` — парсинг MTU из вывода `ifconfig`
+- Потокобезопасность: `_read_lock` и `_write_lock` (threading.Lock)
+- Context manager (`with TunInterface.open() as tun: ...`)
+
+Wire format: каждый пакет на utun предваряется 4-байтным заголовком `\x00\x00\x00\x02` (AF_INET в big-endian).
+
+**Тесты:** 36 тестов, 100% pass  
+**Запуск:** `cd client && python3 -m pytest test_tun_macos.py -v`
