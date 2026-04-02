@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cavad93/vpn/server/api"
 	"github.com/cavad93/vpn/server/crypto"
 	"github.com/cavad93/vpn/server/transport"
 )
@@ -1501,6 +1502,143 @@ func runClientHandshake(t *testing.T, conn net.Conn, clientKP *crypto.KeyPair) (
 	mux := transport.NewMux(nc, true)
 	return mux, session
 }
+
+// ---------------------------------------------------------------------------
+// TestAllowedKeyManagement — AddAllowedKey / RemoveAllowedKey / AllowedKeys
+// ---------------------------------------------------------------------------
+
+func TestAllowedKeyManagement(t *testing.T) {
+	t.Helper()
+	tun := newMockTun()
+	defer tun.Close()
+	kp, _ := crypto.GenerateKeyPair()
+	srv, _ := NewServer(DefaultConfig(), kp, tun, nil, newTestLogger())
+
+	// Initially no allowlist configured — AllowedKeys returns nil.
+	if keys := srv.AllowedKeys(); keys != nil {
+		t.Errorf("expected nil allowlist, got %v", keys)
+	}
+
+	// Adding a key switches server to allowlist mode.
+	var k1, k2 [32]byte
+	k1[0] = 0x01
+	k2[0] = 0x02
+
+	srv.AddAllowedKey(k1)
+	keys := srv.AllowedKeys()
+	if len(keys) != 1 || keys[0] != k1 {
+		t.Errorf("after AddAllowedKey: got %v", keys)
+	}
+
+	// isKeyAllowed reflects the allowlist.
+	if !srv.isKeyAllowed(k1) {
+		t.Error("k1 should be allowed")
+	}
+	if srv.isKeyAllowed(k2) {
+		t.Error("k2 should not be allowed before adding")
+	}
+
+	srv.AddAllowedKey(k2)
+	if len(srv.AllowedKeys()) != 2 {
+		t.Errorf("expected 2 keys, got %d", len(srv.AllowedKeys()))
+	}
+
+	// Removing k1 leaves only k2.
+	srv.RemoveAllowedKey(k1)
+	keys = srv.AllowedKeys()
+	if len(keys) != 1 || keys[0] != k2 {
+		t.Errorf("after RemoveAllowedKey(k1): got %v", keys)
+	}
+
+	// Removing k2 — allowlist is now empty.
+	srv.RemoveAllowedKey(k2)
+	if len(srv.AllowedKeys()) != 0 {
+		t.Errorf("expected 0 keys after removing all, got %d", len(srv.AllowedKeys()))
+	}
+
+	// An empty allowlist (len==0) behaves like no allowlist: open access.
+	if !srv.isKeyAllowed(k1) {
+		t.Error("empty allowlist should allow all keys (open access)")
+	}
+}
+
+// TestAddAllowedKey_Idempotent verifies that adding the same key twice leaves
+// only one entry in the allowlist.
+func TestAddAllowedKey_Idempotent(t *testing.T) {
+	t.Helper()
+	tun := newMockTun()
+	defer tun.Close()
+	kp, _ := crypto.GenerateKeyPair()
+	srv, _ := NewServer(DefaultConfig(), kp, tun, nil, newTestLogger())
+
+	var k [32]byte
+	k[0] = 0xAB
+	srv.AddAllowedKey(k)
+	srv.AddAllowedKey(k) // duplicate
+	if n := len(srv.AllowedKeys()); n != 1 {
+		t.Errorf("expected 1 key after duplicate add, got %d", n)
+	}
+}
+
+// TestRemoveAllowedKey_Nonexistent verifies that removing a key that was never
+// added does not panic or corrupt state.
+func TestRemoveAllowedKey_Nonexistent(t *testing.T) {
+	t.Helper()
+	tun := newMockTun()
+	defer tun.Close()
+	kp, _ := crypto.GenerateKeyPair()
+	srv, _ := NewServer(DefaultConfig(), kp, tun, nil, newTestLogger())
+
+	var k1, k2 [32]byte
+	k1[0] = 0x01
+	k2[0] = 0x02
+	srv.AddAllowedKey(k1)
+	srv.RemoveAllowedKey(k2) // not in the map — should be a no-op
+	if n := len(srv.AllowedKeys()); n != 1 {
+		t.Errorf("expected 1 key, got %d", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestStartAPIServer
+// ---------------------------------------------------------------------------
+
+func TestStartAPIServer_Disabled(t *testing.T) {
+	t.Helper()
+	// ListenAddr="" should be a no-op (no goroutine launched, no panic).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tun := newMockTun()
+	defer tun.Close()
+	kp, _ := crypto.GenerateKeyPair()
+	srv, _ := NewServer(DefaultConfig(), kp, tun, nil, newTestLogger())
+
+	// Should return immediately without starting a server.
+	startAPIServer(ctx, api.Config{ListenAddr: ""}, srv, newTestLogger())
+}
+
+func TestStartAPIServer_Enabled(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	tun := newMockTun()
+	defer tun.Close()
+	kp, _ := crypto.GenerateKeyPair()
+	srv, _ := NewServer(DefaultConfig(), kp, tun, nil, newTestLogger())
+
+	cfg := api.Config{ListenAddr: "127.0.0.1:0"}
+	// This starts the API server in a goroutine; context cancellation stops it.
+	// We just verify it doesn't panic during startup and cancellation.
+	startAPIServer(ctx, cfg, srv, newTestLogger())
+	// Give goroutine a moment to start, then cancel.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+}
+
+// ---------------------------------------------------------------------------
 
 // streamReadFull reads exactly len(buf) bytes from a Stream.
 func streamReadFull(s *transport.Stream, buf []byte) (int, error) {

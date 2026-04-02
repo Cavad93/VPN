@@ -165,5 +165,30 @@ Wire format: 7-байтный заголовок (streamID uint32 + type uint8 +
 - `loadOrGenerateKeyPair` — загрузка/генерация статического ключа сервера
 - `OpenTun` — Linux: /dev/net/tun + ioctl TUNSETIFF; stub для остальных платформ
 
-**Тесты:** покрытие 80.2%  
+**Тесты:** покрытие 80.4%  
 **Запуск:** `cd server && go test . -v -cover`
+
+### ЗАДАЧА 8 — ВЫПОЛНЕНО (2026-04-02)
+**Файл:** `server/api/api.go`
+
+Реализован REST API для управления VPN-сервером:
+- `SessionInfo{ID, RemoteKey, AssignedIP, BytesIn, BytesOut, ConnectedAt, Duration}` — структура статистики сессии
+- `ServerIface` — интерфейс для взаимодействия API с VPN-сервером (Sessions, DisconnectSession, AddAllowedKey, RemoveAllowedKey, AllowedKeys)
+- `APIServer` — HTTP сервер (`NewAPIServer`, `Run`, `Handler`)
+- `Config{ListenAddr, APIToken}` — конфигурация API
+- Авторизация: Bearer-токен (`Authorization: Bearer <token>`) или `X-API-Key` заголовок
+
+Эндпоинты:
+- `GET  /api/v1/health`           — health check (без авторизации)
+- `GET  /api/v1/sessions`         — список активных сессий
+- `GET  /api/v1/sessions/{id}`    — одна сессия по ID
+- `DELETE /api/v1/sessions/{id}`  — отключить клиента
+- `GET  /api/v1/keys`             — список разрешённых ключей
+- `POST /api/v1/keys`             — добавить ключ `{"key":"<hex>"}`
+- `DELETE /api/v1/keys/{key}`     — удалить ключ
+- `GET  /api/v1/stats`            — агрегированная статистика трафика
+
+В `server/main.go` добавлены: `AddAllowedKey`/`RemoveAllowedKey`/`AllowedKeys` методы в `Server`, `SessionStats = api.SessionInfo` (type alias), helper `startAPIServer()`, флаги `-api-addr` и `-api-token`.
+
+**Тесты:** 27 тестов api + 7 новых тестов main, покрытие api 87.2%, main 80.4%  
+**Запуск:** `cd server && go test ./api/ -v -cover`

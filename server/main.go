@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/crypto/curve25519"
 
+	"github.com/cavad93/vpn/server/api"
 	"github.com/cavad93/vpn/server/crypto"
 	"github.com/cavad93/vpn/server/transport"
 )
@@ -58,16 +59,8 @@ func DefaultConfig() Config {
 	}
 }
 
-// SessionStats holds read-only statistics for one client session.
-type SessionStats struct {
-	ID          uint64
-	RemoteKey   string
-	AssignedIP  string
-	BytesIn     uint64
-	BytesOut    uint64
-	ConnectedAt time.Time
-	Duration    string
-}
+// SessionStats is an alias for api.SessionInfo — exported for compatibility.
+type SessionStats = api.SessionInfo
 
 // clientSession holds per-client runtime state.
 type clientSession struct {
@@ -180,12 +173,44 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 // Sessions returns a snapshot of current session statistics.
-func (s *Server) Sessions() []SessionStats {
+func (s *Server) Sessions() []api.SessionInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]SessionStats, 0, len(s.sessions))
+	out := make([]api.SessionInfo, 0, len(s.sessions))
 	for _, cs := range s.sessions {
 		out = append(out, cs.stats())
+	}
+	return out
+}
+
+// AddAllowedKey adds key to the allowlist. If no allowlist existed, one is
+// created (switching the server from open-access to allowlist mode).
+func (s *Server) AddAllowedKey(key [32]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.allowedKeys == nil {
+		s.allowedKeys = make(map[[32]byte]struct{})
+	}
+	s.allowedKeys[key] = struct{}{}
+}
+
+// RemoveAllowedKey removes key from the allowlist.
+func (s *Server) RemoveAllowedKey(key [32]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.allowedKeys, key)
+}
+
+// AllowedKeys returns a copy of the current allowlist, or nil if open access.
+func (s *Server) AllowedKeys() [][32]byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.allowedKeys) == 0 {
+		return nil
+	}
+	out := make([][32]byte, 0, len(s.allowedKeys))
+	for k := range s.allowedKeys {
+		out = append(out, k)
 	}
 	return out
 }
@@ -783,10 +808,13 @@ func loadOrGenerateKeyPair(path string, logger *slog.Logger) (*crypto.KeyPair, e
 
 func main() {
 	cfg := DefaultConfig()
+	apiCfg := api.DefaultConfig()
 
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
 	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
 	flag.StringVar(&cfg.PrivKeyFile, "privkey", cfg.PrivKeyFile, "path to hex-encoded private key file")
+	flag.StringVar(&apiCfg.ListenAddr, "api-addr", apiCfg.ListenAddr, "REST API listen address (empty to disable)")
+	flag.StringVar(&apiCfg.APIToken, "api-token", "", "Bearer token for the REST API (empty disables auth)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
@@ -815,8 +843,24 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	startAPIServer(ctx, apiCfg, srv, logger)
+
 	if err := srv.Run(ctx); err != nil {
 		logger.Error("server error", "err", err)
 		os.Exit(1)
 	}
+}
+
+// startAPIServer launches the REST management API in a background goroutine.
+// If cfg.ListenAddr is empty the API is not started.
+func startAPIServer(ctx context.Context, cfg api.Config, srv api.ServerIface, logger *slog.Logger) {
+	if cfg.ListenAddr == "" {
+		return
+	}
+	apiSrv := api.NewAPIServer(cfg, srv, logger)
+	go func() {
+		if err := apiSrv.Run(ctx); err != nil {
+			logger.Error("api server error", "err", err)
+		}
+	}()
 }

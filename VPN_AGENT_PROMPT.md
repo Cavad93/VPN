@@ -100,7 +100,8 @@ git push -u origin claude/create-claude-md-zT6Gk
 ### ФАЗА 3: Сервер Go
 - [x] **ЗАДАЧА 7:** VPN сервер — принимает соединения, аутентифицирует, маршрутизирует трафик. `server/main.go`
   > Выполнено: `server/main.go` + `server/tun_linux.go` + `server/tun_stub.go` + тесты (покрытие 80.2%). Реализованы: Server (Run, Sessions, DisconnectSession), handleConn (ObfsConn + Noise_XX handshake + noiseConn + Mux), handleControlStream (IP assignment с протоколом ctlHello/ctlAssign), handleDataStream (чтение IP пакетов → TUN), routeFromTun (TUN → client data stream), ipPool (аллокация/релиз IPv4 адресов), noiseConn (шифрование всего трафика через Noise session cipher), loadOrGenerateKeyPair. Linux TUN через /dev/net/tun + ioctl TUNSETIFF. Запуск: `cd server && go test . -v -cover`
-- [ ] **ЗАДАЧА 8:** Управление клиентами через REST API (добавление/удаление/статистика). `server/api/api.go`
+- [x] **ЗАДАЧА 8:** Управление клиентами через REST API (добавление/удаление/статистика). `server/api/api.go`
+  > Выполнено: `server/api/api.go` + тесты (27 тестов, покрытие 87.2%). Реализованы: `SessionInfo` (тип сессии), `ServerIface` (интерфейс VPN-сервера для API), `APIServer` (NewAPIServer, Run, Handler). Эндпоинты: GET /health (без авторизации), GET/DELETE /sessions, GET/DELETE /sessions/{id}, GET /keys, POST /keys, DELETE /keys/{key}, GET /stats. Авторизация: Bearer-токен (Authorization: Bearer <token>) или X-API-Key заголовок. В `server/main.go` добавлены методы AddAllowedKey/RemoveAllowedKey/AllowedKeys к Server, SessionStats = api.SessionInfo (type alias), startAPIServer() helper, флаги -api-addr и -api-token. Запуск: `cd server && go test ./api/ -v -cover`
 - [ ] **ЗАДАЧА 9:** Windows Service враппер — запуск как служба Windows. `server/service/windows_service.go`
 - [ ] **ЗАДАЧА 10:** Конфигурация через YAML, генерация ключей при первом запуске. `server/config/config.go`
 
