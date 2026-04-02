@@ -391,7 +391,7 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 		stream.Close()
 	}()
 
-	buf := make([]byte, 65535)
+	buf := make([]byte, 65536)
 	for {
 		select {
 		case <-ctx.Done():
@@ -416,7 +416,10 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 
 // routeFromTun reads packets from the TUN device and routes them to clients.
 func (s *Server) routeFromTun(ctx context.Context) {
-	buf := make([]byte, 65535)
+	// 64 KB is the maximum single IP packet, but Linux TUN may coalesce
+	// multiple packets via GRO into a single read() up to ~65535 bytes.
+	// Using a full 64 KB buffer ensures we always capture complete packets.
+	buf := make([]byte, 65536)
 	for {
 		select {
 		case <-ctx.Done():
