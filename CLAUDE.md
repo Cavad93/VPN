@@ -394,3 +394,20 @@ Wire format обеспечивает статистическую неразли
 **Тесты:** 26 тестов Go SNI + 86 тестов Python, все pass  
 **Запуск (Go):** `cd server && go test ./transport/ -v -cover`  
 **Запуск (Python):** `cd client && python3 -m pytest test_sni_spoof.py -v`
+
+### ЗАДАЧА 19 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `client/menubar.py`, `client/test_menubar.py`
+
+Реализовано macOS menubar приложение на PyObjC:
+- `VPNStatus` — перечисление состояний (DISCONNECTED/CONNECTING/CONNECTED/DISCONNECTING/ERROR)
+- `TrafficStats` — счётчики трафика и метаданные соединения: `bytes_in`, `bytes_out`, `connected_since`, `server_ip`, `assigned_ip`; методы `format_bytes()`, `uptime`, `ingress_label`, `egress_label`, `reset()`
+- `VPNStatusModel` — потокобезопасная модель состояния: `set_status()`, `update_traffic()`, `set_server_info()`, `clear_server_info()`; регистрация колбэков `on_status_change`/`on_stats_update`; UI-хелперы `status_label()`, `menu_bar_title()`, `can_connect()`, `can_disconnect()`
+- `VPNMenuBarController(NSObject)` — NSStatusItem с NSMenu; 1-секундный NSTimer обновляет иконку и все лейблы; `toggleVPN_` запускает connect/disconnect в фоновом потоке; `quitApp_` завершает приложение; `teardown()` удаляет status item
+- `VPNMenuBarAppDelegate(NSObject)` — NSApplicationDelegate; устанавливает `NSApplicationActivationPolicyAccessory` (нет dock-иконки); вызывает `controller.setup()` после запуска
+- `run_menubar_app(model, connect_action, disconnect_action)` — точка входа; поднимает RuntimeError на не-macOS платформах
+
+Меню включает: заголовок со статусом, кнопку Connect/Disconnect, секцию Traffic (↓ bytes, ↑ bytes, Uptime), секцию с адресом сервера и назначенным IP, Quit CavadVPN.
+
+**Зависимости:** `pyobjc-core>=10.0`, `pyobjc-framework-Cocoa>=10.0` (только macOS, условная установка)  
+**Тесты:** 47 тестов, все pass  
+**Запуск:** `cd client && python3 -m pytest test_menubar.py -v`

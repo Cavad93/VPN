@@ -129,7 +129,8 @@ git push -u origin claude/create-claude-md-zT6Gk
   > Выполнено (Python): `client/sni_spoof.py` + `client/test_sni_spoof.py` (86 тестов, все pass). DOMAIN_POOL (30 доменов), RotationPolicy, SNIConfig, DomainSelector, TLS extension builders, build_client_hello (Chrome 120 fingerprint), SNISpoofConn drop-in замена ObfsConn, create_sni_conn. Запуск: `cd client && python3 -m pytest test_sni_spoof.py -v`
 
 ### ФАЗА 6: UI и удобство
-- [ ] **ЗАДАЧА 19:** macOS menubar иконка на PyObjC (вкл/выкл, статус, статистика трафика).
+- [x] **ЗАДАЧА 19:** macOS menubar иконка на PyObjC (вкл/выкл, статус, статистика трафика).
+  > Выполнено: `client/menubar.py` + `client/test_menubar.py` (47 тестов, все pass). Реализованы: `VPNStatus` (DISCONNECTED/CONNECTING/CONNECTED/DISCONNECTING/ERROR), `TrafficStats` (bytes_in/out, connected_since, format_bytes, uptime, ingress_label/egress_label, reset), `VPNStatusModel` — потокобезопасная модель состояния (set_status, update_traffic, set_server_info, clear_server_info, on_status_change/on_stats_update колбэки, status_label, menu_bar_title, can_connect/can_disconnect). Под PyObjC (macOS): `VPNMenuBarController(NSObject)` — NSStatusItem с NSMenu, timer 1с для обновления статистики, toggleVPN_/quitApp_ actions; `VPNMenuBarAppDelegate(NSObject)` — ApplicationDelegate без dock иконки (NSApplicationActivationPolicyAccessory); `run_menubar_app(model, connect_action, disconnect_action)` — главная точка входа. Меню: статус, Connect/Disconnect кнопка, ↓/↑ трафик, аптайм, адрес сервера, назначенный IP, Quit. Зависимости: pyobjc-core>=10.0, pyobjc-framework-Cocoa>=10.0 (только macOS). Запуск тестов: `cd client && python3 -m pytest test_menubar.py -v`
 - [ ] **ЗАДАЧА 20:** Веб-панель управления сервером (статистика, логи, управление клиентами).
 - [ ] **ЗАДАЧА 21:** Автоустановщик сервера (PowerShell скрипт для Windows).
 - [ ] **ЗАДАЧА 22:** Автоустановщик клиента (.pkg установщик для macOS).
