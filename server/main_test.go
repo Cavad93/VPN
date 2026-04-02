@@ -1406,11 +1406,11 @@ func TestWriteHandshakeMsgPayloadError(t *testing.T) {
 		}
 	}()
 
-	// failAt=1: first Write (length bytes) succeeds, second Write (payload) fails.
-	failConn := &failAfterNConn{Conn: cConn, failAt: 1}
+	// failAt=0: the single combined Write (header+payload) fails immediately.
+	failConn := &failAfterNConn{Conn: cConn, failAt: 0}
 	err := writeHandshakeMsg(failConn, []byte("some payload"))
 	if err == nil {
-		t.Error("expected error when payload write fails")
+		t.Error("expected error when combined frame write fails")
 	}
 }
 

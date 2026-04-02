@@ -538,17 +538,17 @@ func readHandshakeMsg(conn net.Conn) ([]byte, error) {
 }
 
 // writeHandshakeMsg writes a length-prefixed handshake message (2-byte big-endian length).
+// Header and payload are combined into a single slice so the kernel sends them
+// in one TCP segment instead of two, halving the handshake RTTs.
 func writeHandshakeMsg(conn net.Conn, msg []byte) error {
 	if len(msg) > noiseHandshakeMsgMaxSize {
 		return fmt.Errorf("handshake message too large: %d", len(msg))
 	}
-	var lenBuf [2]byte
-	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(msg)))
-	if _, err := conn.Write(lenBuf[:]); err != nil {
-		return fmt.Errorf("write handshake length: %w", err)
-	}
-	if _, err := conn.Write(msg); err != nil {
-		return fmt.Errorf("write handshake payload: %w", err)
+	frame := make([]byte, 2+len(msg))
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(msg)))
+	copy(frame[2:], msg)
+	if _, err := conn.Write(frame); err != nil {
+		return fmt.Errorf("write handshake frame: %w", err)
 	}
 	return nil
 }
