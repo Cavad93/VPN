@@ -348,3 +348,19 @@ Wire format: каждый пакет на utun предваряется 4-бай
 
 **Тесты:** 57 тестов, все pass  
 **Запуск:** `cd client && python3 -m pytest test_traffic_shaping.py -v`
+
+### ЗАДАЧА 17 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `client/padding.py`, `client/test_padding.py`
+
+Реализован модуль advanced padding и timing randomization против статистического анализа трафика:
+- `encode_frame(data, flag, padding_len)` / `decode_frame(body)` — wire format: 4-байтный length prefix + 1-байтный flag (FLAG_DATA=0x00/FLAG_COVER=0x01/FLAG_KEEPALIVE=0x02) + 2-байтный padding_len + data + random padding
+- `FixedBucketPadder(buckets)` — паддинг пакетов до ближайшего fixed bucket (TLS-aligned: 64/128/256/512/1024/1448/2896/4096/8192/16384 байт); нормализует распределение размеров для защиты от size fingerprinting; `target_frame_size(data_len)`, `compute_padding(data_len)`, поддержка кастомных bucket'ов
+- `JitterConfig(distribution, min_ms, max_ms, mean_ms, std_ms)` — семплирование timing jitter из трёх распределений: UNIFORM (random.uniform), GAUSSIAN (random.gauss с зажимом), EXPONENTIAL (random.expovariate с зажимом); методы `sample_ms()`, `sample_seconds()`, `wait()`
+- `CoverTrafficConfig(enabled, idle_threshold_ms, interval_ms, min_size, max_size)` — конфигурация cover-трафика
+- `StatisticalObfuscator(conn, padder, jitter, cover_config)` — главный класс: `write(data)` применяет jitter + bucket padding + FLAG_DATA frame; `read()` пропускает FLAG_COVER/FLAG_KEEPALIVE и возвращает только FLAG_DATA; фоновый daemon-поток инжектирует cover-пакеты (FLAG_COVER) во время idle > threshold; `stats()` возвращает counters и overhead_ratio; потокобезопасен (_write_lock); `close()` останавливает cover-поток
+- `create_obfuscator(conn, mode)` — три пресета: "light" (uniform 0–5 мс, без cover, ~5-15% overhead), "balanced" (Gaussian mean=10 мс std=5 мс + cover 200 мс threshold, ~20-40% overhead), "paranoid" (exponential mean=20 мс + cover 50 мс threshold + fine buckets до 32 байт, ~50-100% overhead)
+
+Wire format обеспечивает статистическую неразличимость cover и реального трафика по размерам: cover-пакеты паддируются до тех же bucket'ов, что и реальные пакеты соответствующего размера.
+
+**Тесты:** 64 теста, все pass  
+**Запуск:** `cd client && python3 -m pytest test_padding.py -v`
