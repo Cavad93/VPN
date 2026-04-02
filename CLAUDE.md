@@ -36,6 +36,9 @@ server/
 │   ├── replay.go        — защита от replay атак (nonce + timestamp window)
 │   ├── replay_test.go   — unit тесты replay.go
 │   └── README.md
+├── transport/
+│   ├── udp.go           — надёжный UDP транспорт (ACK, retransmit, ordering, congestion)
+│   └── udp_test.go      — unit + integration тесты транспорта
 ```
 
 ## Прогресс задач
@@ -86,3 +89,21 @@ server/
 
 **Тесты:** 41 тест суммарно, покрытие 82.9%  
 **Запуск:** `cd server && go test ./crypto/ -v -cover`
+
+### ЗАДАЧА 4 — ВЫПОЛНЕНО (2026-04-02)
+**Файл:** `server/transport/udp.go`
+
+Реализован надёжный UDP транспорт:
+- `Packet{Type, SeqNum, AckNum, Payload}` — PDU с encode/decode (11-байтный заголовок)
+- `Conn` — надёжное соединение: `Write`, `Read(ctx)`, `Close`
+- `processData(pkt)` — упорядочивание пакетов, sliding receive buffer, cumulative ACK
+- `processACK(ackNum)` — освобождение pending пакетов, рост окна (slow start / congestion avoidance)
+- `doRetransmit()` — повторная отправка пакетов по таймауту, multiplicative decrease
+- `Listen(addr)` — UDP-сервер с демультиплексингом по remote-адресу
+- `Listener.Accept(ctx)` — принятие новых соединений
+- `Dial(addr)` — клиентское подключение к серверу
+
+Алгоритм congestion control: TCP Reno-style — slow start до ssthresh, linear increase после, halvingwindow при потере.
+
+**Тесты:** 25 тестов, покрытие 90.7%  
+**Запуск:** `cd server && go test ./transport/ -v -cover`

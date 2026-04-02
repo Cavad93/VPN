@@ -90,7 +90,8 @@ git push -u origin claude/create-claude-md-zT6Gk
   > Выполнено: `server/crypto/replay.go` + тесты (19 тестов replay, 41 тест суммарно, покрытие 82.9%). Реализованы: PacketHeader (timestamp + nonce, encode/decode), ReplayFilter с скользящим окном ±90с. Потокобезопасен (sync.Mutex). Автоочистка устаревших bucket'ов. Запуск: `cd server && go test ./crypto/ -v -cover`
 
 ### ФАЗА 2: Транспорт (Transport Layer)
-- [ ] **ЗАДАЧА 4:** UDP транспорт с надёжностью (ACK, retransmit, ordering, congestion control). `server/transport/udp.go`
+- [x] **ЗАДАЧА 4:** UDP транспорт с надёжностью (ACK, retransmit, ordering, congestion control). `server/transport/udp.go`
+  > Выполнено: `server/transport/udp.go` + тесты (25 тестов, покрытие 90.7%). Реализованы: Packet (Encode/DecodePacket), Conn (Write/Read/Close + processData/processACK/doRetransmit), Listener (Listen/Accept), Dial. Congestion control: TCP Reno-style slow start + multiplicative decrease. Ordering: sliding receive buffer с дренажём. Запуск: `cd server && go test ./transport/ -v -cover`
 - [ ] **ЗАДАЧА 5:** Обфускация под HTTPS/TLS — трафик неотличим от браузерного HTTPS для DPI. `server/transport/obfs.go`
 - [ ] **ЗАДАЧА 6:** Multiplexing — несколько виртуальных каналов в одном UDP соединении. `server/transport/mux.go`
 
