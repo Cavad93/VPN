@@ -493,3 +493,21 @@ Wire format обеспечивает статистическую неразли
 **Тесты:** 70 тестов, все pass (работают на Linux без macOS-специфичных инструментов)  
 **Запуск тестов:** `bash scripts/test_install_client.sh`  
 **Сборка .pkg (только macOS):** `bash scripts/install_client.sh --version 1.0.0`
+
+### ЗАДАЧА 23 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `android/app/src/main/java/com/cavadvpn/`
+
+Реализован Android VPN стек на Kotlin:
+- `crypto/CryptoCore.kt` — X25519 (BouncyCastle) + ChaCha20-Poly1305 AEAD; `generateKeyPair`, `diffieHellman`, `encrypt`, `decrypt`, `generateNonce`
+- `crypto/NoiseHandshake.kt` — Noise_XX инициатор; `NoiseCipherState` (nonce: 4 нулевых байта + 8-байт LE счётчик), `NoiseSymmetricState` (mixHash/mixKey/encryptAndHash/decryptAndHash/split), `NoiseHandshake` (writeMessage1/readMessage2/writeMessage3), `NoiseSession`
+- `crypto/ReplayFilter.kt` — `PacketHeader` (encode/decode, 20 байт), `ReplayFilter` (скользящее окно ±90с, synchronized)
+- `transport/ObfsConn.kt` — TLS-обфускация: синтетические ClientHello/ServerHello, фрагментация в TLS app_data records (max 16383 байт), read-буферизация
+- `transport/MuxConn.kt` — `NoiseConn` (2-байт BE length + шифрование), `MuxStream` (BlockingQueue, readExactly), `ClientMux` (чётные stream ID, фоновый read-loop, writeFrame)
+- `config/VpnConfig.kt` — `VpnConfig` data class, `RouteInfo` (assignedIp/prefixLen/gateway/cidr/network)
+- `vpn/VpnClient.kt` — полный стек: TCP → ObfsConn → Noise_XX → NoiseConn → ClientMux → control stream (ctlHello/ctlAssign) → data stream; `connect()`, `sendPacket()`, `recvPacket()`, `disconnect()`
+- `vpn/CavadVpnService.kt` — Android `VpnService`; `setupTunnel()` (VpnService.Builder + addAddress/addRoute/addDnsServer), `runTunnel()` (bidirectional coroutine forwarding), foreground notification
+
+Протокол wire-совместим с Go сервером (ObfsConn, Noise framing, Mux frame format, control protocol).
+
+**Тесты:** 39 тестов (CryptoCoreTest×11, NoiseHandshakeTest×9, ReplayFilterTest×9, ObfsConnTest×5, MuxConnTest×5)  
+**Запуск:** `cd android && ./gradlew test`
