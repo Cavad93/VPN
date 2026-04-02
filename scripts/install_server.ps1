@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     CavadVPN Server — автоматический установщик для Windows Server 2019/2022.
