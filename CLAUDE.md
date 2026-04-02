@@ -364,3 +364,20 @@ Wire format обеспечивает статистическую неразли
 
 **Тесты:** 64 теста, все pass  
 **Запуск:** `cd client && python3 -m pytest test_padding.py -v`
+
+### ЗАДАЧА 18 — ВЫПОЛНЕНО (2026-04-02)
+**Файлы:** `server/transport/sni.go`, `server/transport/sni_test.go`
+
+Реализован SNI spoofing для TLS-обфускации — подделка Server Name Indication под легитимные домены:
+- `SNISelector` — интерфейс выбора домена (`Select() string`)
+- `StaticSNI{Domain}` — всегда возвращает фиксированный домен (для стабильной имитации одного сервиса)
+- `RandomSNI{Domains}` + `NewRandomSNI()` — случайный выбор из пула: www.google.com, www.youtube.com, www.cloudflare.com, cdn.cloudflare.com, www.googleapis.com и другие (10 доменов)
+- `buildSNIExtension(host)` — кодирует TLS server_name extension (RFC 6066 §3): ext_type(2) + ext_len(2) + list_len(2) + name_type(1) + name_len(2) + name
+- `buildSupportedVersionsExtension()` — TLS supported_versions extension, объявляющий TLS 1.3 (0x0304)
+- `buildClientHelloWithSNI(sni)` — синтетический ClientHello с SNI + supported_versions extensions; random/session_id — криптографически случайные (уникальны при каждом вызове)
+- `ExtractSNI(body []byte) string` — парсинг SNI из тела ClientHello (для серверного логирования/отладки)
+- `ObfsConn.WithSNI(selector) *ObfsConn` — builder-метод для настройки SNI на клиентской стороне
+- Обновлён `ObfsConn.ClientHandshake()` — если sniSelector установлен, отправляет ClientHello с SNI; иначе — прежнее поведение без SNI
+
+**Тесты:** 26 тестов SNI + 70 тестов transport суммарно, покрытие 90.1%  
+**Запуск:** `cd server && go test ./transport/ -v -cover`

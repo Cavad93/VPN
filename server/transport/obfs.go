@@ -52,8 +52,9 @@ const maxObfsPayload = 16383
 // records.  Callers must run ClientHandshake (initiator side) or
 // ServerHandshake (responder side) before calling Read/Write.
 type ObfsConn struct {
-	conn    net.Conn
-	readBuf []byte // unconsumed payload bytes from the last decoded record
+	conn        net.Conn
+	readBuf     []byte      // unconsumed payload bytes from the last decoded record
+	sniSelector SNISelector // optional; if set, ClientHandshake embeds an SNI extension
 }
 
 // NewObfsConn wraps conn.  No I/O is performed until Handshake is called.
@@ -61,10 +62,28 @@ func NewObfsConn(conn net.Conn) *ObfsConn {
 	return &ObfsConn{conn: conn}
 }
 
+// WithSNI attaches an SNISelector to the connection.  When set, ClientHandshake
+// will include a server_name extension in the synthetic ClientHello using the
+// domain returned by selector.Select().  Returns c to allow method chaining:
+//
+//	conn := transport.NewObfsConn(raw).WithSNI(transport.NewRandomSNI())
+func (c *ObfsConn) WithSNI(selector SNISelector) *ObfsConn {
+	c.sniSelector = selector
+	return c
+}
+
 // ClientHandshake sends a synthetic ClientHello and reads the ServerHello.
+// If an SNISelector was attached via WithSNI, the ClientHello includes a
+// server_name extension for the domain returned by the selector.
 // Must be called exactly once before the first Write/Read on the initiator.
 func (c *ObfsConn) ClientHandshake() error {
-	if _, err := c.conn.Write(buildClientHello()); err != nil {
+	var hello []byte
+	if c.sniSelector != nil {
+		hello = buildClientHelloWithSNI(c.sniSelector.Select())
+	} else {
+		hello = buildClientHello()
+	}
+	if _, err := c.conn.Write(hello); err != nil {
 		return err
 	}
 	return c.readHandshakeRecord(tlsHelloServer)
