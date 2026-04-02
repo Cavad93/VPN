@@ -561,17 +561,18 @@ func newNoiseConn(conn net.Conn, session *crypto.Session) *noiseConn {
 }
 
 // Write encrypts p and writes it with a 2-byte big-endian length prefix.
+// Length prefix and ciphertext are combined into one slice so that ObfsConn
+// wraps them in a single TLS record. This halves the number of TLS records
+// the Python client must read per message, doubling download throughput.
 func (nc *noiseConn) Write(p []byte) (int, error) {
 	ciphertext, err := nc.session.SendCipher.Encrypt(p, nil)
 	if err != nil {
 		return 0, fmt.Errorf("noiseConn encrypt: %w", err)
 	}
-	var lenBuf [2]byte
-	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(ciphertext)))
-	if _, err := nc.conn.Write(lenBuf[:]); err != nil {
-		return 0, err
-	}
-	if _, err := nc.conn.Write(ciphertext); err != nil {
+	frame := make([]byte, 2+len(ciphertext))
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(ciphertext)))
+	copy(frame[2:], ciphertext)
+	if _, err := nc.conn.Write(frame); err != nil {
 		return 0, err
 	}
 	return len(p), nil
