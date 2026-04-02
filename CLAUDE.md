@@ -38,7 +38,9 @@ server/
 │   └── README.md
 ├── transport/
 │   ├── udp.go           — надёжный UDP транспорт (ACK, retransmit, ordering, congestion)
-│   └── udp_test.go      — unit + integration тесты транспорта
+│   ├── udp_test.go      — unit + integration тесты транспорта
+│   ├── obfs.go          — TLS-обфускация трафика (DPI bypass, fake TLS 1.3 records)
+│   └── obfs_test.go     — unit тесты ObfsConn
 ```
 
 ## Прогресс задач
@@ -106,4 +108,23 @@ server/
 Алгоритм congestion control: TCP Reno-style — slow start до ssthresh, linear increase после, halvingwindow при потере.
 
 **Тесты:** 25 тестов, покрытие 90.7%  
+**Запуск:** `cd server && go test ./transport/ -v -cover`
+
+### ЗАДАЧА 5 — ВЫПОЛНЕНО (2026-04-02)
+**Файл:** `server/transport/obfs.go`
+
+Реализована TLS-обфускация трафика (DPI bypass):
+- `ObfsConn` — враппер net.Conn с TLS-подобным фреймингом
+- `NewObfsConn(conn)` — создание ObfsConn поверх существующего соединения
+- `ClientHandshake()` — отправка синтетического ClientHello + чтение ServerHello
+- `ServerHandshake()` — чтение ClientHello + отправка синтетического ServerHello
+- `Write(p)` — фрагментация данных в TLS application_data records (content_type=0x17)
+- `Read(p)` — чтение и дефрагментация TLS records с внутренним буфером
+- `buildClientHello()` / `buildServerHello()` — синтетические TLS 1.3 handshake сообщения с рандомными полями
+- Реализует полный net.Conn интерфейс (SetDeadline, LocalAddr, RemoteAddr, Close)
+
+Wire format: TLS record header (5 байт: content_type + version 0x0303 + length) + payload.
+Каждое соединение уникально: random[32] и session_id[32] заполняются crypto/rand.
+
+**Тесты:** 15 тестов, покрытие пакета transport 90.8%  
 **Запуск:** `cd server && go test ./transport/ -v -cover`

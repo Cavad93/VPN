@@ -92,7 +92,8 @@ git push -u origin claude/create-claude-md-zT6Gk
 ### ФАЗА 2: Транспорт (Transport Layer)
 - [x] **ЗАДАЧА 4:** UDP транспорт с надёжностью (ACK, retransmit, ordering, congestion control). `server/transport/udp.go`
   > Выполнено: `server/transport/udp.go` + тесты (25 тестов, покрытие 90.7%). Реализованы: Packet (Encode/DecodePacket), Conn (Write/Read/Close + processData/processACK/doRetransmit), Listener (Listen/Accept), Dial. Congestion control: TCP Reno-style slow start + multiplicative decrease. Ordering: sliding receive buffer с дренажём. Запуск: `cd server && go test ./transport/ -v -cover`
-- [ ] **ЗАДАЧА 5:** Обфускация под HTTPS/TLS — трафик неотличим от браузерного HTTPS для DPI. `server/transport/obfs.go`
+- [x] **ЗАДАЧА 5:** Обфускация под HTTPS/TLS — трафик неотличим от браузерного HTTPS для DPI. `server/transport/obfs.go`
+  > Выполнено: `server/transport/obfs.go` + тесты (15 тестов, покрытие 90.8% пакет transport). Реализованы: ObfsConn (NewObfsConn, ClientHandshake, ServerHandshake, Write, Read, Close + net.Conn deadline интерфейс), buildClientHello/buildServerHello (синтетические TLS 1.3 записи с рандомными полями random/session_id), buildAppDataRecord, wrapHandshakeRecord. Трафик выглядит как TLS 1.2/1.3 для DPI: content_type=0x17, version=0x0303, big-endian length. Поддержка фрагментации больших сообщений (>16383 байт) и буферизация частичных Read. Запуск: `cd server && go test ./transport/ -v -cover`
 - [ ] **ЗАДАЧА 6:** Multiplexing — несколько виртуальных каналов в одном UDP соединении. `server/transport/mux.go`
 
 ### ФАЗА 3: Сервер Go
