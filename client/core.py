@@ -512,8 +512,12 @@ class NoiseConn:
 
     def write_message(self, plaintext: bytes) -> None:
         ciphertext = self._session.send_cipher.encrypt(plaintext)
-        length_prefix = struct.pack(">H", len(ciphertext))
-        self._obfs.write(length_prefix + ciphertext)
+        # Build length-prefixed frame without an extra bytes concatenation.
+        # bytearray pre-allocated to exact size avoids reallocation.
+        frame = bytearray(2 + len(ciphertext))
+        struct.pack_into(">H", frame, 0, len(ciphertext))
+        frame[2:] = ciphertext
+        self._obfs.write(bytes(frame))
 
     def read_message(self) -> bytes:
         # Read 2-byte length prefix
