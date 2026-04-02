@@ -55,6 +55,9 @@ type ObfsConn struct {
 	conn        net.Conn
 	readBuf     []byte      // unconsumed payload bytes from the last decoded record
 	sniSelector SNISelector // optional; if set, ClientHandshake embeds an SNI extension
+	// hdr is a reusable 5-byte scratch buffer for TLS record headers.
+	// Avoids one heap allocation per read in the hot data path.
+	hdr [ObfsHeaderSize]byte
 }
 
 // NewObfsConn wraps conn.  No I/O is performed until Handshake is called.
@@ -164,15 +167,15 @@ func (c *ObfsConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteD
 // ---------------------------------------------------------------------------
 
 // readRecord reads exactly one TLS record and validates its content type.
+// It reuses c.hdr to avoid a heap allocation on every call in the hot path.
 func (c *ObfsConn) readRecord(wantType byte) ([]byte, error) {
-	hdr := make([]byte, ObfsHeaderSize)
-	if _, err := io.ReadFull(c.conn, hdr); err != nil {
+	if _, err := io.ReadFull(c.conn, c.hdr[:]); err != nil {
 		return nil, err
 	}
-	if hdr[0] != wantType {
+	if c.hdr[0] != wantType {
 		return nil, errors.New("obfs: unexpected TLS record content type")
 	}
-	length := binary.BigEndian.Uint16(hdr[3:5])
+	length := binary.BigEndian.Uint16(c.hdr[3:5])
 	if length == 0 || length > maxObfsPayload {
 		return nil, errors.New("obfs: invalid TLS record length")
 	}
