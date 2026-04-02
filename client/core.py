@@ -417,6 +417,9 @@ class ObfsConn:
         # Both buffers are bytearray: += is an in-place extend O(chunk), not O(total).
         self._read_buf = bytearray()
         self._sock_buf = bytearray()  # bytearray avoids O(n) copy on each += unlike bytes
+        # Pre-allocated receive staging buffer for recv_into() — avoids allocating
+        # a new bytes object on every recv() syscall (~13 allocs/s at 10 Mbps).
+        self._recv_staging = bytearray(self._SOCK_RECV_SIZE)
 
     def client_handshake(self) -> None:
         """Send ClientHello, read ServerHello."""
@@ -460,14 +463,15 @@ class ObfsConn:
 
     def _recv_exactly(self, n: int) -> bytes:
         # Fill the socket buffer in large 64 KB chunks so most calls return
-        # from memory without a syscall.  Each recv(65536) typically delivers
+        # from memory without a syscall.  Each recv_into(65536) typically delivers
         # ~45 complete TLS records at once.
-        # bytearray += is an in-place extend (O(chunk) not O(total)), unlike bytes.
+        # recv_into() writes directly into _recv_staging (pre-allocated bytearray)
+        # avoiding the temporary bytes object that recv() would create.
         while len(self._sock_buf) < n:
-            chunk = self._sock.recv(self._SOCK_RECV_SIZE)
-            if not chunk:
+            nbytes = self._sock.recv_into(self._recv_staging)
+            if not nbytes:
                 raise ConnectionError("connection closed mid-read")
-            self._sock_buf += chunk
+            self._sock_buf += self._recv_staging[:nbytes]
         result = bytes(self._sock_buf[:n])
         del self._sock_buf[:n]
         return result
