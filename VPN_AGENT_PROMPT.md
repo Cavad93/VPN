@@ -82,7 +82,8 @@ git push -u origin claude/create-claude-md-zT6Gk
 ## Очередь задач
 
 ### ФАЗА 1: Ядро (Crypto Layer)
-- [ ] **ЗАДАЧА 1:** Реализовать X25519 key exchange + ChaCha20-Poly1305 шифрование на Go. Unit тесты. `server/crypto/crypto.go`
+- [x] **ЗАДАЧА 1:** Реализовать X25519 key exchange + ChaCha20-Poly1305 шифрование на Go. Unit тесты. `server/crypto/crypto.go`
+  > Выполнено: `server/crypto/crypto.go` + тесты (11 тестов, покрытие 81.6%). Функции: GenerateKeyPair, DiffieHellman, NewCipher, Encrypt, Decrypt, GenerateNonce. Зависимость: golang.org/x/crypto@v0.32.0. Запуск: `go test ./crypto/ -v`
 - [ ] **ЗАДАЧА 2:** Noise_XX handshake протокол. Mutual authentication сервер↔клиент. `server/crypto/handshake.go`
 - [ ] **ЗАДАЧА 3:** Защита от replay атак (nonce + timestamp window 90s). `server/crypto/replay.go`
 
