@@ -70,8 +70,7 @@ type clientSession struct {
 	noiseSession *crypto.Session
 	mux          *transport.Mux
 	assignedIP   net.IP
-	dataStream   *transport.Stream
-	dataMu       sync.Mutex
+	dataStream   atomic.Pointer[transport.Stream] // lock-free on the hot TUN→client path
 	bytesIn      atomic.Uint64
 	bytesOut     atomic.Uint64
 	connectedAt  time.Time
@@ -179,11 +178,11 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		// Increase TCP socket buffers to match the bandwidth-delay product
 		// for Russia↔Kazakhstan (RTT ≈ 80-120 ms). Default Linux buffers
-		// (128-256 KB) cap throughput at ~2 Mbps; 4 MB allows ≥32 Mbps.
+		// (128-256 KB) cap throughput at ~2 Mbps; 8 MB allows ≥64 Mbps.
 		// setForcedSocketBuffers uses SO_RCVBUFFORCE/SO_SNDBUFFORCE (Linux,
 		// CAP_NET_ADMIN) to bypass the net.core.rmem_max kernel limit.
 		if tc, ok := conn.(*net.TCPConn); ok {
-			setForcedSocketBuffers(tc, 4<<20) // 4 MB, force-bypass rmem_max
+			setForcedSocketBuffers(tc, 8<<20) // 8 MB, force-bypass rmem_max
 			tc.SetNoDelay(true)               // disable Nagle — VPN packets must not be coalesced
 			// TCP keepalive: probe idle connections every 30 s with 3 retries.
 			// Prevents ISP NAT/firewall from silently dropping "idle" VPN connections
@@ -324,11 +323,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 // handleStream dispatches a stream to the appropriate handler.
 func (s *Server) handleStream(ctx context.Context, cs *clientSession, stream *transport.Stream) {
-	cs.dataMu.Lock()
-	hasIP := cs.assignedIP != nil
-	cs.dataMu.Unlock()
-
-	if !hasIP {
+	if cs.assignedIP == nil {
 		if err := s.handleControlStream(ctx, cs, stream); err != nil {
 			s.logger.Warn("control stream error", "id", cs.id, "err", err)
 		}
@@ -359,9 +354,7 @@ func (s *Server) handleControlStream(ctx context.Context, cs *clientSession, str
 		return fmt.Errorf("ip allocation failed: %w", err)
 	}
 
-	cs.dataMu.Lock()
 	cs.assignedIP = ip
-	cs.dataMu.Unlock()
 
 	// Register in O(1) reverse IP index so routeFromTun avoids O(n) scan.
 	packed := binary.BigEndian.Uint32(ip.To4())
@@ -386,16 +379,10 @@ func (s *Server) handleControlStream(ctx context.Context, cs *clientSession, str
 
 // handleDataStream relays data between the stream and the TUN device.
 func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream *transport.Stream) {
-	cs.dataMu.Lock()
-	cs.dataStream = stream
-	cs.dataMu.Unlock()
+	cs.dataStream.Store(stream)
 
 	defer func() {
-		cs.dataMu.Lock()
-		if cs.dataStream == stream {
-			cs.dataStream = nil
-		}
-		cs.dataMu.Unlock()
+		cs.dataStream.CompareAndSwap(stream, nil)
 		stream.Close()
 	}()
 
@@ -448,10 +435,7 @@ func (s *Server) routeFromTun(ctx context.Context) {
 		}
 		target := val.(*clientSession)
 
-		target.dataMu.Lock()
-		ds := target.dataStream
-		target.dataMu.Unlock()
-
+		ds := target.dataStream.Load()
 		if ds == nil {
 			continue
 		}
@@ -563,10 +547,10 @@ const maxNoiseFrame = 65535 + 16
 
 // noiseWritePool pools the length-prefixed frame buffers used in
 // noiseConn.Write, eliminating one make() per transmitted packet.
-// Typical capacity: 2 (length header) + 1500 (IP MTU) + 16 (AEAD tag) = 1518.
+// Typical capacity: 2 (length header) + 1460 (TUN MTU) + 16 (AEAD tag) = 1478.
 var noiseWritePool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 0, 2+1500+16)
+		b := make([]byte, 0, 2+1460+16)
 		return &b
 	},
 }

@@ -408,9 +408,9 @@ class ObfsConn:
     Call client_handshake() before read/write.
     """
 
-    # Large socket-level read buffer: one recv(65536) fills ~45 TLS records,
+    # Large socket-level read buffer: one recv(131072) fills ~90 TLS records,
     # so most _recv_exactly() calls return instantly from memory with zero syscalls.
-    _SOCK_RECV_SIZE = 65536
+    _SOCK_RECV_SIZE = 131072
 
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
@@ -561,10 +561,10 @@ class MuxStream:
         self._closed = threading.Event()
         self._remote_fin = threading.Event()
         # Queue for incoming data chunks; bounded to provide backpressure.
-        # 2048 × 1500-byte packets ≈ 3 MB — matches the 4 MB socket buffer
+        # 4096 × 1460-byte packets ≈ 6 MB — matches the 8 MB socket buffer
         # so that the reader thread can drain without stalling the TCP window.
         import queue
-        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=2048)
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=4096)
 
     def write(self, data: bytes) -> None:
         if self._closed.is_set():
@@ -835,9 +835,9 @@ class VPNClient:
         # preventing the remote server from advancing its send window and
         # killing throughput 10-20×.
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        # Large socket buffers: bandwidth-delay product for 30 Mbps × 118 ms
-        # ≈ 440 KB; use 4 MB to leave plenty of headroom.
-        _BUF_SIZE = 4 * 1024 * 1024
+        # Large socket buffers: bandwidth-delay product for 64 Mbps × 118 ms
+        # ≈ 940 KB; use 8 MB to leave plenty of headroom for bursts.
+        _BUF_SIZE = 8 * 1024 * 1024
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _BUF_SIZE)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _BUF_SIZE)
         # After handshake switch to fully blocking reads so the mux read loop

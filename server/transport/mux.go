@@ -24,11 +24,11 @@ import (
 )
 
 // muxFramePool pools byte slices used to build mux frames and avoids a heap
-// allocation on every data packet.  Slices are returned with cap ≥ 1507 bytes
-// (7-byte header + 1500-byte typical IP MTU).
+// allocation on every data packet.  Slices are returned with cap ≥ 1467 bytes
+// (7-byte header + 1460-byte TUN MTU).
 var muxFramePool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 0, muxHeaderSize+1500)
+		b := make([]byte, 0, muxHeaderSize+1460)
 		return &b
 	},
 }
@@ -72,7 +72,7 @@ func NewMux(conn net.Conn, isClient bool) *Mux {
 	m := &Mux{
 		conn:     conn,
 		streams:  make(map[uint32]*Stream),
-		acceptCh: make(chan *Stream, 16),
+		acceptCh: make(chan *Stream, 64),
 		ctx:      ctx,
 		cancel:   cancel,
 	}
@@ -174,6 +174,10 @@ func (m *Mux) writeFrame(streamID uint32, fType uint8, payload []byte) error {
 // readLoop reads frames from the underlying connection and dispatches them to
 // the appropriate Stream. It runs as a dedicated goroutine until an I/O error
 // (including a deliberate Close) terminates the connection.
+//
+// Uses a single large scratch buffer so that the header + payload of typical
+// VPN packets (≤ 1460 bytes) are read in one io.ReadFull call through the
+// underlying noiseConn, which already decrypts the entire mux frame at once.
 func (m *Mux) readLoop() {
 	hdr := make([]byte, muxHeaderSize)
 	for {

@@ -20,10 +20,9 @@ const (
 	//   noise header: 2 + 16 (AEAD tag) = 18 bytes
 	//   obfs header:  5 bytes
 	//   total:        30 bytes
-	// Setting MTU = 1500 - 30 - 50 (safety margin) = 1420 ensures that inner
-	// IP packets, after VPN wrapping, stay within the 1500-byte Ethernet MTU
-	// of the physical interface and are never fragmented.
-	tunMTU = 1420
+	// Setting MTU = 1500 - 30 - 10 (minimal safety) = 1460 maximises payload
+	// per packet while staying within the 1500-byte Ethernet MTU.
+	tunMTU = 1460
 )
 
 // tunIfreq is the ifreq structure for TUNSETIFF ioctl.

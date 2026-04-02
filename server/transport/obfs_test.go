@@ -391,7 +391,7 @@ func TestObfsReadWrongContentType(t *testing.T) {
 		sRaw.Close()
 	}()
 
-	conn := &ObfsConn{conn: cRaw}
+	conn := NewObfsConn(cRaw)
 	buf := make([]byte, 10)
 	_, err := conn.Read(buf)
 	if err == nil {
@@ -410,7 +410,7 @@ func TestObfsReadZeroLengthRecord(t *testing.T) {
 		sRaw.Close()
 	}()
 
-	conn := &ObfsConn{conn: cRaw}
+	conn := NewObfsConn(cRaw)
 	buf := make([]byte, 10)
 	_, err := conn.Read(buf)
 	if err == nil {
@@ -422,7 +422,7 @@ func TestObfsReadEOF(t *testing.T) {
 	cRaw, sRaw := net.Pipe()
 	sRaw.Close() // immediate EOF
 
-	conn := &ObfsConn{conn: cRaw}
+	conn := NewObfsConn(cRaw)
 	buf := make([]byte, 10)
 	_, err := conn.Read(buf)
 	if err == nil {

@@ -16,11 +16,22 @@ const (
 	soSndBufForce = 32 // SO_SNDBUFFORCE — Linux ≥ 2.6.14
 )
 
-// dscpCS1 is DSCP class CS1 (DSCP=8, TOS=0x20): "lower effort" forwarding.
-// Setting this on VPN tunnel packets signals to ISP QoS systems that the
-// traffic should not be rate-limited as a high-priority flow, which can
-// help avoid DPI-triggered throttling on some Russian ISPs.
-const dscpCS1 = 0x20
+// dscpDefault is DSCP 0 (TOS=0x00): default/best-effort forwarding.
+// Previous CS1 (0x20) explicitly asked ISPs to deprioritize the traffic,
+// which reduced throughput. Using default class ensures equal treatment.
+const dscpDefault = 0x00
+
+// TCP_QUICKACK disables delayed ACKs. On Linux the default TCP delayed-ACK
+// timer is 40 ms, which adds a full RTT of latency to every request-response
+// exchange over the VPN tunnel. Disabling it sends ACKs immediately,
+// allowing the sender's congestion window to open faster.
+const tcpQuickAck = 12 // TCP_QUICKACK — Linux ≥ 2.4.4
+
+// TCP_CONGESTION sets the per-socket congestion control algorithm.
+// BBR (Bottleneck Bandwidth and RTT) probes actual link bandwidth
+// rather than relying on packet loss, which dramatically improves
+// throughput on high-latency links (Russia↔Kazakhstan ≈ 80-120 ms).
+const tcpCongestion = 13 // TCP_CONGESTION — Linux ≥ 2.6.13
 
 // setForcedSocketBuffers attempts to set SO_RCVBUFFORCE / SO_SNDBUFFORCE on
 // conn.  Falls back to SO_RCVBUF / SO_SNDBUF if the process lacks
@@ -39,8 +50,14 @@ func setForcedSocketBuffers(conn *net.TCPConn, size int) {
 		if syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soSndBufForce, size) != nil {
 			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, size) //nolint:errcheck
 		}
-		// Mark outgoing packets with DSCP CS1 (best-effort, lower than default).
-		// This is a hint to ISP QoS systems; ignored by most.
-		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TOS, dscpCS1) //nolint:errcheck
+		// Mark outgoing packets with default DSCP (best-effort).
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TOS, dscpDefault) //nolint:errcheck
+		// Disable delayed ACKs — send ACKs immediately to speed up congestion
+		// window growth and reduce per-packet latency by up to 40 ms.
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpQuickAck, 1) //nolint:errcheck
+		// Try to use BBR congestion control (requires kernel module tcp_bbr).
+		// Falls back silently to the system default (usually CUBIC) if BBR
+		// is not available.
+		syscall.SetsockoptString(int(fd), syscall.IPPROTO_TCP, tcpCongestion, "bbr") //nolint:errcheck
 	})
 }
