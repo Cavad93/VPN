@@ -6,7 +6,7 @@ on:
     paths:
       - 'android/**'
       - '.github/workflows/build-android.yml'
-  workflow_dispatch:  # allows manual run from GitHub UI
+  workflow_dispatch:
 
 jobs:
   build:
@@ -22,14 +22,13 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Make gradlew executable
         run: chmod +x android/gradlew
 
       - name: Build debug APK
         working-directory: android
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
         run: ./gradlew assembleDebug --no-daemon
 
       - name: Upload APK
