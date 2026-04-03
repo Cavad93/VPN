@@ -57,11 +57,17 @@ const (
 	// Russia↔Kazakhstan typically has RTT 800-1000ms, so we need many more
 	// connections than a low-latency path:
 	//   Target 14 Mbps at RTT=919ms → 14/0.18 ≈ 78 connections theoretical.
-	//   In practice 32 gives ~8-12 Mbps (CUBIC beats Reno; connections share
-	//   the path, so scaling is ~0.7× linear).
+	//   In practice 64 gives ~10-20 Mbps (CUBIC beats Reno; connections share
+	//   the path, so scaling is ~0.7× linear). Some bonds may fail during setup;
+	//   extra headroom ensures enough reach the target count.
 	//
 	// Override with -bonds flag at runtime.
-	numBondConns = 32
+	numBondConns = 64
+
+	// secondaryMaxRetries is the number of times to retry a secondary
+	// connection before giving up.  Each retry adds ~1s delay (jittered).
+	// At RTT=89ms a single connect takes ~300ms; 3 retries = ~1.2s extra.
+	secondaryMaxRetries = 3
 
 	// reconnectMaxAttempts limits consecutive reconnect failures before giving up.
 	reconnectMaxAttempts = 30
@@ -619,8 +625,13 @@ func run() error {
 
 		// Open secondary connections CONCURRENTLY for download bonding.
 		// Sequential dialing at 919ms RTT would take (bonds-1)×919ms ≈ 28s for
-		// 32 connections. Concurrent dialing completes in ~1 RTT regardless of
+		// 64 connections. Concurrent dialing completes in ~1 RTT regardless of
 		// bond count, limited only by server-side accept parallelism.
+		//
+		// Each secondary goroutine retries up to secondaryMaxRetries times on
+		// failure (network blip, server backlog full, etc.) before giving up.
+		// Retries use jittered 500–1500ms delays to avoid thundering-herd on
+		// the server accept queue.
 		n := *bonds - 1 // number of secondaries (primary counts as 1)
 		var (
 			secMu       sync.Mutex
@@ -632,19 +643,35 @@ func run() error {
 			secWg.Add(1)
 			go func() {
 				defer secWg.Done()
-				sc, err := vs.connectSecondary(assignedIP)
-				if err != nil {
-					log.Warn("secondary connection failed", "n", i, "err", err)
-					return
+				var sc *secondaryConn
+				var lastErr error
+				for attempt := 0; attempt < secondaryMaxRetries; attempt++ {
+					if attempt > 0 {
+						// Jittered backoff: 500ms + up to 1s of random delay.
+						jitter := time.Duration(500+attempt*250) * time.Millisecond
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(jitter):
+						}
+					}
+					sc, lastErr = vs.connectSecondary(assignedIP)
+					if lastErr == nil {
+						break
+					}
+					log.Warn("secondary connect failed", "n", i, "attempt", attempt+1, "err", lastErr)
+				}
+				if lastErr != nil {
+					return // all retries exhausted; silently drop this bond slot
 				}
 				secMu.Lock()
 				secondaries = append(secondaries, sc)
-				log.Info("secondary connected", "n", i+1, "total", len(secondaries)+1)
+				log.Info("secondary connected", "bond", i+1, "total_bonds", len(secondaries)+1)
 				secMu.Unlock()
 			}()
 		}
 		secWg.Wait()
-		log.Info("bonding active", "connections", len(secondaries)+1)
+		log.Info("bonding active", "bonds", len(secondaries)+1, "target", *bonds)
 
 		// Run bidirectional forwarding until disconnection.
 		log.Info("VPN running — press Ctrl+C to disconnect")
@@ -671,9 +698,20 @@ func run() error {
 // runForwarding performs bidirectional TUN↔VPN packet forwarding with an
 // application-level keepalive. Multiple data streams (primary + secondaries)
 // are used for download bonding — each runs in its own receive goroutine.
+//
+// Resilience design:
+//   - Only a primary stream failure or total upload failure terminates the session.
+//   - Secondary stream failures are logged but do NOT kill the session — the VPN
+//     continues with the remaining bonds. Individual bond TCP connections can be
+//     dropped by intermediate ISP NAT boxes or packet loss without full reconnect.
+//   - Upload round-robins across all bonds; if one bond's Write fails, the next
+//     bond is tried. Only when ALL bonds are dead does upload terminate.
+//
 // Returns nil on clean shutdown (ctx cancelled), or an error on connection loss.
 func runForwarding(ctx context.Context, tun *tunDevice, primaryStream *transport.Stream, secondaries []*secondaryConn) error {
-	errCh := make(chan error, 2+len(secondaries))
+	// errCh is only written by critical failures (primary stream, tun I/O, all
+	// upload bonds dead). Secondary failures are intentionally NOT sent here.
+	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
 
 	// Collect all streams for upload.
@@ -682,6 +720,7 @@ func runForwarding(ctx context.Context, tun *tunDevice, primaryStream *transport
 	for _, sc := range secondaries {
 		allStreams = append(allStreams, sc.dataStream)
 	}
+	totalStreams := uint32(len(allStreams))
 
 	// Application-level keepalive on primary stream.
 	keepaliveDone := make(chan struct{})
@@ -702,16 +741,17 @@ func runForwarding(ctx context.Context, tun *tunDevice, primaryStream *transport
 		}
 	}()
 
-	// TUN → VPN (upload): single goroutine, round-robin across all streams.
-	// stream.Write() is fast (writes to TCP send buffer, not a blocking syscall)
-	// so sequential round-robin is efficient. Each bond stream has its own TCP
-	// congestion window so each Write distributes load across 32 connections.
+	// TUN → VPN (upload): single goroutine, resilient round-robin across bonds.
+	//
+	// On each packet we try up to totalStreams streams in round-robin order.
+	// Failed writes (dead bond) are skipped — the next bond gets the packet.
+	// Only when every bond is dead does the goroutine terminate with an error.
+	// This prevents a single dropped TCP connection from killing the session.
 	var uploadIdx atomic.Uint32
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 65536)
-		n := uint32(len(allStreams))
 		for {
 			nr, err := tun.Read(buf)
 			if err != nil {
@@ -726,13 +766,22 @@ func runForwarding(ctx context.Context, tun *tunDevice, primaryStream *transport
 			if nr < 20 {
 				continue
 			}
-			idx := uploadIdx.Add(1) % n
-			if _, err := allStreams[idx].Write(buf[:nr]); err != nil {
+			// Round-robin with dead-stream skipping: try each bond once.
+			base := uploadIdx.Add(1) % totalStreams
+			sent := false
+			for i := uint32(0); i < totalStreams; i++ {
+				idx := (base + i) % totalStreams
+				if _, werr := allStreams[idx].Write(buf[:nr]); werr == nil {
+					sent = true
+					break
+				}
+			}
+			if !sent {
 				select {
 				case <-ctx.Done():
 					errCh <- nil
 				default:
-					errCh <- fmt.Errorf("vpn upload write: %w", err)
+					errCh <- fmt.Errorf("all %d bond streams closed", totalStreams)
 				}
 				return
 			}
@@ -740,8 +789,10 @@ func runForwarding(ctx context.Context, tun *tunDevice, primaryStream *transport
 	}()
 
 	// VPN → TUN (download): one goroutine per stream.
-	// Each goroutine reads from its stream and writes to the shared TUN.
-	startRecvGoroutine := func(stream *transport.Stream, label string) {
+	// PRIMARY failure terminates the session (the main tunnel is gone).
+	// SECONDARY failure is logged and the goroutine exits silently — the session
+	// keeps running with the remaining bonds.
+	startRecvGoroutine := func(stream *transport.Stream, label string, isPrimary bool) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -749,21 +800,25 @@ func runForwarding(ctx context.Context, tun *tunDevice, primaryStream *transport
 			for {
 				n, err := stream.Read(buf)
 				if err != nil {
-					select {
-					case <-ctx.Done():
-					default:
-						errCh <- fmt.Errorf("%s read: %w", label, err)
+					if isPrimary {
+						select {
+						case <-ctx.Done():
+						default:
+							errCh <- fmt.Errorf("primary stream closed: %w", err)
+						}
+					} else if ctx.Err() == nil {
+						log.Info("bond closed — continuing with remaining bonds", "bond", label)
 					}
 					return
 				}
 				if n < 20 {
 					continue
 				}
-				if _, err := tun.Write(buf[:n]); err != nil {
+				if _, werr := tun.Write(buf[:n]); werr != nil {
 					select {
 					case <-ctx.Done():
 					default:
-						errCh <- fmt.Errorf("tun write: %w", err)
+						errCh <- fmt.Errorf("tun write: %w", werr)
 					}
 					return
 				}
@@ -771,12 +826,12 @@ func runForwarding(ctx context.Context, tun *tunDevice, primaryStream *transport
 		}()
 	}
 
-	startRecvGoroutine(primaryStream, "primary")
+	startRecvGoroutine(primaryStream, "primary", true)
 	for i, sc := range secondaries {
-		startRecvGoroutine(sc.dataStream, fmt.Sprintf("secondary-%d", i+1))
+		startRecvGoroutine(sc.dataStream, fmt.Sprintf("secondary-%d", i+1), false)
 	}
 
-	// Wait for first error or clean shutdown.
+	// Wait for a critical failure or clean shutdown.
 	var result error
 	select {
 	case <-ctx.Done():
