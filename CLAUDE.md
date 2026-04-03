@@ -602,3 +602,30 @@ Wire format обеспечивает статистическую неразли
 1. **Параллельная доставка уведомлений** — вместо последовательной отправки по подписчикам, каждый получает горутину (fire-and-forget). Медленный webhook не блокирует остальных и не блокирует очередь. Worker мгновенно переходит к следующему событию — VPN data path никогда не затрагивается.
 
 2. **sync.Pool для 64 KB буферов в handleDataStream** — `streamReadBufPool` пулит 65536-байтные буферы чтения. До оптимизации: каждая сессия делала `make([]byte, 65536)` при старте — при мобильных клиентах с частыми reconnect это создаёт GC pressure. После: буфер берётся из пула и возвращается при завершении сессии. Экономия: -1 heap alloc per session, снижение пауз GC при 50+ одновременных клиентах.
+
+### ЗАДАЧА 32 — ВЫПОЛНЕНО (2026-04-03)
+**Файлы:** `client/autoupdate.py`, `client/test_autoupdate.py`, `server/api/update_api.go`, `server/api/update_api_test.go`
+
+Реализовано автообновление клиента без участия пользователя:
+- `UpdateInfo{version, download_url, sha256, release_notes, min_os_version}` — метаданные обновления; `is_newer_than(current)` — семантическое сравнение версий
+- `UpdateConfig` — конфигурация: update_url, check_interval_s, timeout_s, auto_install, колбэки on_update_available/installed/error
+- `UpdateState` — состояния жизненного цикла: IDLE/CHECKING/DOWNLOADING/INSTALLING/RESTART_PENDING/UP_TO_DATE/ERROR
+- `_VersionParser` — парсинг JSON версии с endpoint
+- `_Downloader` — потоковая загрузка чанками 64 KB с SHA-256 верификацией на лету (не держит весь файл в памяти)
+- `_Installer` — macOS .pkg через `installer -pkg` или .zip с атомарной заменой файлов (backup → replace → cleanup)
+- `AutoUpdater` — фоновый daemon thread: `start()`, `stop()`, `check_now()`, `install_pending()`; 60-секундная задержка перед первой проверкой чтобы не конкурировать со стартом VPN
+- `create_auto_updater()` — фабричная функция
+
+Сервер (Go): `ClientVersionInfo` (JSON структура), `updateStore` (RWMutex), `GET /api/v1/client/version` — публичный endpoint, `POST /api/v1/client/version` — защищённый endpoint для обновления версии
+
+**Тесты:** 46 тестов Python + 6 тестов Go, все pass
+**Запуск:** `cd client && python3 -m pytest test_autoupdate.py -v`; `cd server && go test ./api/ -v -cover`
+
+### ОПТИМИЗАЦИЯ СКОРОСТИ — ВЫПОЛНЕНО (2026-04-03)
+**Файлы:** `client/autoupdate.py`
+
+Два улучшения производительности:
+
+1. **60-секундная задержка первой проверки** — `_run_loop` ждёт 60 с перед первым обращением к update_url. VPN-туннель успевает полностью подняться прежде чем появится любой фоновый HTTP-трафик обновлений. Задержка прерывается через `stop_event.wait()` — `stop()` немедленно завершает поток.
+
+2. **Стриминговая загрузка 64 KB чанками** — `_Downloader.download()` читает ответ чанками `_DOWNLOAD_CHUNK_SIZE = 65536` байт, совпадающими с `streamReadBufPool` на сервере. SHA-256 обновляется инкрементально на лету — весь файл обновления никогда не находится в памяти целиком. Это устраняет GC pause при загрузке обновления во время активного VPN-соединения.

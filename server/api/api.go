@@ -75,14 +75,15 @@ func DefaultConfig() Config {
 
 // APIServer is the HTTP management API server.
 type APIServer struct {
-	cfg      Config
-	srv      ServerIface
-	qrSrv    QRServerIface
-	invites  *InviteStore
-	notifSvc NotificationService
-	logger   *slog.Logger
-	mux      *http.ServeMux
-	logBuf   *LogBuffer
+	cfg         Config
+	srv         ServerIface
+	qrSrv       QRServerIface
+	invites     *InviteStore
+	notifSvc    NotificationService
+	logger      *slog.Logger
+	mux         *http.ServeMux
+	logBuf      *LogBuffer
+	updateStore *updateStore
 }
 
 // NewAPIServer creates a new APIServer and registers all routes.
@@ -158,6 +159,10 @@ func (a *APIServer) registerRoutes() {
 
 	// Aggregate statistics
 	a.mux.HandleFunc("GET /api/v1/stats", a.auth(a.handleStats))
+
+	// Client auto-update — GET is public so headless clients can poll freely.
+	a.mux.HandleFunc("GET /api/v1/client/version", a.handleGetClientVersion)
+	a.mux.HandleFunc("POST /api/v1/client/version", a.auth(a.handleSetClientVersion))
 }
 
 // ---------------------------------------------------------------------------
