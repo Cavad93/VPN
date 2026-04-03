@@ -414,7 +414,18 @@ func (s *Server) runPrimaryConn(ctx context.Context, session *crypto.Session, ct
 		cancel:       cancel,
 	}
 
+	// If this client key already has an active session, close it first.
+	// This prevents IP pool exhaustion when a client reconnects without
+	// cleanly closing the previous connection (e.g. Android app crash,
+	// network switch, or routing loop causing rapid reconnects).
 	s.mu.Lock()
+	for id, existing := range s.sessions {
+		if existing.remoteKey == session.RemoteStatic && id != cs.id {
+			s.logger.Info("replacing existing session for same key",
+				"old_id", id, "new_id", cs.id)
+			existing.cancel()
+		}
+	}
 	s.sessions[cs.id] = cs
 	s.mu.Unlock()
 

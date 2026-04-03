@@ -16,6 +16,7 @@ import kotlinx.coroutines.*
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /** Starts the VPN tunnel. Required extras: EXTRA_SERVER_HOST, EXTRA_PRIVATE_KEY. */
@@ -61,6 +62,9 @@ class CavadVpnService : VpnService() {
     private var connectedSinceMs = 0L
     private var assignedIp = ""
 
+    /** Prevents re-entrant startVpn while a connection attempt is in progress. */
+    private val connecting = AtomicBoolean(false)
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_CONNECT -> {
@@ -76,8 +80,16 @@ class CavadVpnService : VpnService() {
                 startVpn(config)
             }
             ACTION_DISCONNECT -> stopVpn()
+            else -> {
+                // No action (e.g. system restart without intent) — do not reconnect.
+                stopSelf()
+                return START_NOT_STICKY
+            }
         }
-        return START_STICKY
+        // START_NOT_STICKY: do NOT auto-restart the service. The user must
+        // explicitly reconnect. This prevents the infinite reconnection loop
+        // where Android restarts the service after stopVpn().
+        return START_NOT_STICKY
     }
 
     override fun onRevoke() {
@@ -95,6 +107,12 @@ class CavadVpnService : VpnService() {
     // -----------------------------------------------------------------------
 
     private fun startVpn(config: VpnConfig) {
+        // Prevent re-entrant connection attempts.
+        if (!connecting.compareAndSet(false, true)) {
+            Log.w(TAG, "startVpn called while already connecting — ignoring")
+            return
+        }
+
         stopVpn() // clean up any existing session
 
         createNotificationChannel()
@@ -118,11 +136,18 @@ class CavadVpnService : VpnService() {
                 val route = client.connect()
                 Log.i(TAG, "Connected — assigned IP ${route.assignedIp}/${route.prefixLen}")
 
+                // CRITICAL: Protect the VPN tunnel socket BEFORE setting up the
+                // TUN interface. setupTunnel() calls addRoute("0.0.0.0", 0) which
+                // would route the VPN socket's own traffic back through the TUN
+                // interface, creating a routing loop.
+                client.protectSocket(this@CavadVpnService)
+
                 val fd = setupTunnel(route, config)
                 tunFd = fd
 
                 connectedSinceMs = System.currentTimeMillis()
                 assignedIp = route.assignedIp
+                connecting.set(false) // connection established
 
                 updateNotification("Connected — ${route.assignedIp}")
                 broadcastState("CONNECTED")
@@ -138,15 +163,28 @@ class CavadVpnService : VpnService() {
                 }
 
                 runTunnel(fd, client)
+                // Tunnel ended normally (server closed connection).
+                Log.i(TAG, "Tunnel ended normally")
+                broadcastState("DISCONNECTED")
+                stopVpn()
+            } catch (e: CancellationException) {
+                // Coroutine was cancelled (e.g. by stopVpn) — not an error.
+                Log.d(TAG, "VPN coroutine cancelled")
             } catch (e: Exception) {
                 Log.e(TAG, "VPN connection failed: ${e.message}", e)
                 broadcastState("ERROR")
-                stopVpn()
+                // Clean up but do NOT call stopVpn() → stopSelf() here.
+                // That would cause Android to potentially restart the service.
+                // Instead, just clean up resources and let the user manually reconnect.
+                cleanupResources()
+            } finally {
+                connecting.set(false)
             }
         }
     }
 
-    private fun stopVpn() {
+    /** Releases all resources without stopping the service. */
+    private fun cleanupResources() {
         serviceScope?.cancel()
         serviceScope = null
 
@@ -162,6 +200,10 @@ class CavadVpnService : VpnService() {
         assignedIp = ""
 
         stopForeground(STOP_FOREGROUND_REMOVE)
+    }
+
+    private fun stopVpn() {
+        cleanupResources()
         stopSelf()
         broadcastState("DISCONNECTED")
         Log.i(TAG, "VPN stopped")
@@ -222,7 +264,14 @@ class CavadVpnService : VpnService() {
                 try {
                     while (isActive) {
                         val pkt = client.recvPacket()
-                        if (pkt.isEmpty()) break
+                        if (pkt.isEmpty()) {
+                            // Empty packet = timeout or stream closed. If the
+                            // client is still connected, this is an idle timeout
+                            // — just retry. If the mux is closed, the next read
+                            // will throw EOFException.
+                            if (!client.isConnected) break
+                            continue
+                        }
                         tunOut.write(pkt)
                         bytesIn.addAndGet(pkt.size.toLong())
                     }

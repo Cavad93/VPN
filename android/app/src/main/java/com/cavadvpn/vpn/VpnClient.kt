@@ -36,6 +36,11 @@ class VpnClient(private val config: VpnConfig) {
     @Volatile var isConnected: Boolean = false
         private set
 
+    /** Exposes the underlying socket so [CavadVpnService] can call protect() on it. */
+    fun protectSocket(service: android.net.VpnService) {
+        socket?.let { service.protect(it) }
+    }
+
     /** The route info assigned by the server after [connect]. */
     var routeInfo: RouteInfo? = null
         private set
@@ -119,11 +124,13 @@ class VpnClient(private val config: VpnConfig) {
 
     /**
      * Receives a raw IPv4 packet from the data stream.
-     * Blocks until a packet arrives or the stream closes.
+     * Blocks until a packet arrives, the stream closes, or the read times out.
+     * Returns an empty array on timeout or stream close so the caller can
+     * decide whether to retry or shut down.
      */
     fun recvPacket(): ByteArray {
         checkNotNull(dataStream) { "not connected" }
-        return dataStream!!.read()
+        return dataStream!!.read(30_000L) // 30s timeout — long enough for idle connections
     }
 
     /**
