@@ -189,20 +189,22 @@ func (vs *vpnSession) connect() (
 
 	tc := rawConn.(*net.TCPConn)
 	_ = tc.SetNoDelay(true)
-	_ = tc.SetReadBuffer(16 * 1024 * 1024)
-	_ = tc.SetWriteBuffer(16 * 1024 * 1024)
+	// Socket buffers: 2 MB each.
+	// BDP = 50 Mbps × 80ms = 500 KB. 2 MB provides 4× headroom for bursts
+	// WITHOUT causing bufferbloat (16 MB buffers caused latency to spike
+	// from 80ms to 321ms because the kernel queued too much data).
+	_ = tc.SetReadBuffer(2 * 1024 * 1024)
+	_ = tc.SetWriteBuffer(2 * 1024 * 1024)
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(15 * time.Second)
-	// Per-socket TCP tuning via raw fd — TCP_NOTSENT_LOWAT reduces bufferbloat
-	// in the kernel's send queue. Without it, the kernel buffers up to the full
-	// SO_SNDBUF (16 MB) before pushing data onto the wire, adding hundreds of ms
-	// of latency that confuses inner TCP's RTT estimates.
-	// With TCP_NOTSENT_LOWAT=131072 (128 KB), the kernel pushes data sooner,
-	// giving inner TCP connections more accurate RTT measurements.
+	// TCP_NOTSENT_LOWAT = 16384 (16 KB) on macOS.
+	// Tells the kernel: "signal me as writable only when <16 KB is unsent."
+	// This prevents the kernel from queuing megabytes of data in the send
+	// buffer before pushing it to the wire. Lower value = lower latency.
+	// Apple recommends this for real-time applications (WWDC 2015).
 	if raw, err := tc.SyscallConn(); err == nil {
 		raw.Control(func(fd uintptr) { //nolint:errcheck
-			// TCP_NOTSENT_LOWAT = 0x201 on macOS
-			syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, 0x201, 131072) //nolint:errcheck
+			syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, 0x201, 16384) //nolint:errcheck
 		})
 	}
 
@@ -314,50 +316,38 @@ func (vs *vpnSession) connect() (
 
 var log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-// applyMacOSTuning sets kernel parameters for optimal TCP throughput on macOS.
-// The vpnclient runs as root, so sysctl writes succeed. Best-effort: failures
-// are logged but do not prevent the VPN from starting.
+// applyMacOSTuning sets kernel parameters for optimal VPN throughput on macOS.
+// The vpnclient runs as root (sudo), so sysctl writes succeed.
 //
-// Key settings:
-//   - maxsockbuf=16 MB: allows SO_RCVBUF/SO_SNDBUF up to 16 MB per socket
-//   - sendspace/recvspace=1 MB: default TCP buffer per new socket (auto-tuning
-//     grows it further). macOS default is 128 KB which limits initial throughput.
-//   - tcp_fastopen=3: enable TFO for both client and server
-//   - delayed_ack=0: disable 100 ms delayed ACK timer (macOS equivalent of
-//     Linux TCP_QUICKACK). This is the highest-impact fix for download speed:
-//     without it, the server's congestion window can only grow once per
-//     100 ms + 93 ms = 193 ms round-trip, capping download at ~5 Mbps.
+// IMPORTANT: VPN tunnels suffer from bufferbloat if TCP buffers are too large.
+// Large buffers (1+ MB) queue hundreds of ms of data, inflating latency from
+// 80ms to 300ms+. For VPN, we want MODERATE buffers — enough for the
+// bandwidth-delay product but not more.
+//
+// BDP = 50 Mbps × 0.08s = 500 KB. We set 524288 (512 KB) which allows
+// full 50 Mbps throughput at 80ms RTT without excess queuing.
 func applyMacOSTuning() {
-	// Order matters: maxsockbuf must be set before sendspace/recvspace.
 	type kv struct{ k, v string }
 	sysctls := []kv{
-		// Allow 16 MB socket buffers (must be first — limits sendspace/recvspace).
-		{"kern.ipc.maxsockbuf", "16777216"},
-		// Default TCP buffer per socket: 1 MB (macOS default is 128 KB).
-		{"net.inet.tcp.sendspace", "1048576"},
-		{"net.inet.tcp.recvspace", "1048576"},
-		// CRITICAL: disable delayed ACK. macOS defaults to 100 ms delayed ACK.
-		// With 80 ms RTT, this means the server's congestion window can only
-		// grow once per 180 ms, capping download to ~5 Mbps.
-		// Setting to 0 = ACK every segment immediately.
+		// CRITICAL: disable delayed ACK (100ms → 0ms). Without this,
+		// the server's cwnd grows once per 180ms (100ms ACK + 80ms RTT),
+		// capping download to ~5 Mbps. With delayed_ack=0, cwnd grows
+		// every 80ms, allowing 15-30 Mbps.
 		{"net.inet.tcp.delayed_ack", "0"},
-		// TCP Fast Open (both client and server).
-		{"net.inet.tcp.fastopen", "3"},
-		// Default MSS to 1440 (match VPN MTU - 20 byte IP - 20 byte TCP).
-		{"net.inet.tcp.mssdflt", "1440"},
-		// Enable window scaling with factor 8 (window up to 16 MB).
-		{"net.inet.tcp.win_scale_factor", "8"},
-		// Auto-receive buffer tuning.
+		// Moderate TCP buffers: 512 KB = BDP for 50 Mbps × 80ms.
+		// NOT 1MB+ — that causes bufferbloat (latency 80ms → 300ms+).
+		{"net.inet.tcp.sendspace", "524288"},
+		{"net.inet.tcp.recvspace", "524288"},
+		// Auto-tuning: let kernel grow buffers up to 4MB if needed,
+		// but start moderate. 4MB covers up to 400 Mbps at 80ms RTT.
 		{"net.inet.tcp.doautorcvbuf", "1"},
-		{"net.inet.tcp.autorcvbufmax", "16777216"},
-		// Auto-send buffer tuning.
-		{"net.inet.tcp.doautosndbuf", "1"},
-		{"net.inet.tcp.autosndbufmax", "16777216"},
+		{"net.inet.tcp.autorcvbufmax", "4194304"},
+		// TCP Fast Open (saves 1 RTT on reconnect).
+		{"net.inet.tcp.fastopen", "3"},
 	}
 	for _, s := range sysctls {
 		out, err := exec.Command("sysctl", "-w", s.k+"="+s.v).CombinedOutput()
 		if err != nil {
-			// Log as WARN so the user sees it — delayed_ack failure is critical.
 			log.Warn("sysctl failed", "key", s.k, "value", s.v, "err", strings.TrimSpace(string(out)))
 		} else {
 			log.Info("sysctl applied", "key", s.k, "value", s.v)

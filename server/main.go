@@ -195,7 +195,10 @@ func (s *Server) Run(ctx context.Context) error {
 		// setForcedSocketBuffers uses SO_RCVBUFFORCE/SO_SNDBUFFORCE (Linux,
 		// CAP_NET_ADMIN) to bypass the net.core.rmem_max kernel limit.
 		if tc, ok := conn.(*net.TCPConn); ok {
-			setForcedSocketBuffers(tc, 16<<20) // 16 MB, force-bypass rmem_max
+			// 2 MB socket buffers. BDP = 50 Mbps × 80ms = 500 KB.
+		// 2 MB provides 4× headroom without causing bufferbloat.
+		// Previously 16 MB — caused latency spike from 80ms to 321ms.
+		setForcedSocketBuffers(tc, 2<<20)
 			tc.SetNoDelay(true)               // disable Nagle — VPN packets must not be coalesced
 			// TCP keepalive: probe idle connections every 15 s with 3 retries.
 			// Detects dead connections in 30 s (15+3×5) — 2× faster than before.

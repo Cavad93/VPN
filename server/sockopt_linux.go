@@ -85,12 +85,14 @@ const tcpFastOpen = 23 // TCP_FASTOPEN — Linux ≥ 3.7
 //   - tcp_slow_start_after_idle=0: don't reset cwnd after idle periods
 func applySysctls() {
 	sysctls := map[string]string{
-		"net.core.rmem_max":                  "16777216",
-		"net.core.wmem_max":                  "16777216",
-		"net.core.rmem_default":              "1048576",
-		"net.core.wmem_default":              "1048576",
-		"net.ipv4.tcp_rmem":                  "4096 1048576 16777216",
-		"net.ipv4.tcp_wmem":                  "4096 1048576 16777216",
+		// 4 MB max — enough for 400 Mbps at 80ms, no bufferbloat.
+		// 16 MB caused latency spike from 80ms to 321ms.
+		"net.core.rmem_max":                  "4194304",
+		"net.core.wmem_max":                  "4194304",
+		"net.core.rmem_default":              "524288",
+		"net.core.wmem_default":              "524288",
+		"net.ipv4.tcp_rmem":                  "4096 524288 4194304",
+		"net.ipv4.tcp_wmem":                  "4096 524288 4194304",
 		"net.core.default_qdisc":             "fq",
 		"net.ipv4.tcp_congestion_control":    "bbr",
 		"net.ipv4.ip_forward":                "1",

@@ -873,10 +873,9 @@ class VPNClient:
         # preventing the remote server from advancing its send window and
         # killing throughput 10-20×.
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        # Large socket buffers: bandwidth-delay product for 64 Mbps × 118 ms
-        # ≈ 940 KB; use 16 MB to leave plenty of headroom for bursts.
-        # Server-side sysctl tuning raises rmem_max/wmem_max to 16 MB.
-        _BUF_SIZE = 16 * 1024 * 1024
+        # Socket buffers: 2 MB. BDP = 50 Mbps × 80ms = 500 KB.
+        # 2 MB gives 4× headroom without bufferbloat (16 MB caused 321ms latency).
+        _BUF_SIZE = 2 * 1024 * 1024
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _BUF_SIZE)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _BUF_SIZE)
         # TCP keepalive: prevent ISP NAT/firewall from dropping idle connections.
