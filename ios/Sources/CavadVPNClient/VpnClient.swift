@@ -9,7 +9,7 @@ import CavadVPNTransport
 
 private let ctlHello:  UInt8 = 0x01
 private let ctlAssign: UInt8 = 0x02
-private let ctlError:  UInt8 = 0x03
+private let ctlError:  UInt8 = 0xFF
 private let ctlAssignPayloadLen = 9  // ip(4) + prefixLen(1) + gateway(4)
 
 // MARK: - VpnClient
@@ -182,10 +182,8 @@ public final class VpnClient {
         let ctl = try muxConn.openStream()
         defer { ctl.close() }
 
-        // Send ctlHello: [0x01, 0x00 × 9] = 10 bytes
-        var hello = Data(repeating: 0, count: 10)
-        hello[0] = ctlHello
-        try ctl.write(hello)
+        // Send ctlHello: single byte 0x01 (must match server protocol)
+        try ctl.write(Data([ctlHello]))
 
         // Receive ctlAssign: [0x02, ip(4), prefixLen(1), gateway(4)] = 10 bytes
         let resp = try ctl.readExactly(1 + ctlAssignPayloadLen)

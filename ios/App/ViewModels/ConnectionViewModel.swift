@@ -113,15 +113,13 @@ public final class ConnectionViewModel: ObservableObject {
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = "com.cavadvpn.ios.tunnel"
         if let cfg = config {
-            proto.serverAddress = cfg.host
+            proto.serverAddress = "\(cfg.host):\(cfg.port)"
             var settings: [String: Any] = [
-                "host": cfg.host,
-                "port": cfg.port,
-                "dns":  cfg.dnsServer,
-                "mtu":  cfg.mtu
+                "dnsServer": cfg.dnsServer,
+                "mtu":       cfg.mtu
             ]
-            if let pk = cfg.privateKeyHex    { settings["private_key"]  = pk }
-            if let sk = cfg.serverPublicKeyHex { settings["server_key"] = sk }
+            if let pk = cfg.privateKeyHex    { settings["privateKeyHex"]      = pk }
+            if let sk = cfg.serverPublicKeyHex { settings["serverPublicKeyHex"] = sk }
             proto.providerConfiguration = settings
         }
         manager.protocolConfiguration = proto
