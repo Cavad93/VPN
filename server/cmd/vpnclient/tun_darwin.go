@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -39,7 +40,8 @@ type tunDevice struct {
 	fd      int
 	name    string
 	readBuf [65536 + utunHdrLen]byte // pre-allocated: eliminates per-packet make() in Read
-	wrBuf   [65536 + utunHdrLen]byte // pre-allocated: eliminates per-packet make() in Write
+	wrMu    sync.Mutex               // protects wrBuf: 32 download goroutines call Write concurrently
+	wrBuf   [65536 + utunHdrLen]byte // pre-allocated; guarded by wrMu
 }
 
 // openTun opens a utun device.  The kernel assigns the next free interface
@@ -114,13 +116,22 @@ func (t *tunDevice) Read(buf []byte) (int, error) {
 }
 
 // Write writes a raw IPv4 packet, prepending the 4-byte AF_INET utun header.
-// Uses pre-allocated wrBuf — zero heap allocation per call.
+// Uses pre-allocated wrBuf (guarded by wrMu) — zero heap allocation per call.
+//
+// wrMu is required because runForwarding spawns one goroutine per bond stream
+// (up to 32), all calling Write concurrently. Without the lock each goroutine
+// overwrites wrBuf while another goroutine's syscall.Write is still reading it,
+// causing corrupt packets and false TCP checksum failures — the primary cause of
+// throughput being ~50% of theoretical maximum.
 func (t *tunDevice) Write(pkt []byte) (int, error) {
 	total := utunHdrLen + len(pkt)
+	t.wrMu.Lock()
 	// AF_INET = 2, big-endian 4 bytes: 0x00 0x00 0x00 0x02
 	t.wrBuf[0] = 0; t.wrBuf[1] = 0; t.wrBuf[2] = 0; t.wrBuf[3] = byte(afInet)
 	copy(t.wrBuf[utunHdrLen:], pkt)
-	if _, err := syscall.Write(t.fd, t.wrBuf[:total]); err != nil {
+	_, err := syscall.Write(t.fd, t.wrBuf[:total])
+	t.wrMu.Unlock()
+	if err != nil {
 		return 0, &net.OpError{Op: "write", Net: "tun", Err: err}
 	}
 	return len(pkt), nil

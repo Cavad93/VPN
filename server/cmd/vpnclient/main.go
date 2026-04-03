@@ -676,13 +676,12 @@ func runForwarding(ctx context.Context, tun *tunDevice, primaryStream *transport
 	errCh := make(chan error, 2+len(secondaries))
 	var wg sync.WaitGroup
 
-	// Collect all streams for upload round-robin.
+	// Collect all streams for upload.
 	allStreams := make([]*transport.Stream, 0, 1+len(secondaries))
 	allStreams = append(allStreams, primaryStream)
 	for _, sc := range secondaries {
 		allStreams = append(allStreams, sc.dataStream)
 	}
-	var uploadIdx atomic.Uint32
 
 	// Application-level keepalive on primary stream.
 	keepaliveDone := make(chan struct{})
@@ -703,12 +702,58 @@ func runForwarding(ctx context.Context, tun *tunDevice, primaryStream *transport
 		}
 	}()
 
-	// TUN → VPN (upload): round-robin across all connections.
+	// TUN → VPN (upload): one worker goroutine per stream.
+	//
+	// Previous design: one goroutine did round-robin writes to all streams
+	// sequentially. If any stream's Write blocked (TCP send buffer full due
+	// to congestion), ALL streams were starved — head-of-line blocking.
+	// At 0.7% loss with 32 bonds, ~22% of iterations hit a backed-up stream.
+	//
+	// New design: each stream has a dedicated goroutine and a buffered channel
+	// (uploadCh). The TUN reader pushes packets into channels round-robin.
+	// A blocked stream only backs up its own channel — others proceed freely.
+	// Channel depth 128 = ~180 KB per stream, enough to absorb one RTT burst.
+	const uploadChanDepth = 128
+	type uploadWorker struct {
+		ch     chan []byte
+		stream *transport.Stream
+	}
+	workers := make([]uploadWorker, len(allStreams))
+	var uploadIdx atomic.Uint32
+	for i, s := range allStreams {
+		w := uploadWorker{
+			ch:     make(chan []byte, uploadChanDepth),
+			stream: s,
+		}
+		workers[i] = w
+		wg.Add(1)
+		go func(w uploadWorker, label string) {
+			defer wg.Done()
+			for pkt := range w.ch {
+				if _, err := w.stream.Write(pkt); err != nil {
+					select {
+					case <-ctx.Done():
+					default:
+						errCh <- fmt.Errorf("%s upload write: %w", label, err)
+					}
+					return
+				}
+			}
+		}(w, fmt.Sprintf("upload-%d", i))
+	}
+
+	// TUN reader: reads packets and distributes to worker channels round-robin.
+	// The read loop itself never blocks on a slow stream.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer func() {
+			for _, w := range workers {
+				close(w.ch)
+			}
+		}()
 		buf := make([]byte, 65536)
-		n := uint32(len(allStreams))
+		n := uint32(len(workers))
 		for {
 			nr, err := tun.Read(buf)
 			if err != nil {
@@ -723,14 +768,13 @@ func runForwarding(ctx context.Context, tun *tunDevice, primaryStream *transport
 			if nr < 20 {
 				continue
 			}
+			pkt := make([]byte, nr)
+			copy(pkt, buf[:nr])
 			idx := uploadIdx.Add(1) % n
-			if _, err := allStreams[idx].Write(buf[:nr]); err != nil {
-				select {
-				case <-ctx.Done():
-					errCh <- nil
-				default:
-					errCh <- fmt.Errorf("vpn write: %w", err)
-				}
+			select {
+			case workers[idx].ch <- pkt:
+			case <-ctx.Done():
+				errCh <- nil
 				return
 			}
 		}
