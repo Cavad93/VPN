@@ -18,6 +18,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestLogBuffer_Empty(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(10)
 	entries := b.Entries(0)
 	if len(entries) != 0 {
@@ -26,6 +27,7 @@ func TestLogBuffer_Empty(t *testing.T) {
 }
 
 func TestLogBuffer_AddAndRetrieve(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(10)
 	for i := 0; i < 5; i++ {
 		b.Add(api.LogEntry{Message: string(rune('A' + i)), Level: "info"})
@@ -43,6 +45,7 @@ func TestLogBuffer_AddAndRetrieve(t *testing.T) {
 }
 
 func TestLogBuffer_RingOverwrite(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(3)
 	for i := 0; i < 5; i++ {
 		b.Add(api.LogEntry{Message: string(rune('A' + i)), Level: "info"})
@@ -61,6 +64,7 @@ func TestLogBuffer_RingOverwrite(t *testing.T) {
 }
 
 func TestLogBuffer_LimitParameter(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(20)
 	for i := 0; i < 10; i++ {
 		b.Add(api.LogEntry{Message: string(rune('A' + i)), Level: "info"})
@@ -79,6 +83,7 @@ func TestLogBuffer_LimitParameter(t *testing.T) {
 }
 
 func TestLogBuffer_LimitExceedsCount(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(10)
 	b.Add(api.LogEntry{Message: "only", Level: "info"})
 	entries := b.Entries(100)
@@ -88,6 +93,7 @@ func TestLogBuffer_LimitExceedsCount(t *testing.T) {
 }
 
 func TestLogBuffer_DefaultCapacity(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(0)
 	// Verify it doesn't panic and can store entries
 	b.Add(api.LogEntry{Message: "test", Level: "info"})
@@ -98,6 +104,7 @@ func TestLogBuffer_DefaultCapacity(t *testing.T) {
 }
 
 func TestLogBuffer_ExactCapacity(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(5)
 	for i := 0; i < 5; i++ {
 		b.Add(api.LogEntry{Message: string(rune('A' + i)), Level: "info"})
@@ -112,6 +119,7 @@ func TestLogBuffer_ExactCapacity(t *testing.T) {
 }
 
 func TestLogBuffer_OneEntry(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(5)
 	b.Add(api.LogEntry{Message: "hello", Level: "warn"})
 	entries := b.Entries(0)
@@ -121,6 +129,7 @@ func TestLogBuffer_OneEntry(t *testing.T) {
 }
 
 func TestLogBuffer_ChronologicalOrder(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(10)
 	for i := 0; i < 6; i++ {
 		b.Add(api.LogEntry{Message: string(rune('A' + i)), Level: "info"})
@@ -138,6 +147,7 @@ func TestLogBuffer_ChronologicalOrder(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLogBufHandler_BasicLevels(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(50)
 	h := b.Handler()
 	logger := slog.New(h)
@@ -161,6 +171,7 @@ func TestLogBufHandler_BasicLevels(t *testing.T) {
 }
 
 func TestLogBufHandler_Attrs(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(10)
 	h := b.Handler()
 	logger := slog.New(h)
@@ -177,6 +188,7 @@ func TestLogBufHandler_Attrs(t *testing.T) {
 }
 
 func TestLogBufHandler_WithAttrs(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(10)
 	h := b.Handler()
 	logger := slog.New(h).With("component", "server")
@@ -192,6 +204,7 @@ func TestLogBufHandler_WithAttrs(t *testing.T) {
 }
 
 func TestLogBufHandler_WithGroup(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(10)
 	h := b.Handler()
 	h2 := h.WithGroup("grp")
@@ -201,6 +214,7 @@ func TestLogBufHandler_WithGroup(t *testing.T) {
 }
 
 func TestLogBufHandler_Enabled(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(10)
 	h := b.Handler()
 	for _, lvl := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
@@ -211,6 +225,7 @@ func TestLogBufHandler_Enabled(t *testing.T) {
 }
 
 func TestLogBufHandler_Timestamp(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(10)
 	h := b.Handler()
 	logger := slog.New(h)
@@ -229,6 +244,7 @@ func TestLogBufHandler_Timestamp(t *testing.T) {
 }
 
 func TestLogBufHandler_BoolAttr(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(10)
 	h := b.Handler()
 	logger := slog.New(h)
@@ -240,6 +256,7 @@ func TestLogBufHandler_BoolAttr(t *testing.T) {
 }
 
 func TestLogBufHandler_MessagePreserved(t *testing.T) {
+	t.Parallel()
 	b := api.NewLogBuffer(10)
 	logger := slog.New(b.Handler())
 	logger.Info("hello world")
@@ -272,6 +289,7 @@ func newDashAPIServer(t *testing.T, token string) (*api.APIServer, *api.LogBuffe
 }
 
 func TestDashboard_ServeIndex(t *testing.T) {
+	t.Parallel()
 	a, _ := newDashAPIServer(t, "")
 
 	req := httptest.NewRequest("GET", "/", nil)
@@ -289,6 +307,7 @@ func TestDashboard_ServeIndex(t *testing.T) {
 }
 
 func TestDashboard_IndexContainsCavadVPN(t *testing.T) {
+	t.Parallel()
 	a, _ := newDashAPIServer(t, "")
 
 	req := httptest.NewRequest("GET", "/", nil)
@@ -302,6 +321,7 @@ func TestDashboard_IndexContainsCavadVPN(t *testing.T) {
 }
 
 func TestDashboard_IndexContainsAutoRefresh(t *testing.T) {
+	t.Parallel()
 	a, _ := newDashAPIServer(t, "")
 	req := httptest.NewRequest("GET", "/", nil)
 	w := httptest.NewRecorder()
@@ -312,6 +332,7 @@ func TestDashboard_IndexContainsAutoRefresh(t *testing.T) {
 }
 
 func TestDashboard_LogsEmpty(t *testing.T) {
+	t.Parallel()
 	a, _ := newDashAPIServer(t, "")
 
 	req := httptest.NewRequest("GET", "/api/v1/logs", nil)
@@ -331,6 +352,7 @@ func TestDashboard_LogsEmpty(t *testing.T) {
 }
 
 func TestDashboard_LogsWithEntries(t *testing.T) {
+	t.Parallel()
 	a, buf := newDashAPIServer(t, "")
 
 	logger := slog.New(buf.Handler())
@@ -358,6 +380,7 @@ func TestDashboard_LogsWithEntries(t *testing.T) {
 }
 
 func TestDashboard_LogsLimitQueryParam(t *testing.T) {
+	t.Parallel()
 	a, buf := newDashAPIServer(t, "")
 
 	for i := 0; i < 20; i++ {
@@ -378,6 +401,7 @@ func TestDashboard_LogsLimitQueryParam(t *testing.T) {
 }
 
 func TestDashboard_LogsLimitCapped(t *testing.T) {
+	t.Parallel()
 	a, buf := newDashAPIServer(t, "")
 
 	for i := 0; i < 100; i++ {
@@ -399,6 +423,7 @@ func TestDashboard_LogsLimitCapped(t *testing.T) {
 }
 
 func TestDashboard_LogsNoBufferSet(t *testing.T) {
+	t.Parallel()
 	logger := slog.New(slog.NewTextHandler(nil, &slog.HandlerOptions{Level: slog.LevelError}))
 	a := api.NewAPIServer(api.Config{}, &dashMockServer{}, logger)
 	// No SetLogBuffer
@@ -420,6 +445,7 @@ func TestDashboard_LogsNoBufferSet(t *testing.T) {
 }
 
 func TestDashboard_LogsRequireAuth(t *testing.T) {
+	t.Parallel()
 	a, _ := newDashAPIServer(t, "secret")
 
 	req := httptest.NewRequest("GET", "/api/v1/logs", nil)
@@ -432,6 +458,7 @@ func TestDashboard_LogsRequireAuth(t *testing.T) {
 }
 
 func TestDashboard_LogsWithValidAuth(t *testing.T) {
+	t.Parallel()
 	a, _ := newDashAPIServer(t, "secret")
 
 	req := httptest.NewRequest("GET", "/api/v1/logs", nil)
@@ -445,6 +472,7 @@ func TestDashboard_LogsWithValidAuth(t *testing.T) {
 }
 
 func TestDashboard_LogsWithXAPIKey(t *testing.T) {
+	t.Parallel()
 	a, _ := newDashAPIServer(t, "secret")
 
 	req := httptest.NewRequest("GET", "/api/v1/logs", nil)
@@ -458,6 +486,7 @@ func TestDashboard_LogsWithXAPIKey(t *testing.T) {
 }
 
 func TestDashboard_LogsContentType(t *testing.T) {
+	t.Parallel()
 	a, _ := newDashAPIServer(t, "")
 
 	req := httptest.NewRequest("GET", "/api/v1/logs", nil)
@@ -471,6 +500,7 @@ func TestDashboard_LogsContentType(t *testing.T) {
 }
 
 func TestDashboard_SetLogBuffer(t *testing.T) {
+	t.Parallel()
 	logger := slog.New(slog.NewTextHandler(nil, &slog.HandlerOptions{Level: slog.LevelError}))
 	a := api.NewAPIServer(api.Config{}, &dashMockServer{}, logger)
 
@@ -492,6 +522,7 @@ func TestDashboard_SetLogBuffer(t *testing.T) {
 }
 
 func TestLogEntry_JSONFields(t *testing.T) {
+	t.Parallel()
 	e := api.LogEntry{
 		Time:    time.Now(),
 		Level:   "warn",
@@ -511,6 +542,7 @@ func TestLogEntry_JSONFields(t *testing.T) {
 }
 
 func TestLogEntry_AttrsOmittedWhenNil(t *testing.T) {
+	t.Parallel()
 	e := api.LogEntry{Level: "info", Message: "no attrs"}
 	b, _ := json.Marshal(e)
 	if strings.Contains(string(b), `"attrs"`) {

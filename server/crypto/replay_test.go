@@ -9,6 +9,7 @@ import (
 // ---------- PacketHeader тесты ----------
 
 func TestNewPacketHeader(t *testing.T) {
+	t.Parallel()
 	before := time.Now().Unix()
 	h, err := NewPacketHeader()
 	after := time.Now().Unix()
@@ -27,6 +28,7 @@ func TestNewPacketHeader(t *testing.T) {
 }
 
 func TestNewPacketHeaderUnique(t *testing.T) {
+	t.Parallel()
 	h1, err := NewPacketHeader()
 	if err != nil {
 		t.Fatal(err)
@@ -41,6 +43,7 @@ func TestNewPacketHeaderUnique(t *testing.T) {
 }
 
 func TestPacketHeaderEncodeDecodeRoundtrip(t *testing.T) {
+	t.Parallel()
 	original, err := NewPacketHeader()
 	if err != nil {
 		t.Fatal(err)
@@ -65,6 +68,7 @@ func TestPacketHeaderEncodeDecodeRoundtrip(t *testing.T) {
 }
 
 func TestDecodePacketHeaderTooShort(t *testing.T) {
+	t.Parallel()
 	short := make([]byte, PacketHeaderSize-1)
 	_, err := DecodePacketHeader(short)
 	if err == nil {
@@ -73,6 +77,7 @@ func TestDecodePacketHeaderTooShort(t *testing.T) {
 }
 
 func TestDecodePacketHeaderExactSize(t *testing.T) {
+	t.Parallel()
 	data := make([]byte, PacketHeaderSize)
 	// timestamp = 1000, nonce = нули
 	data[7] = 0xe8 // big-endian 1000 в последнем байте? нет...
@@ -90,6 +95,7 @@ func TestDecodePacketHeaderExactSize(t *testing.T) {
 }
 
 func TestPacketHeaderEncodeLargerBuffer(t *testing.T) {
+	t.Parallel()
 	h, err := NewPacketHeader()
 	if err != nil {
 		t.Fatal(err)
@@ -109,6 +115,7 @@ func TestPacketHeaderEncodeLargerBuffer(t *testing.T) {
 // ---------- ReplayFilter тесты ----------
 
 func TestNewReplayFilter(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 	if rf == nil {
 		t.Fatal("NewReplayFilter вернул nil")
@@ -119,6 +126,7 @@ func TestNewReplayFilter(t *testing.T) {
 }
 
 func TestReplayFilterCheckValidPacket(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 	h, err := NewPacketHeader()
 	if err != nil {
@@ -130,6 +138,7 @@ func TestReplayFilterCheckValidPacket(t *testing.T) {
 }
 
 func TestReplayFilterCheckNilHeader(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 	err := rf.Check(nil)
 	if err == nil {
@@ -138,6 +147,7 @@ func TestReplayFilterCheckNilHeader(t *testing.T) {
 }
 
 func TestReplayFilterCheckDuplicateNonce(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 	h, err := NewPacketHeader()
 	if err != nil {
@@ -156,6 +166,7 @@ func TestReplayFilterCheckDuplicateNonce(t *testing.T) {
 }
 
 func TestReplayFilterCheckOldPacket(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 	h := &PacketHeader{
 		Timestamp: time.Now().Add(-(TimestampWindow + time.Second)).Unix(),
@@ -170,6 +181,7 @@ func TestReplayFilterCheckOldPacket(t *testing.T) {
 }
 
 func TestReplayFilterCheckFuturePacket(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 	h := &PacketHeader{
 		Timestamp: time.Now().Add(TimestampWindow + time.Second).Unix(),
@@ -183,6 +195,7 @@ func TestReplayFilterCheckFuturePacket(t *testing.T) {
 }
 
 func TestReplayFilterCheckBoundaryPackets(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 
 	// Пакет на границе окна (89 секунд назад) — должен пройти
@@ -205,6 +218,7 @@ func TestReplayFilterCheckBoundaryPackets(t *testing.T) {
 }
 
 func TestReplayFilterMultipleUniqueNonces(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 	now := time.Now().Unix()
 
@@ -223,6 +237,7 @@ func TestReplayFilterMultipleUniqueNonces(t *testing.T) {
 }
 
 func TestReplayFilterSameNonceDifferentTimestamps(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 
 	// Один и тот же nonce, но разные временные метки — оба должны пройти
@@ -241,6 +256,7 @@ func TestReplayFilterSameNonceDifferentTimestamps(t *testing.T) {
 }
 
 func TestReplayFilterCleanupOldBuckets(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 
 	// Добавляем старую запись напрямую (имитируем старый пакет)
@@ -274,6 +290,7 @@ func TestReplayFilterCleanupOldBuckets(t *testing.T) {
 }
 
 func TestReplayFilterConcurrentAccess(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 	const goroutines = 50
 	now := time.Now().Unix()
@@ -302,6 +319,7 @@ func TestReplayFilterConcurrentAccess(t *testing.T) {
 }
 
 func TestReplayFilterConcurrentDuplicates(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 	const goroutines = 20
 
@@ -336,6 +354,7 @@ func TestReplayFilterConcurrentDuplicates(t *testing.T) {
 }
 
 func TestReplayFilterSize(t *testing.T) {
+	t.Parallel()
 	rf := NewReplayFilter()
 
 	// Добавляем пакеты в разные секунды

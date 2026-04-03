@@ -15,6 +15,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestPacketEncodeDecodeData(t *testing.T) {
+	t.Parallel()
 	p := &Packet{
 		Type:    PacketTypeData,
 		SeqNum:  42,
@@ -42,6 +43,7 @@ func TestPacketEncodeDecodeData(t *testing.T) {
 }
 
 func TestPacketEncodeDecodeACK(t *testing.T) {
+	t.Parallel()
 	p := &Packet{Type: PacketTypeACK, AckNum: 99}
 	got, err := DecodePacket(p.Encode())
 	if err != nil {
@@ -53,6 +55,7 @@ func TestPacketEncodeDecodeACK(t *testing.T) {
 }
 
 func TestPacketEncodeDecodeEmptyPayload(t *testing.T) {
+	t.Parallel()
 	p := &Packet{Type: PacketTypeSYN, SeqNum: 1}
 	got, err := DecodePacket(p.Encode())
 	if err != nil {
@@ -64,6 +67,7 @@ func TestPacketEncodeDecodeEmptyPayload(t *testing.T) {
 }
 
 func TestDecodePacketTooShort(t *testing.T) {
+	t.Parallel()
 	_, err := DecodePacket([]byte{0x01, 0x00})
 	if err == nil {
 		t.Fatal("expected error for too-short packet")
@@ -71,6 +75,7 @@ func TestDecodePacketTooShort(t *testing.T) {
 }
 
 func TestDecodePacketTruncatedPayload(t *testing.T) {
+	t.Parallel()
 	// Build a header claiming 100 bytes of payload but supply none.
 	buf := make([]byte, HeaderSize)
 	buf[0] = PacketTypeData
@@ -83,6 +88,7 @@ func TestDecodePacketTruncatedPayload(t *testing.T) {
 }
 
 func TestPacketEncodeLength(t *testing.T) {
+	t.Parallel()
 	payload := make([]byte, 32)
 	p := &Packet{Type: PacketTypeData, SeqNum: 1, Payload: payload}
 	encoded := p.Encode()
@@ -112,6 +118,7 @@ func makeTestConn(t *testing.T) *Conn {
 }
 
 func TestProcessDataInOrder(t *testing.T) {
+	t.Parallel()
 	c := makeTestConn(t)
 
 	c.processData(&Packet{Type: PacketTypeData, SeqNum: 0, Payload: []byte("a")})
@@ -133,6 +140,7 @@ func TestProcessDataInOrder(t *testing.T) {
 }
 
 func TestProcessDataOutOfOrder(t *testing.T) {
+	t.Parallel()
 	c := makeTestConn(t)
 
 	// Deliver 0, then 2 (buffered), then 1 — after 1 arrives, 2 should also drain.
@@ -156,12 +164,13 @@ func TestProcessDataOutOfOrder(t *testing.T) {
 }
 
 func TestProcessDataDuplicate(t *testing.T) {
+	t.Parallel()
 	c := makeTestConn(t)
 
 	c.processData(&Packet{Type: PacketTypeData, SeqNum: 0, Payload: []byte("x")})
 	c.processData(&Packet{Type: PacketTypeData, SeqNum: 0, Payload: []byte("x")}) // duplicate
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Millisecond)
 	defer cancel()
 
 	// First read should succeed.
@@ -181,12 +190,13 @@ func TestProcessDataDuplicate(t *testing.T) {
 }
 
 func TestProcessDataNoPayload(t *testing.T) {
+	t.Parallel()
 	c := makeTestConn(t)
 
 	// A SYN-like packet with no payload should not be delivered to readCh.
 	c.processData(&Packet{Type: PacketTypeSYN, SeqNum: 0})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Millisecond)
 	defer cancel()
 
 	_, err := c.Read(ctx)
@@ -200,6 +210,7 @@ func TestProcessDataNoPayload(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestProcessACKClearsWindow(t *testing.T) {
+	t.Parallel()
 	c := makeTestConn(t)
 
 	// Manually populate pending packets.
@@ -230,6 +241,7 @@ func TestProcessACKClearsWindow(t *testing.T) {
 }
 
 func TestProcessACKCongestionAvoidance(t *testing.T) {
+	t.Parallel()
 	c := makeTestConn(t)
 
 	// Force into congestion-avoidance phase (cwnd >= ssthresh).
@@ -257,6 +269,7 @@ func TestProcessACKCongestionAvoidance(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDoRetransmitIncreasesCounter(t *testing.T) {
+	t.Parallel()
 	c := makeTestConn(t)
 
 	pkt := &Packet{Type: PacketTypeData, SeqNum: 0, Payload: []byte("retry")}
@@ -282,6 +295,7 @@ func TestDoRetransmitIncreasesCounter(t *testing.T) {
 }
 
 func TestDoRetransmitDropsAfterMaxRetransmits(t *testing.T) {
+	t.Parallel()
 	c := makeTestConn(t)
 
 	c.sendMu.Lock()
@@ -304,6 +318,7 @@ func TestDoRetransmitDropsAfterMaxRetransmits(t *testing.T) {
 }
 
 func TestDoRetransmitCongestionDecrease(t *testing.T) {
+	t.Parallel()
 	c := makeTestConn(t)
 	c.sendMu.Lock()
 	c.cwnd = 20
@@ -330,6 +345,7 @@ func TestDoRetransmitCongestionDecrease(t *testing.T) {
 }
 
 func TestDoRetransmitNoActionBeforeTimeout(t *testing.T) {
+	t.Parallel()
 	c := makeTestConn(t)
 
 	c.sendMu.Lock()
@@ -355,6 +371,7 @@ func TestDoRetransmitNoActionBeforeTimeout(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestConnCloseBlocksRead(t *testing.T) {
+	t.Parallel()
 	c := makeTestConn(t)
 	c.Close()
 
@@ -366,6 +383,7 @@ func TestConnCloseBlocksRead(t *testing.T) {
 }
 
 func TestConnCloseIdempotent(t *testing.T) {
+	t.Parallel()
 	c := makeTestConn(t)
 	// Calling Close multiple times must not panic.
 	c.Close()
@@ -377,6 +395,7 @@ func TestConnCloseIdempotent(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestListenAndDial(t *testing.T) {
+	t.Parallel()
 	l, err := Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -417,6 +436,7 @@ func TestListenAndDial(t *testing.T) {
 }
 
 func TestBidirectionalCommunication(t *testing.T) {
+	t.Parallel()
 	l, err := Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -466,6 +486,7 @@ func TestBidirectionalCommunication(t *testing.T) {
 }
 
 func TestMultipleClients(t *testing.T) {
+	t.Parallel()
 	l, err := Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -538,6 +559,7 @@ func TestMultipleClients(t *testing.T) {
 }
 
 func TestLargePayloadFragmentation(t *testing.T) {
+	t.Parallel()
 	l, err := Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -584,6 +606,7 @@ func TestLargePayloadFragmentation(t *testing.T) {
 }
 
 func TestListenerClose(t *testing.T) {
+	t.Parallel()
 	l, err := Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -611,6 +634,7 @@ func TestListenerClose(t *testing.T) {
 }
 
 func TestDialInvalidAddress(t *testing.T) {
+	t.Parallel()
 	_, err := Dial("not-a-valid-address!!!")
 	if err == nil {
 		t.Error("Dial should fail on invalid address")
@@ -618,6 +642,7 @@ func TestDialInvalidAddress(t *testing.T) {
 }
 
 func TestListenInvalidAddress(t *testing.T) {
+	t.Parallel()
 	_, err := Listen("not-a-valid-address!!!")
 	if err == nil {
 		t.Error("Listen should fail on invalid address")

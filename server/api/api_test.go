@@ -100,6 +100,7 @@ func randomHexKey() string {
 // ---------------------------------------------------------------------------
 
 func TestHealth(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "GET", "/api/v1/health", "", "")
 
@@ -116,6 +117,7 @@ func TestHealth(t *testing.T) {
 // TestHealthNoAuth verifies health is accessible without a token even when auth
 // is enabled.
 func TestHealthNoAuth(t *testing.T) {
+	t.Parallel()
 	cfg := api.Config{ListenAddr: "127.0.0.1:0", APIToken: "secret"}
 	h := newServer(t, cfg, &mockServer{})
 	w := do(t, h, "GET", "/api/v1/health", "", "") // no token
@@ -129,6 +131,7 @@ func TestHealthNoAuth(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAuthRequired(t *testing.T) {
+	t.Parallel()
 	cfg := api.Config{ListenAddr: "127.0.0.1:0", APIToken: "s3cr3t"}
 	h := newServer(t, cfg, &mockServer{})
 
@@ -155,6 +158,7 @@ func TestAuthRequired(t *testing.T) {
 }
 
 func TestAuthXAPIKey(t *testing.T) {
+	t.Parallel()
 	cfg := api.Config{ListenAddr: "127.0.0.1:0", APIToken: "mytoken"}
 	h := newServer(t, cfg, &mockServer{})
 	req := httptest.NewRequest("GET", "/api/v1/sessions", nil)
@@ -167,6 +171,7 @@ func TestAuthXAPIKey(t *testing.T) {
 }
 
 func TestAuthDisabled(t *testing.T) {
+	t.Parallel()
 	// APIToken is empty — all requests pass through.
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "GET", "/api/v1/sessions", "", "")
@@ -180,6 +185,7 @@ func TestAuthDisabled(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestListSessions_Empty(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "GET", "/api/v1/sessions", "", "")
 	if w.Code != http.StatusOK {
@@ -193,6 +199,7 @@ func TestListSessions_Empty(t *testing.T) {
 }
 
 func TestListSessions_WithData(t *testing.T) {
+	t.Parallel()
 	mock := &mockServer{
 		sessions: []api.SessionInfo{
 			{ID: 1, RemoteKey: "aabbcc", AssignedIP: "10.8.0.2", BytesIn: 100, BytesOut: 200, ConnectedAt: time.Now(), Duration: "5s"},
@@ -219,6 +226,7 @@ func TestListSessions_WithData(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGetSession_Found(t *testing.T) {
+	t.Parallel()
 	mock := &mockServer{
 		sessions: []api.SessionInfo{
 			{ID: 42, RemoteKey: "aabbcc", AssignedIP: "10.8.0.5"},
@@ -237,6 +245,7 @@ func TestGetSession_Found(t *testing.T) {
 }
 
 func TestGetSession_NotFound(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "GET", "/api/v1/sessions/99", "", "")
 	if w.Code != http.StatusNotFound {
@@ -245,6 +254,7 @@ func TestGetSession_NotFound(t *testing.T) {
 }
 
 func TestGetSession_BadID(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "GET", "/api/v1/sessions/notanumber", "", "")
 	if w.Code != http.StatusBadRequest {
@@ -257,6 +267,7 @@ func TestGetSession_BadID(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDeleteSession_Found(t *testing.T) {
+	t.Parallel()
 	mock := &mockServer{
 		sessions: []api.SessionInfo{{ID: 7}},
 	}
@@ -271,6 +282,7 @@ func TestDeleteSession_Found(t *testing.T) {
 }
 
 func TestDeleteSession_NotFound(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "DELETE", "/api/v1/sessions/999", "", "")
 	if w.Code != http.StatusNotFound {
@@ -279,6 +291,7 @@ func TestDeleteSession_NotFound(t *testing.T) {
 }
 
 func TestDeleteSession_BadID(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "DELETE", "/api/v1/sessions/abc", "", "")
 	if w.Code != http.StatusBadRequest {
@@ -291,6 +304,7 @@ func TestDeleteSession_BadID(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestListKeys_Empty(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "GET", "/api/v1/keys", "", "")
 	if w.Code != http.StatusOK {
@@ -304,6 +318,7 @@ func TestListKeys_Empty(t *testing.T) {
 }
 
 func TestListKeys_WithData(t *testing.T) {
+	t.Parallel()
 	var k1, k2 [32]byte
 	k1[0] = 1
 	k2[0] = 2
@@ -325,6 +340,7 @@ func TestListKeys_WithData(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAddKey_Valid(t *testing.T) {
+	t.Parallel()
 	mock := &mockServer{}
 	h := newServer(t, api.DefaultConfig(), mock)
 	hexKey := randomHexKey()
@@ -339,6 +355,7 @@ func TestAddKey_Valid(t *testing.T) {
 }
 
 func TestAddKey_InvalidHex(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	body := `{"key":"notvalidhex!"}`
 	w := do(t, h, "POST", "/api/v1/keys", "", body)
@@ -348,6 +365,7 @@ func TestAddKey_InvalidHex(t *testing.T) {
 }
 
 func TestAddKey_WrongLength(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	body := `{"key":"aabb"}` // only 2 bytes
 	w := do(t, h, "POST", "/api/v1/keys", "", body)
@@ -357,6 +375,7 @@ func TestAddKey_WrongLength(t *testing.T) {
 }
 
 func TestAddKey_BadJSON(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "POST", "/api/v1/keys", "", "{notjson")
 	if w.Code != http.StatusBadRequest {
@@ -365,6 +384,7 @@ func TestAddKey_BadJSON(t *testing.T) {
 }
 
 func TestAddKey_EmptyBody(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	req := httptest.NewRequest("POST", "/api/v1/keys", bytes.NewReader(nil))
 	req.Header.Set("Content-Type", "application/json")
@@ -380,6 +400,7 @@ func TestAddKey_EmptyBody(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRemoveKey_Valid(t *testing.T) {
+	t.Parallel()
 	var k [32]byte
 	k[5] = 0xFF
 	mock := &mockServer{keys: [][32]byte{k}}
@@ -395,6 +416,7 @@ func TestRemoveKey_Valid(t *testing.T) {
 }
 
 func TestRemoveKey_InvalidHex(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "DELETE", "/api/v1/keys/ZZZZ", "", "")
 	if w.Code != http.StatusBadRequest {
@@ -403,6 +425,7 @@ func TestRemoveKey_InvalidHex(t *testing.T) {
 }
 
 func TestRemoveKey_WrongLength(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "DELETE", "/api/v1/keys/deadbeef", "", "") // only 4 bytes
 	if w.Code != http.StatusBadRequest {
@@ -415,6 +438,7 @@ func TestRemoveKey_WrongLength(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestStats_NoSessions(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "GET", "/api/v1/stats", "", "")
 	if w.Code != http.StatusOK {
@@ -428,6 +452,7 @@ func TestStats_NoSessions(t *testing.T) {
 }
 
 func TestStats_WithSessions(t *testing.T) {
+	t.Parallel()
 	mock := &mockServer{
 		sessions: []api.SessionInfo{
 			{ID: 1, BytesIn: 1000, BytesOut: 2000},
@@ -457,6 +482,7 @@ func TestStats_WithSessions(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestContentTypeJSON(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	w := do(t, h, "GET", "/api/v1/health", "", "")
 	ct := w.Header().Get("Content-Type")

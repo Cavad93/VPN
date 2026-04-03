@@ -15,6 +15,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestDefault_Values(t *testing.T) {
+	t.Parallel()
 	cfg := config.Default()
 
 	if cfg.Listen == "" {
@@ -35,6 +36,7 @@ func TestDefault_Values(t *testing.T) {
 }
 
 func TestDefault_Valid(t *testing.T) {
+	t.Parallel()
 	if err := config.Default().Validate(); err != nil {
 		t.Errorf("Default config must be valid, got: %v", err)
 	}
@@ -45,6 +47,7 @@ func TestDefault_Valid(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestValidate_EmptyListen(t *testing.T) {
+	t.Parallel()
 	cfg := config.Default()
 	cfg.Listen = ""
 	if err := cfg.Validate(); err == nil {
@@ -53,6 +56,7 @@ func TestValidate_EmptyListen(t *testing.T) {
 }
 
 func TestValidate_EmptyTunCIDR(t *testing.T) {
+	t.Parallel()
 	cfg := config.Default()
 	cfg.TunCIDR = ""
 	if err := cfg.Validate(); err == nil {
@@ -61,6 +65,7 @@ func TestValidate_EmptyTunCIDR(t *testing.T) {
 }
 
 func TestValidate_EmptyPrivKeyFile(t *testing.T) {
+	t.Parallel()
 	cfg := config.Default()
 	cfg.PrivateKeyFile = ""
 	if err := cfg.Validate(); err == nil {
@@ -69,6 +74,7 @@ func TestValidate_EmptyPrivKeyFile(t *testing.T) {
 }
 
 func TestValidate_BadLogLevel(t *testing.T) {
+	t.Parallel()
 	cfg := config.Default()
 	cfg.Log.Level = "verbose"
 	if err := cfg.Validate(); err == nil {
@@ -77,6 +83,7 @@ func TestValidate_BadLogLevel(t *testing.T) {
 }
 
 func TestValidate_BadLogFormat(t *testing.T) {
+	t.Parallel()
 	cfg := config.Default()
 	cfg.Log.Format = "xml"
 	if err := cfg.Validate(); err == nil {
@@ -85,6 +92,7 @@ func TestValidate_BadLogFormat(t *testing.T) {
 }
 
 func TestValidate_InvalidAllowedKey_TooShort(t *testing.T) {
+	t.Parallel()
 	cfg := config.Default()
 	cfg.AllowedKeys = []string{"deadbeef"}
 	if err := cfg.Validate(); err == nil {
@@ -93,6 +101,7 @@ func TestValidate_InvalidAllowedKey_TooShort(t *testing.T) {
 }
 
 func TestValidate_InvalidAllowedKey_NotHex(t *testing.T) {
+	t.Parallel()
 	cfg := config.Default()
 	cfg.AllowedKeys = []string{strings.Repeat("zz", 32)}
 	if err := cfg.Validate(); err == nil {
@@ -101,6 +110,7 @@ func TestValidate_InvalidAllowedKey_NotHex(t *testing.T) {
 }
 
 func TestValidate_ValidAllowedKey(t *testing.T) {
+	t.Parallel()
 	cfg := config.Default()
 	cfg.AllowedKeys = []string{strings.Repeat("ab", 32)}
 	if err := cfg.Validate(); err != nil {
@@ -113,6 +123,7 @@ func TestValidate_ValidAllowedKey(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSaveLoad_RoundTrip(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vpn.yaml")
 
@@ -142,6 +153,7 @@ func TestSaveLoad_RoundTrip(t *testing.T) {
 }
 
 func TestLoad_MissingFile_CreatesDefault(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vpn.yaml")
 
@@ -163,6 +175,7 @@ func TestLoad_MissingFile_CreatesDefault(t *testing.T) {
 }
 
 func TestLoad_InvalidYAML(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.yaml")
 	os.WriteFile(path, []byte("listen: [not: a: string"), 0600) //nolint:errcheck
@@ -173,6 +186,7 @@ func TestLoad_InvalidYAML(t *testing.T) {
 }
 
 func TestLoad_InvalidConfig(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "invalid.yaml")
 	os.WriteFile(path, []byte("listen: \"\"\ntun_cidr: 10.8.0.1/24\nprivate_key_file: key.hex\n"), 0600) //nolint:errcheck
@@ -183,6 +197,7 @@ func TestLoad_InvalidConfig(t *testing.T) {
 }
 
 func TestSave_CreatesParentDirectories(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "deep", "vpn.yaml")
 
@@ -196,6 +211,7 @@ func TestSave_CreatesParentDirectories(t *testing.T) {
 }
 
 func TestSave_FilePermissions(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vpn.yaml")
 
@@ -217,6 +233,7 @@ func TestSave_FilePermissions(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestParseAllowedKeys_Empty(t *testing.T) {
+	t.Parallel()
 	cfg := config.Default()
 	keys, err := cfg.ParseAllowedKeys()
 	if err != nil {
@@ -228,6 +245,7 @@ func TestParseAllowedKeys_Empty(t *testing.T) {
 }
 
 func TestParseAllowedKeys_Valid(t *testing.T) {
+	t.Parallel()
 	cfg := config.Default()
 	raw := strings.Repeat("ab", 32)
 	cfg.AllowedKeys = []string{raw}
@@ -249,6 +267,7 @@ func TestParseAllowedKeys_Valid(t *testing.T) {
 }
 
 func TestParseAllowedKeys_Invalid(t *testing.T) {
+	t.Parallel()
 	cfg := config.Default()
 	cfg.AllowedKeys = []string{"not-hex"}
 	if _, err := cfg.ParseAllowedKeys(); err == nil {
@@ -261,6 +280,7 @@ func TestParseAllowedKeys_Invalid(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestEnsureKeyFile_GeneratesOnMissing(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "privkey.hex")
 
@@ -291,6 +311,7 @@ func TestEnsureKeyFile_GeneratesOnMissing(t *testing.T) {
 }
 
 func TestEnsureKeyFile_LoadsExisting(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "privkey.hex")
 
@@ -311,6 +332,7 @@ func TestEnsureKeyFile_LoadsExisting(t *testing.T) {
 }
 
 func TestEnsureKeyFile_FilePermissions(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "privkey.hex")
 
@@ -328,6 +350,7 @@ func TestEnsureKeyFile_FilePermissions(t *testing.T) {
 }
 
 func TestEnsureKeyFile_KeyIsClamped(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "privkey.hex")
 
@@ -349,6 +372,7 @@ func TestEnsureKeyFile_KeyIsClamped(t *testing.T) {
 }
 
 func TestEnsureKeyFile_CreatesParentDirectories(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "keys", "server", "privkey.hex")
 

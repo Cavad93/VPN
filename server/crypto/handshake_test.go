@@ -55,6 +55,7 @@ func runHandshake(t *testing.T, initiatorKP, responderKP *crypto.KeyPair) (*cryp
 
 // TestHandshakeComplete проверяет успешный полный handshake.
 func TestHandshakeComplete(t *testing.T) {
+	t.Parallel()
 	initiatorKP, err := crypto.GenerateKeyPair()
 	if err != nil {
 		t.Fatalf("GenerateKeyPair(initiator): %v", err)
@@ -77,6 +78,7 @@ func TestHandshakeComplete(t *testing.T) {
 // TestHandshakeRemoteStaticKeys проверяет что обе стороны верно идентифицируют
 // публичные статические ключи друг друга после handshake.
 func TestHandshakeRemoteStaticKeys(t *testing.T) {
+	t.Parallel()
 	initiatorKP, _ := crypto.GenerateKeyPair()
 	responderKP, _ := crypto.GenerateKeyPair()
 
@@ -98,6 +100,7 @@ func TestHandshakeRemoteStaticKeys(t *testing.T) {
 // TestHandshakeEncryptDecrypt проверяет двунаправленную передачу данных
 // после handshake.
 func TestHandshakeEncryptDecrypt(t *testing.T) {
+	t.Parallel()
 	initiatorKP, _ := crypto.GenerateKeyPair()
 	responderKP, _ := crypto.GenerateKeyPair()
 
@@ -136,6 +139,7 @@ func TestHandshakeEncryptDecrypt(t *testing.T) {
 
 // TestHandshakeEncryptWithAAD проверяет шифрование с дополнительными данными.
 func TestHandshakeEncryptWithAAD(t *testing.T) {
+	t.Parallel()
 	initiatorKP, _ := crypto.GenerateKeyPair()
 	responderKP, _ := crypto.GenerateKeyPair()
 
@@ -174,6 +178,7 @@ func TestHandshakeEncryptWithAAD(t *testing.T) {
 // TestHandshakeTamperedMessage проверяет что подмена handshake сообщений
 // вызывает ошибку.
 func TestHandshakeTamperedMessage2(t *testing.T) {
+	t.Parallel()
 	initiatorKP, _ := crypto.GenerateKeyPair()
 	responderKP, _ := crypto.GenerateKeyPair()
 
@@ -200,6 +205,7 @@ func TestHandshakeTamperedMessage2(t *testing.T) {
 // TestHandshakeWrongRole проверяет что вызов методов в неправильной роли
 // возвращает ошибку.
 func TestHandshakeWrongRole(t *testing.T) {
+	t.Parallel()
 	kp, _ := crypto.GenerateKeyPair()
 
 	// Ответчик не может вызвать WriteMessage1
@@ -226,6 +232,7 @@ func TestHandshakeWrongRole(t *testing.T) {
 
 // TestHandshakeNilKeyPair проверяет что nil keypair вызывает ошибку.
 func TestHandshakeNilKeyPair(t *testing.T) {
+	t.Parallel()
 	_, err := crypto.NewHandshake(crypto.Initiator, nil)
 	if err == nil {
 		t.Error("NewHandshake с nil keypair должен вернуть ошибку")
@@ -234,6 +241,7 @@ func TestHandshakeNilKeyPair(t *testing.T) {
 
 // TestHandshakeMessageTooShort проверяет обработку слишком коротких сообщений.
 func TestHandshakeMessageTooShort(t *testing.T) {
+	t.Parallel()
 	kp, _ := crypto.GenerateKeyPair()
 
 	// ReadMessage1 с коротким сообщением
@@ -247,6 +255,7 @@ func TestHandshakeMessageTooShort(t *testing.T) {
 // TestHandshakeMultipleSessions проверяет что каждый handshake порождает
 // уникальные cipher states.
 func TestHandshakeMultipleSessions(t *testing.T) {
+	t.Parallel()
 	initiatorKP, _ := crypto.GenerateKeyPair()
 	responderKP, _ := crypto.GenerateKeyPair()
 
@@ -289,6 +298,7 @@ func TestHandshakeMultipleSessions(t *testing.T) {
 
 // TestHandshakeWrongStep проверяет защиту от вызовов методов в неверном порядке.
 func TestHandshakeWrongStep(t *testing.T) {
+	t.Parallel()
 	kp, _ := crypto.GenerateKeyPair()
 
 	// Инициатор пытается вызвать WriteMessage2 сразу
@@ -323,6 +333,7 @@ func TestHandshakeWrongStep(t *testing.T) {
 // TestHandshakeSequentialMessages проверяет что счётчик nonce корректно
 // инкрементируется для последовательных сообщений.
 func TestHandshakeSequentialMessages(t *testing.T) {
+	t.Parallel()
 	initiatorKP, _ := crypto.GenerateKeyPair()
 	responderKP, _ := crypto.GenerateKeyPair()
 

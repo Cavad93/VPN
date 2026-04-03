@@ -15,6 +15,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestBuildSNIExtensionFormat(t *testing.T) {
+	t.Parallel()
 	host := "www.google.com"
 	ext := buildSNIExtension(host)
 
@@ -56,6 +57,7 @@ func TestBuildSNIExtensionFormat(t *testing.T) {
 }
 
 func TestBuildSNIExtensionTotalLength(t *testing.T) {
+	t.Parallel()
 	host := "example.com"
 	ext := buildSNIExtension(host)
 	// ext_type(2) + ext_data_len(2) + list_len(2) + name_type(1) + name_len(2) + name
@@ -66,6 +68,7 @@ func TestBuildSNIExtensionTotalLength(t *testing.T) {
 }
 
 func TestBuildSNIExtensionShortDomain(t *testing.T) {
+	t.Parallel()
 	ext := buildSNIExtension("a.io")
 	if len(ext) < 9 {
 		t.Fatalf("extension too short: %d bytes", len(ext))
@@ -73,6 +76,7 @@ func TestBuildSNIExtensionShortDomain(t *testing.T) {
 }
 
 func TestBuildSNIExtensionLongDomain(t *testing.T) {
+	t.Parallel()
 	// 63-char label is the DNS maximum
 	host := strings.Repeat("a", 63) + ".example.com"
 	ext := buildSNIExtension(host)
@@ -87,6 +91,7 @@ func TestBuildSNIExtensionLongDomain(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestBuildSupportedVersionsExtension(t *testing.T) {
+	t.Parallel()
 	ext := buildSupportedVersionsExtension()
 
 	// type = 0x002b
@@ -113,6 +118,7 @@ func TestBuildSupportedVersionsExtension(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestBuildClientHelloWithSNIFormat(t *testing.T) {
+	t.Parallel()
 	hello := buildClientHelloWithSNI("www.google.com")
 
 	// Must be a TLS handshake record
@@ -130,6 +136,7 @@ func TestBuildClientHelloWithSNIFormat(t *testing.T) {
 }
 
 func TestBuildClientHelloWithSNIRandomness(t *testing.T) {
+	t.Parallel()
 	h1 := buildClientHelloWithSNI("www.cloudflare.com")
 	h2 := buildClientHelloWithSNI("www.cloudflare.com")
 	if bytes.Equal(h1, h2) {
@@ -138,6 +145,7 @@ func TestBuildClientHelloWithSNIRandomness(t *testing.T) {
 }
 
 func TestBuildClientHelloWithSNIContainsDomain(t *testing.T) {
+	t.Parallel()
 	domain := "fonts.googleapis.com"
 	hello := buildClientHelloWithSNI(domain)
 	if !bytes.Contains(hello, []byte(domain)) {
@@ -146,6 +154,7 @@ func TestBuildClientHelloWithSNIContainsDomain(t *testing.T) {
 }
 
 func TestBuildClientHelloWithSNILarger(t *testing.T) {
+	t.Parallel()
 	// ClientHello with SNI should be larger than one without.
 	plain := buildClientHello()
 	withSNI := buildClientHelloWithSNI("www.google.com")
@@ -171,6 +180,7 @@ func makeClientHelloBody(t *testing.T, sni string) []byte {
 }
 
 func TestExtractSNIRoundtrip(t *testing.T) {
+	t.Parallel()
 	domains := []string{
 		"www.google.com",
 		"www.youtube.com",
@@ -187,6 +197,7 @@ func TestExtractSNIRoundtrip(t *testing.T) {
 }
 
 func TestExtractSNINoExtensions(t *testing.T) {
+	t.Parallel()
 	// buildClientHello() produces a ClientHello without extensions or SNI.
 	hello := buildClientHello()
 	body := hello[ObfsHeaderSize+4:]
@@ -197,6 +208,7 @@ func TestExtractSNINoExtensions(t *testing.T) {
 }
 
 func TestExtractSNITooShort(t *testing.T) {
+	t.Parallel()
 	// Body shorter than 35 bytes must return "".
 	got := ExtractSNI([]byte{0x03, 0x03})
 	if got != "" {
@@ -205,6 +217,7 @@ func TestExtractSNITooShort(t *testing.T) {
 }
 
 func TestExtractSNIEmptyBody(t *testing.T) {
+	t.Parallel()
 	if got := ExtractSNI(nil); got != "" {
 		t.Errorf("expected empty on nil, got %q", got)
 	}
@@ -218,6 +231,7 @@ func TestExtractSNIEmptyBody(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestStaticSNISelect(t *testing.T) {
+	t.Parallel()
 	s := &StaticSNI{Domain: "www.youtube.com"}
 	for i := 0; i < 10; i++ {
 		if got := s.Select(); got != "www.youtube.com" {
@@ -227,6 +241,7 @@ func TestStaticSNISelect(t *testing.T) {
 }
 
 func TestStaticSNIImplementsInterface(t *testing.T) {
+	t.Parallel()
 	var _ SNISelector = &StaticSNI{Domain: "x.com"}
 }
 
@@ -235,6 +250,7 @@ func TestStaticSNIImplementsInterface(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNewRandomSNIDefaultDomains(t *testing.T) {
+	t.Parallel()
 	r := NewRandomSNI()
 	if len(r.Domains) == 0 {
 		t.Fatal("NewRandomSNI().Domains must not be empty")
@@ -242,6 +258,7 @@ func TestNewRandomSNIDefaultDomains(t *testing.T) {
 }
 
 func TestRandomSNISelectFromList(t *testing.T) {
+	t.Parallel()
 	domains := []string{"a.com", "b.com", "c.com"}
 	r := &RandomSNI{Domains: domains}
 
@@ -267,6 +284,7 @@ func TestRandomSNISelectFromList(t *testing.T) {
 }
 
 func TestRandomSNISelectEmptyList(t *testing.T) {
+	t.Parallel()
 	r := &RandomSNI{Domains: []string{}}
 	got := r.Select()
 	if got == "" {
@@ -275,10 +293,12 @@ func TestRandomSNISelectEmptyList(t *testing.T) {
 }
 
 func TestRandomSNIImplementsInterface(t *testing.T) {
+	t.Parallel()
 	var _ SNISelector = &RandomSNI{}
 }
 
 func TestNewRandomSNIDoesNotMutateDefault(t *testing.T) {
+	t.Parallel()
 	r1 := NewRandomSNI()
 	r2 := NewRandomSNI()
 	r1.Domains[0] = "changed.com"
@@ -325,18 +345,21 @@ func newObfsPairWithSNI(t *testing.T, selector SNISelector) (*ObfsConn, *ObfsCon
 }
 
 func TestWithSNIStaticHandshakeSucceeds(t *testing.T) {
+	t.Parallel()
 	client, server := newObfsPairWithSNI(t, &StaticSNI{Domain: "www.google.com"})
 	client.Close()
 	server.Close()
 }
 
 func TestWithSNIRandomHandshakeSucceeds(t *testing.T) {
+	t.Parallel()
 	client, server := newObfsPairWithSNI(t, NewRandomSNI())
 	client.Close()
 	server.Close()
 }
 
 func TestWithSNIDataTransfer(t *testing.T) {
+	t.Parallel()
 	client, server := newObfsPairWithSNI(t, &StaticSNI{Domain: "www.cloudflare.com"})
 	defer client.Close()
 	defer server.Close()
@@ -358,6 +381,7 @@ func TestWithSNIDataTransfer(t *testing.T) {
 }
 
 func TestWithSNIDoesNotBreakNilSelector(t *testing.T) {
+	t.Parallel()
 	// WithSNI(nil) should be safe — ClientHandshake falls back to plain ClientHello.
 	cRaw, sRaw := net.Pipe()
 	var wg sync.WaitGroup
@@ -385,6 +409,7 @@ func TestWithSNIDoesNotBreakNilSelector(t *testing.T) {
 }
 
 func TestWithSNIClientHelloContainsDomain(t *testing.T) {
+	t.Parallel()
 	// Intercept the raw ClientHello to verify the domain appears on the wire.
 	domain := "update.googleapis.com"
 	cRaw, sRaw := net.Pipe()
@@ -423,6 +448,7 @@ func TestWithSNIClientHelloContainsDomain(t *testing.T) {
 }
 
 func TestWithSNIChaining(t *testing.T) {
+	t.Parallel()
 	cRaw, _ := net.Pipe()
 	defer cRaw.Close()
 	c := NewObfsConn(cRaw).WithSNI(&StaticSNI{Domain: "www.youtube.com"})

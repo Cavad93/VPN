@@ -41,6 +41,7 @@ func newAPIServerWithQR(t *testing.T, cfg api.Config, listenAddr string) (*api.A
 // ---------------------------------------------------------------------------
 
 func TestQRServerInfo(t *testing.T) {
+	t.Parallel()
 	apiSrv, qrSrv, _ := newAPIServerWithQR(t, api.Config{}, "203.0.113.10:443")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/qr/server-info", nil)
@@ -69,6 +70,7 @@ func TestQRServerInfo(t *testing.T) {
 }
 
 func TestQRServerInfoWildcardAddr(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newAPIServerWithQR(t, api.Config{}, "0.0.0.0:443")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/qr/server-info", nil)
@@ -86,6 +88,7 @@ func TestQRServerInfoWildcardAddr(t *testing.T) {
 }
 
 func TestQRServerInfoIPv6Wildcard(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newAPIServerWithQR(t, api.Config{}, "[::]:1194")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/qr/server-info", nil)
@@ -110,6 +113,7 @@ func TestQRServerInfoIPv6Wildcard(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestQRGeneratePNG(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newAPIServerWithQR(t, api.Config{}, "203.0.113.10:443")
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/qr/generate", nil)
@@ -132,6 +136,7 @@ func TestQRGeneratePNG(t *testing.T) {
 }
 
 func TestQRGenerateAddsKeyToAllowlist(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, mock := newAPIServerWithQR(t, api.Config{}, "1.2.3.4:443")
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/qr/generate", nil)
@@ -147,6 +152,7 @@ func TestQRGenerateAddsKeyToAllowlist(t *testing.T) {
 }
 
 func TestQRGenerateMultipleAddsMultipleKeys(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, mock := newAPIServerWithQR(t, api.Config{}, "1.2.3.4:443")
 
 	for i := 0; i < 3; i++ {
@@ -167,6 +173,7 @@ func TestQRGenerateMultipleAddsMultipleKeys(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestQRGenerateJSON(t *testing.T) {
+	t.Parallel()
 	apiSrv, qrSrv, _ := newAPIServerWithQR(t, api.Config{}, "203.0.113.10:443")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/qr/generate?format=json", nil)
@@ -199,6 +206,7 @@ func TestQRGenerateJSON(t *testing.T) {
 }
 
 func TestQRGenerateCustomDNS(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newAPIServerWithQR(t, api.Config{}, "1.2.3.4:443")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/qr/generate?format=json&dns=8.8.8.8", nil)
@@ -216,6 +224,7 @@ func TestQRGenerateCustomDNS(t *testing.T) {
 }
 
 func TestQRGenerateGETAlsoWorks(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newAPIServerWithQR(t, api.Config{}, "1.2.3.4:443")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/qr/generate", nil)
@@ -235,6 +244,7 @@ func TestQRGenerateGETAlsoWorks(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestQREndpointsRequireAuth(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newAPIServerWithQR(t, api.Config{APIToken: "secret"}, "1.2.3.4:443")
 
 	endpoints := []struct{ method, path string }{
@@ -253,6 +263,7 @@ func TestQREndpointsRequireAuth(t *testing.T) {
 }
 
 func TestQREndpointsAcceptBearerToken(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newAPIServerWithQR(t, api.Config{APIToken: "tok"}, "1.2.3.4:443")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/qr/server-info", nil)
@@ -266,6 +277,7 @@ func TestQREndpointsAcceptBearerToken(t *testing.T) {
 }
 
 func TestQREndpointsAcceptAPIKey(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newAPIServerWithQR(t, api.Config{APIToken: "tok"}, "1.2.3.4:443")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/qr/server-info", nil)
@@ -283,6 +295,7 @@ func TestQREndpointsAcceptAPIKey(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestQRGenerateDifferentKeysEachTime(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newAPIServerWithQR(t, api.Config{}, "1.2.3.4:443")
 
 	var keys []string
@@ -309,6 +322,7 @@ func TestQRGenerateDifferentKeysEachTime(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestQRGeneratedURIFormat(t *testing.T) {
+	t.Parallel()
 	apiSrv, qrSrv, _ := newAPIServerWithQR(t, api.Config{}, "10.0.0.1:443")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/qr/generate?format=json", nil)

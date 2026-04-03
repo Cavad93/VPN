@@ -112,9 +112,10 @@ type Conn struct {
 	remote  *net.UDPAddr
 
 	// Send side: sequence numbers and pending ACK tracking.
-	sendMu  sync.Mutex
-	sendSeq uint32
-	pending map[uint32]*pendingPacket
+	sendMu   sync.Mutex
+	sendCond *sync.Cond // signalled when cwnd opens (ACK received or conn closed)
+	sendSeq  uint32
+	pending  map[uint32]*pendingPacket
 
 	// Receive side: ordered delivery buffer.
 	recvMu  sync.Mutex
@@ -154,6 +155,7 @@ func newConn(conn *net.UDPConn, remote *net.UDPAddr, ownConn bool) *Conn {
 		cancel:   cancel,
 		closed:   make(chan struct{}),
 	}
+	c.sendCond = sync.NewCond(&c.sendMu)
 	go c.retransmitLoop()
 	return c
 }
@@ -186,15 +188,17 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 	defer c.sendMu.Unlock()
 
 	// Wait for the congestion window to open.
+	// sendCond is signalled by processACK (window grew) and Close (conn dying).
+	// Using sync.Cond eliminates the 1 ms time.After poll on the hot write path,
+	// cutting latency and reducing timer allocations under sustained load.
 	for len(c.pending) >= c.cwnd {
-		c.sendMu.Unlock()
-		select {
-		case <-c.ctx.Done():
-			c.sendMu.Lock()
+		if c.ctx.Err() != nil {
 			return errors.New("transport: connection closed")
-		case <-time.After(time.Millisecond):
 		}
-		c.sendMu.Lock()
+		c.sendCond.Wait() // atomically releases sendMu and sleeps
+		if c.ctx.Err() != nil {
+			return errors.New("transport: connection closed")
+		}
 	}
 
 	seq := c.sendSeq
@@ -225,11 +229,12 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 // and growing the congestion window.
 func (c *Conn) processACK(ackNum uint32) {
 	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
 
+	cleared := 0
 	for seq := range c.pending {
 		if seq < ackNum {
 			delete(c.pending, seq)
+			cleared++
 			// Congestion window growth.
 			if c.cwnd < c.ssthresh {
 				c.cwnd++ // slow start: exponential
@@ -237,6 +242,12 @@ func (c *Conn) processACK(ackNum uint32) {
 				c.cwnd++ // congestion avoidance: linear (simplified)
 			}
 		}
+	}
+	c.sendMu.Unlock()
+
+	// Wake any writePacket goroutine blocked on a full window.
+	if cleared > 0 {
+		c.sendCond.Broadcast()
 	}
 }
 
@@ -341,16 +352,17 @@ func (c *Conn) retransmitLoop() {
 // applies multiplicative-decrease congestion control on each loss event.
 func (c *Conn) doRetransmit() {
 	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
 
+	dropped := 0
 	now := time.Now()
 	for seq, pp := range c.pending {
 		if now.Sub(pp.sentAt) < RetransmitTimeout {
 			continue
 		}
 		if pp.retransmits >= MaxRetransmits {
-			// Give up on this packet.
+			// Give up on this packet — free the window slot.
 			delete(c.pending, seq)
+			dropped++
 			continue
 		}
 		c.conn.WriteToUDP(pp.pkt.Encode(), c.remote) //nolint:errcheck
@@ -363,6 +375,12 @@ func (c *Conn) doRetransmit() {
 			c.ssthresh = 2
 		}
 		c.cwnd = c.ssthresh
+	}
+	c.sendMu.Unlock()
+
+	// Dropped packets free window slots; wake any blocked writePacket callers.
+	if dropped > 0 {
+		c.sendCond.Broadcast()
 	}
 }
 
@@ -398,6 +416,9 @@ func (c *Conn) Close() {
 		}
 
 		c.cancel()
+		// Wake any writePacket goroutine blocked on a full congestion window so
+		// it can observe the cancelled context and return immediately.
+		c.sendCond.Broadcast()
 		close(c.closed)
 		if c.ownConn {
 			c.conn.Close()

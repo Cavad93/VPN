@@ -64,6 +64,7 @@ func waitForCount(t *testing.T, bodies *[][]byte, n int, mu *sync.Mutex) bool {
 // ---------------------------------------------------------------------------
 
 func TestNtfyNotifier_SendAlert_Success(t *testing.T) {
+	t.Parallel()
 	ts, bodies := newTestServer(t)
 	// Build notifier pointing at the test server.
 	n := notify.NewNtfyNotifier(ts.URL, "test-topic", "")
@@ -95,6 +96,7 @@ func TestNtfyNotifier_SendAlert_Success(t *testing.T) {
 }
 
 func TestNtfyNotifier_SendAlert_WithToken(t *testing.T) {
+	t.Parallel()
 	var gotAuth string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
@@ -113,6 +115,7 @@ func TestNtfyNotifier_SendAlert_WithToken(t *testing.T) {
 }
 
 func TestNtfyNotifier_DefaultBaseURL(t *testing.T) {
+	t.Parallel()
 	// Passing empty baseURL should default to https://ntfy.sh (we just
 	// verify no panic and the URL field is set correctly).
 	n := notify.NewNtfyNotifier("", "topic", "")
@@ -122,6 +125,7 @@ func TestNtfyNotifier_DefaultBaseURL(t *testing.T) {
 }
 
 func TestNtfyNotifier_ServerError(t *testing.T) {
+	t.Parallel()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 	}))
@@ -135,6 +139,7 @@ func TestNtfyNotifier_ServerError(t *testing.T) {
 }
 
 func TestNtfyNotifier_ContextCancelled(t *testing.T) {
+	t.Parallel()
 	// Server that blocks until the HTTP client disconnects.
 	// Use a channel so we can unblock the handler when the test ends.
 	releaseCh := make(chan struct{})
@@ -147,7 +152,7 @@ func TestNtfyNotifier_ContextCancelled(t *testing.T) {
 	// Unblock any pending handler before closing the server.
 	t.Cleanup(func() { close(releaseCh); ts.Close() })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
 
 	n := notify.NewNtfyNotifier(ts.URL, "topic", "")
@@ -162,6 +167,7 @@ func TestNtfyNotifier_ContextCancelled(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestWebhookNotifier_SendAlert_Success(t *testing.T) {
+	t.Parallel()
 	ts, bodies := newTestServer(t)
 	w := notify.NewWebhookNotifier(ts.URL, "")
 
@@ -187,6 +193,7 @@ func TestWebhookNotifier_SendAlert_Success(t *testing.T) {
 }
 
 func TestWebhookNotifier_WithSecret(t *testing.T) {
+	t.Parallel()
 	var gotSecret string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotSecret = r.Header.Get("X-Webhook-Secret")
@@ -204,6 +211,7 @@ func TestWebhookNotifier_WithSecret(t *testing.T) {
 }
 
 func TestWebhookNotifier_ServerError(t *testing.T) {
+	t.Parallel()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -220,6 +228,7 @@ func TestWebhookNotifier_ServerError(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNotificationService_AddSubscriber_Ntfy(t *testing.T) {
+	t.Parallel()
 	svc := notify.NewNotificationService(discardLogger())
 	defer svc.Stop()
 
@@ -237,6 +246,7 @@ func TestNotificationService_AddSubscriber_Ntfy(t *testing.T) {
 }
 
 func TestNotificationService_AddSubscriber_Webhook(t *testing.T) {
+	t.Parallel()
 	svc := notify.NewNotificationService(discardLogger())
 	defer svc.Stop()
 
@@ -251,6 +261,7 @@ func TestNotificationService_AddSubscriber_Webhook(t *testing.T) {
 }
 
 func TestNotificationService_AddSubscriber_MissingID(t *testing.T) {
+	t.Parallel()
 	svc := notify.NewNotificationService(discardLogger())
 	defer svc.Stop()
 
@@ -261,6 +272,7 @@ func TestNotificationService_AddSubscriber_MissingID(t *testing.T) {
 }
 
 func TestNotificationService_AddSubscriber_MissingTopic(t *testing.T) {
+	t.Parallel()
 	svc := notify.NewNotificationService(discardLogger())
 	defer svc.Stop()
 
@@ -271,6 +283,7 @@ func TestNotificationService_AddSubscriber_MissingTopic(t *testing.T) {
 }
 
 func TestNotificationService_AddSubscriber_MissingWebhookURL(t *testing.T) {
+	t.Parallel()
 	svc := notify.NewNotificationService(discardLogger())
 	defer svc.Stop()
 
@@ -281,6 +294,7 @@ func TestNotificationService_AddSubscriber_MissingWebhookURL(t *testing.T) {
 }
 
 func TestNotificationService_AddSubscriber_UnknownType(t *testing.T) {
+	t.Parallel()
 	svc := notify.NewNotificationService(discardLogger())
 	defer svc.Stop()
 
@@ -291,6 +305,7 @@ func TestNotificationService_AddSubscriber_UnknownType(t *testing.T) {
 }
 
 func TestNotificationService_RemoveSubscriber(t *testing.T) {
+	t.Parallel()
 	svc := notify.NewNotificationService(discardLogger())
 	defer svc.Stop()
 
@@ -304,6 +319,7 @@ func TestNotificationService_RemoveSubscriber(t *testing.T) {
 }
 
 func TestNotificationService_Subscribers(t *testing.T) {
+	t.Parallel()
 	svc := notify.NewNotificationService(discardLogger())
 	defer svc.Stop()
 
@@ -321,6 +337,7 @@ func TestNotificationService_Subscribers(t *testing.T) {
 }
 
 func TestNotificationService_DefaultEvents(t *testing.T) {
+	t.Parallel()
 	svc := notify.NewNotificationService(discardLogger())
 	defer svc.Stop()
 
@@ -333,6 +350,7 @@ func TestNotificationService_DefaultEvents(t *testing.T) {
 }
 
 func TestNotificationService_Dispatch_ToMatchingSubscribers(t *testing.T) {
+	t.Parallel()
 	var count atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		count.Add(1)
@@ -376,6 +394,7 @@ func TestNotificationService_Dispatch_ToMatchingSubscribers(t *testing.T) {
 }
 
 func TestNotificationService_WildcardEvent(t *testing.T) {
+	t.Parallel()
 	var count atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		count.Add(1)
@@ -409,6 +428,7 @@ func TestNotificationService_WildcardEvent(t *testing.T) {
 }
 
 func TestNotificationService_SendTest(t *testing.T) {
+	t.Parallel()
 	ts, _ := newTestServer(t)
 	svc := notify.NewNotificationService(discardLogger())
 	defer svc.Stop()
@@ -425,6 +445,7 @@ func TestNotificationService_SendTest(t *testing.T) {
 }
 
 func TestNotificationService_SendTest_NotFound(t *testing.T) {
+	t.Parallel()
 	svc := notify.NewNotificationService(discardLogger())
 	defer svc.Stop()
 
@@ -434,6 +455,7 @@ func TestNotificationService_SendTest_NotFound(t *testing.T) {
 }
 
 func TestNotificationService_QueueDrop(t *testing.T) {
+	t.Parallel()
 	// Subscriber that blocks so the queue fills up.
 	blockCh := make(chan struct{})
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -463,14 +485,15 @@ func TestNotificationService_QueueDrop(t *testing.T) {
 }
 
 func TestNotificationService_ParallelDelivery(t *testing.T) {
-	// Two subscribers with deliberate 100ms delay each.
-	// With sequential delivery total latency would be ≥200ms.
-	// With parallel delivery it should be ~100ms.
+	t.Parallel()
+	// Two subscribers with deliberate delay each.
+	// With sequential delivery total latency would be ≥2× delay.
+	// With parallel delivery it should be ~1× delay.
 
 	var mu sync.Mutex
 	var arrivals []time.Time
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(80 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 		mu.Lock()
 		arrivals = append(arrivals, time.Now())
 		mu.Unlock()
@@ -506,8 +529,8 @@ func TestNotificationService_ParallelDelivery(t *testing.T) {
 	}
 
 	elapsed := time.Since(start)
-	// Parallel: ~80ms.  Sequential would be ~160ms.  Allow generous 150ms bound.
-	if elapsed > 150*time.Millisecond {
+	// Parallel: ~5ms.  Sequential would be ~10ms.  Allow generous 25ms bound.
+	if elapsed > 25*time.Millisecond {
 		t.Logf("delivery took %v (may indicate sequential not parallel)", elapsed)
 	}
 

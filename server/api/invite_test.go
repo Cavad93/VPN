@@ -56,6 +56,7 @@ func doInviteReq(t *testing.T, h http.Handler, method, path string, body interfa
 // ---------------------------------------------------------------------------
 
 func TestCreateInvite_Basic(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, mock := newInviteServer(t)
 
 	rr := doInviteReq(t, apiSrv.Handler(), http.MethodPost, "/api/v1/invites",
@@ -104,6 +105,7 @@ func TestCreateInvite_Basic(t *testing.T) {
 }
 
 func TestCreateInvite_EmptyBody(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/invites", nil)
@@ -127,6 +129,7 @@ func TestCreateInvite_EmptyBody(t *testing.T) {
 }
 
 func TestCreateInvite_CustomDNS(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	rr := doInviteReq(t, apiSrv.Handler(), http.MethodPost, "/api/v1/invites",
@@ -143,6 +146,7 @@ func TestCreateInvite_CustomDNS(t *testing.T) {
 }
 
 func TestCreateInvite_MaxUses(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	rr := doInviteReq(t, apiSrv.Handler(), http.MethodPost, "/api/v1/invites",
@@ -163,6 +167,7 @@ func TestCreateInvite_MaxUses(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestListInvites_Empty(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/invites", nil)
@@ -180,6 +185,7 @@ func TestListInvites_Empty(t *testing.T) {
 }
 
 func TestListInvites_AfterCreate(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	// Create 2 invites.
@@ -205,6 +211,7 @@ func TestListInvites_AfterCreate(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRevokeInvite(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	// Create an invite.
@@ -231,6 +238,7 @@ func TestRevokeInvite(t *testing.T) {
 }
 
 func TestRevokeInvite_NotFound(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/invites/nonexistenttoken", nil)
@@ -247,6 +255,7 @@ func TestRevokeInvite_NotFound(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestJoinPage_Valid(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	// Create invite.
@@ -283,6 +292,7 @@ func TestJoinPage_Valid(t *testing.T) {
 }
 
 func TestJoinPage_PlatformDetection(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		ua      string
 		wantStr string
@@ -318,6 +328,7 @@ func TestJoinPage_PlatformDetection(t *testing.T) {
 }
 
 func TestJoinPage_InvalidToken(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/join/badtoken123", nil)
@@ -334,6 +345,7 @@ func TestJoinPage_InvalidToken(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestJoinConfigJSON(t *testing.T) {
+	t.Parallel()
 	apiSrv, qrSrv, _ := newInviteServer(t)
 
 	rr := doInviteReq(t, apiSrv.Handler(), http.MethodPost, "/api/v1/invites", nil)
@@ -377,6 +389,7 @@ func TestJoinConfigJSON(t *testing.T) {
 }
 
 func TestJoinConfigJSON_InvalidToken(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/join/badtoken/config.json", nil)
@@ -393,6 +406,7 @@ func TestJoinConfigJSON_InvalidToken(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestJoinQRPNG(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	rr := doInviteReq(t, apiSrv.Handler(), http.MethodPost, "/api/v1/invites", nil)
@@ -415,6 +429,7 @@ func TestJoinQRPNG(t *testing.T) {
 }
 
 func TestJoinQRPNG_InvalidToken(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/join/notfound/qr.png", nil)
@@ -431,6 +446,7 @@ func TestJoinQRPNG_InvalidToken(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestInviteTokensAreUnique(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	tokens := make(map[string]bool)
@@ -450,6 +466,7 @@ func TestInviteTokensAreUnique(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestJoinPageHTMLEscaping(t *testing.T) {
+	t.Parallel()
 	apiSrv, _, _ := newInviteServer(t)
 
 	rr := doInviteReq(t, apiSrv.Handler(), http.MethodPost, "/api/v1/invites",

@@ -25,6 +25,7 @@ func newMuxPair(t *testing.T) (*Mux, *Mux) {
 // ---------------------------------------------------------------------------
 
 func TestMuxOpenAcceptStream(t *testing.T) {
+	t.Parallel()
 	client, server := newMuxPair(t)
 	defer client.Close()
 	defer server.Close()
@@ -59,6 +60,7 @@ func TestMuxOpenAcceptStream(t *testing.T) {
 }
 
 func TestMuxStreamIDNamespaces(t *testing.T) {
+	t.Parallel()
 	client, server := newMuxPair(t)
 	defer client.Close()
 	defer server.Close()
@@ -128,6 +130,7 @@ func TestMuxStreamIDNamespaces(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMuxStreamWriteRead(t *testing.T) {
+	t.Parallel()
 	client, server := newMuxPair(t)
 	defer client.Close()
 	defer server.Close()
@@ -170,6 +173,7 @@ func TestMuxStreamWriteRead(t *testing.T) {
 }
 
 func TestMuxStreamBidirectional(t *testing.T) {
+	t.Parallel()
 	client, server := newMuxPair(t)
 	defer client.Close()
 	defer server.Close()
@@ -223,6 +227,7 @@ func TestMuxStreamBidirectional(t *testing.T) {
 }
 
 func TestMuxMultipleStreams(t *testing.T) {
+	t.Parallel()
 	const numStreams = 5
 	client, server := newMuxPair(t)
 	defer client.Close()
@@ -290,6 +295,7 @@ func TestMuxMultipleStreams(t *testing.T) {
 }
 
 func TestMuxLargePayload(t *testing.T) {
+	t.Parallel()
 	client, server := newMuxPair(t)
 	defer client.Close()
 	defer server.Close()
@@ -339,6 +345,7 @@ func TestMuxLargePayload(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMuxStreamCloseSignalsEOF(t *testing.T) {
+	t.Parallel()
 	client, server := newMuxPair(t)
 	defer client.Close()
 	defer server.Close()
@@ -373,6 +380,7 @@ func TestMuxStreamCloseSignalsEOF(t *testing.T) {
 }
 
 func TestMuxStreamWriteAfterCloseErrors(t *testing.T) {
+	t.Parallel()
 	client, server := newMuxPair(t)
 	defer client.Close()
 	defer server.Close()
@@ -400,6 +408,7 @@ func TestMuxStreamWriteAfterCloseErrors(t *testing.T) {
 }
 
 func TestMuxStreamCloseIdempotent(t *testing.T) {
+	t.Parallel()
 	client, server := newMuxPair(t)
 	defer client.Close()
 	defer server.Close()
@@ -429,6 +438,7 @@ func TestMuxStreamCloseIdempotent(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMuxCloseUnblocksAccept(t *testing.T) {
+	t.Parallel()
 	client, server := newMuxPair(t)
 	defer client.Close()
 
@@ -452,6 +462,7 @@ func TestMuxCloseUnblocksAccept(t *testing.T) {
 }
 
 func TestMuxCloseUnblocksStreamRead(t *testing.T) {
+	t.Parallel()
 	client, server := newMuxPair(t)
 	defer server.Close()
 
@@ -506,6 +517,7 @@ func TestMuxCloseUnblocksStreamRead(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMuxAcceptStreamContextCancelled(t *testing.T) {
+	t.Parallel()
 	_, server := newMuxPair(t)
 	defer server.Close()
 
@@ -523,6 +535,7 @@ func TestMuxAcceptStreamContextCancelled(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMuxStreamReadBuffering(t *testing.T) {
+	t.Parallel()
 	client, server := newMuxPair(t)
 	defer client.Close()
 	defer server.Close()
@@ -574,6 +587,7 @@ func TestMuxStreamReadBuffering(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMuxFrameHeaderEncoding(t *testing.T) {
+	t.Parallel()
 	cConn, sConn := net.Pipe()
 	defer cConn.Close()
 	defer sConn.Close()

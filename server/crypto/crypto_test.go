@@ -9,6 +9,7 @@ import (
 
 // TestGenerateKeyPair проверяет генерацию ключевой пары.
 func TestGenerateKeyPair(t *testing.T) {
+	t.Parallel()
 	kp1, err := crypto.GenerateKeyPair()
 	if err != nil {
 		t.Fatalf("GenerateKeyPair() ошибка: %v", err)
@@ -35,6 +36,7 @@ func TestGenerateKeyPair(t *testing.T) {
 
 // TestDiffieHellman проверяет корректность X25519 DH обмена.
 func TestDiffieHellman(t *testing.T) {
+	t.Parallel()
 	// Генерируем два ключевых пары (клиент и сервер)
 	server, err := crypto.GenerateKeyPair()
 	if err != nil {
@@ -71,6 +73,7 @@ func TestDiffieHellman(t *testing.T) {
 
 // TestNewCipher проверяет создание шифра.
 func TestNewCipher(t *testing.T) {
+	t.Parallel()
 	var key [crypto.KeySize]byte
 	copy(key[:], bytes.Repeat([]byte{0x42}, crypto.KeySize))
 
@@ -85,6 +88,7 @@ func TestNewCipher(t *testing.T) {
 
 // TestEncryptDecrypt проверяет полный цикл шифрования и расшифровки.
 func TestEncryptDecrypt(t *testing.T) {
+	t.Parallel()
 	var key [crypto.KeySize]byte
 	copy(key[:], bytes.Repeat([]byte{0x01}, crypto.KeySize))
 
@@ -130,6 +134,7 @@ func TestEncryptDecrypt(t *testing.T) {
 
 // TestDecryptTampered проверяет что изменение ciphertext вызывает ошибку.
 func TestDecryptTampered(t *testing.T) {
+	t.Parallel()
 	var key [crypto.KeySize]byte
 	copy(key[:], bytes.Repeat([]byte{0x02}, crypto.KeySize))
 
@@ -155,6 +160,7 @@ func TestDecryptTampered(t *testing.T) {
 
 // TestDecryptWrongKey проверяет что неверный ключ вызывает ошибку расшифровки.
 func TestDecryptWrongKey(t *testing.T) {
+	t.Parallel()
 	var key1 [crypto.KeySize]byte
 	copy(key1[:], bytes.Repeat([]byte{0x01}, crypto.KeySize))
 	var key2 [crypto.KeySize]byte
@@ -175,6 +181,7 @@ func TestDecryptWrongKey(t *testing.T) {
 
 // TestDecryptWrongNonce проверяет что неверный nonce вызывает ошибку.
 func TestDecryptWrongNonce(t *testing.T) {
+	t.Parallel()
 	var key [crypto.KeySize]byte
 	copy(key[:], bytes.Repeat([]byte{0x03}, crypto.KeySize))
 
@@ -194,6 +201,7 @@ func TestDecryptWrongNonce(t *testing.T) {
 
 // TestDecryptWrongAAD проверяет что неверные additional data вызывают ошибку.
 func TestDecryptWrongAAD(t *testing.T) {
+	t.Parallel()
 	var key [crypto.KeySize]byte
 	copy(key[:], bytes.Repeat([]byte{0x04}, crypto.KeySize))
 
@@ -211,6 +219,7 @@ func TestDecryptWrongAAD(t *testing.T) {
 
 // TestDiffieHellmanIntegration проверяет полный DH + шифрование цикл.
 func TestDiffieHellmanIntegration(t *testing.T) {
+	t.Parallel()
 	// Генерируем ключи для обеих сторон
 	serverKP, err := crypto.GenerateKeyPair()
 	if err != nil {
@@ -258,6 +267,7 @@ func TestDiffieHellmanIntegration(t *testing.T) {
 
 // TestGenerateNonce проверяет что нonce генерируются случайными.
 func TestGenerateNonce(t *testing.T) {
+	t.Parallel()
 	nonce1, err := crypto.GenerateNonce()
 	if err != nil {
 		t.Fatalf("GenerateNonce(): %v", err)
@@ -279,6 +289,7 @@ func TestGenerateNonce(t *testing.T) {
 
 // TestEncryptEmptyPlaintext проверяет шифрование пустого сообщения.
 func TestEncryptEmptyPlaintext(t *testing.T) {
+	t.Parallel()
 	var key [crypto.KeySize]byte
 	copy(key[:], bytes.Repeat([]byte{0x05}, crypto.KeySize))
 	cipher, _ := crypto.NewCipher(key)

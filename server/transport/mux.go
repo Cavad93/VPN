@@ -122,15 +122,25 @@ func (m *Mux) AcceptStream(ctx context.Context) (*Stream, error) {
 }
 
 // Close shuts down all Streams and the underlying connection.
+// Lock ordering: streamsMu must NOT be held while calling closeLocal, because
+// Stream.Close holds closeOnce while acquiring streamsMu. Snapshot the stream
+// list first, clear the map, then close streams without holding streamsMu to
+// prevent an ABBA deadlock with concurrent Stream.Close calls.
 func (m *Mux) Close() error {
 	var err error
 	m.closeOnce.Do(func() {
 		m.cancel()
 		m.streamsMu.Lock()
+		toClose := make([]*Stream, 0, len(m.streams))
 		for _, s := range m.streams {
+			toClose = append(toClose, s)
+		}
+		m.streams = make(map[uint32]*Stream)
+		m.streamsMu.Unlock()
+
+		for _, s := range toClose {
 			s.closeLocal()
 		}
-		m.streamsMu.Unlock()
 		err = m.conn.Close()
 	})
 	return err

@@ -73,6 +73,7 @@ func newTestLogger() *slog.Logger {
 // ---------------------------------------------------------------------------
 
 func TestDefaultConfig(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	cfg := DefaultConfig()
 	if cfg.ListenAddr != "0.0.0.0:443" {
@@ -91,6 +92,7 @@ func TestDefaultConfig(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNewIPPool(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	// Valid CIDR
@@ -114,6 +116,7 @@ func TestNewIPPool(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIPPoolAllocate(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	pool, err := newIPPool("10.8.0.1/24")
 	if err != nil {
@@ -144,6 +147,7 @@ func TestIPPoolAllocate(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIPPoolRelease(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	pool, err := newIPPool("10.8.0.1/24")
 	if err != nil {
@@ -172,6 +176,7 @@ func TestIPPoolRelease(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIPPoolExhausted(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	// /30: network(.0), host1(.1)=server, host2(.2), broadcast(.3)
 	// Server takes .1; only .2 is available.
@@ -197,6 +202,7 @@ func TestIPPoolExhausted(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIPPoolServerIP(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	pool, err := newIPPool("10.8.0.1/24")
 	if err != nil {
@@ -219,6 +225,7 @@ func TestIPPoolServerIP(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIPToUint32(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	ip := net.ParseIP("10.8.0.1")
 	val := ipToUint32(ip.To4())
@@ -233,6 +240,7 @@ func TestIPToUint32(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIncrementIP(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	ip := net.IP([]byte{10, 8, 0, 0})
 	incrementIP(ip)
@@ -253,6 +261,7 @@ func TestIncrementIP(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIsBroadcast(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	_, network, _ := net.ParseCIDR("10.8.0.0/24")
 
@@ -272,6 +281,7 @@ func TestIsBroadcast(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNewServer(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	tun := newMockTun()
 	defer tun.Close()
@@ -322,6 +332,7 @@ func TestNewServer(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNewServerInvalidCIDR(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	tun := newMockTun()
 	defer tun.Close()
@@ -341,6 +352,7 @@ func TestNewServerInvalidCIDR(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandshakeMsgRoundTrip(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	cConn, sConn := net.Pipe()
 	defer cConn.Close()
@@ -377,6 +389,7 @@ func TestHandshakeMsgRoundTrip(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNoiseConnRoundTrip(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	serverKP, _ := crypto.GenerateKeyPair()
@@ -494,6 +507,7 @@ func TestNoiseConnRoundTrip(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestServerSessions(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	tun := newMockTun()
 	defer tun.Close()
@@ -562,6 +576,7 @@ func TestServerSessions(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDisconnectSession(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	tun := newMockTun()
 	defer tun.Close()
@@ -602,6 +617,7 @@ func TestDisconnectSession(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIsKeyAllowed(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	tun := newMockTun()
 	defer tun.Close()
@@ -633,6 +649,7 @@ func TestIsKeyAllowed(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLoadOrGenerateKeyPair(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "privkey.hex")
@@ -690,6 +707,7 @@ func TestLoadOrGenerateKeyPair(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFullClientHandshake(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	tun := newMockTun()
@@ -748,6 +766,7 @@ func TestFullClientHandshake(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDataStreamRouting(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	tun := newMockTun()
@@ -788,8 +807,7 @@ func TestDataStreamRouting(t *testing.T) {
 	}
 	ctlStream.Close()
 
-	// Small pause to let server register assigned IP
-	time.Sleep(50 * time.Millisecond)
+	// IP is already registered before ctlAssign is sent — no sleep needed.
 
 	// Step 2: data stream
 	dataStream, err := mux.OpenStream()
@@ -823,6 +841,7 @@ func TestDataStreamRouting(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestServerRun(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	tun := newMockTun()
@@ -861,7 +880,7 @@ func TestServerRun(t *testing.T) {
 	}()
 
 	// Wait briefly for server to start
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(time.Millisecond)
 
 	// Connect a client
 	rawConn, err := net.DialTimeout("tcp", addr, 3*time.Second)
@@ -912,6 +931,7 @@ func TestServerRun(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRouteFromTun(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	tun := newMockTun()
@@ -938,7 +958,7 @@ func TestRouteFromTun(t *testing.T) {
 	defer cancel()
 
 	go srv.Run(ctx) //nolint:errcheck
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(time.Millisecond)
 
 	// Connect client
 	rawConn, err := net.DialTimeout("tcp", addr, 3*time.Second)
@@ -967,7 +987,7 @@ func TestRouteFromTun(t *testing.T) {
 	}
 	ctlStream.Close()
 
-	time.Sleep(50 * time.Millisecond)
+	// IP is already registered before ctlAssign is sent — no sleep needed.
 
 	// Open data stream to receive the routed packet
 	dataStream, err := mux.OpenStream()
@@ -976,8 +996,8 @@ func TestRouteFromTun(t *testing.T) {
 	}
 	defer dataStream.Close()
 
-	// Wait for data stream to be registered on server side
-	time.Sleep(100 * time.Millisecond)
+	// Wait for data stream to be registered on server side (bond.add is fast)
+	time.Sleep(time.Millisecond)
 
 	// Build IPv4 packet from tun→client: dst = assigned IP (resp[1:5])
 	pkt := make([]byte, 20)
@@ -1007,6 +1027,7 @@ func TestRouteFromTun(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNoiseConnDelegateMethods(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	serverKP, _ := crypto.GenerateKeyPair()
@@ -1083,6 +1104,7 @@ func TestNoiseConnDelegateMethods(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandleControlStreamBadMsg(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	tun := newMockTun()
@@ -1130,6 +1152,7 @@ func TestHandleControlStreamBadMsg(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNoiseConnReadBuffering(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	serverKP, _ := crypto.GenerateKeyPair()
@@ -1187,6 +1210,7 @@ func TestNoiseConnReadBuffering(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandshakeMsgZeroLength(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	cConn, sConn := net.Pipe()
 	defer cConn.Close()
@@ -1208,6 +1232,7 @@ func TestHandshakeMsgZeroLength(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDoNoiseHandshakeErrors(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	serverKP, _ := crypto.GenerateKeyPair()
@@ -1299,6 +1324,7 @@ func TestDoNoiseHandshakeErrors(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandleConnKeyNotAllowed(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	serverKP, _ := crypto.GenerateKeyPair()
@@ -1348,6 +1374,7 @@ func TestHandleConnKeyNotAllowed(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIPUtilsNilCases(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	// ipToUint32: IPv6 address (no To4) should return 0
@@ -1390,6 +1417,7 @@ func (f *failAfterNConn) Write(p []byte) (int, error) {
 }
 
 func TestWriteHandshakeMsgPayloadError(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	cConn, sConn := net.Pipe()
 	defer cConn.Close()
@@ -1419,6 +1447,7 @@ func TestWriteHandshakeMsgPayloadError(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNoiseConnWriteError(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 
 	serverKP, _ := crypto.GenerateKeyPair()
@@ -1508,6 +1537,7 @@ func runClientHandshake(t *testing.T, conn net.Conn, clientKP *crypto.KeyPair) (
 // ---------------------------------------------------------------------------
 
 func TestAllowedKeyManagement(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	tun := newMockTun()
 	defer tun.Close()
@@ -1565,6 +1595,7 @@ func TestAllowedKeyManagement(t *testing.T) {
 // TestAddAllowedKey_Idempotent verifies that adding the same key twice leaves
 // only one entry in the allowlist.
 func TestAddAllowedKey_Idempotent(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	tun := newMockTun()
 	defer tun.Close()
@@ -1583,6 +1614,7 @@ func TestAddAllowedKey_Idempotent(t *testing.T) {
 // TestRemoveAllowedKey_Nonexistent verifies that removing a key that was never
 // added does not panic or corrupt state.
 func TestRemoveAllowedKey_Nonexistent(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	tun := newMockTun()
 	defer tun.Close()
@@ -1604,6 +1636,7 @@ func TestRemoveAllowedKey_Nonexistent(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestStartAPIServer_Disabled(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	// ListenAddr="" should be a no-op (no goroutine launched, no panic).
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1619,6 +1652,7 @@ func TestStartAPIServer_Disabled(t *testing.T) {
 }
 
 func TestStartAPIServer_Enabled(t *testing.T) {
+	t.Parallel()
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -1633,9 +1667,9 @@ func TestStartAPIServer_Enabled(t *testing.T) {
 	// We just verify it doesn't panic during startup and cancellation.
 	startAPIServer(ctx, cfg, srv, newTestLogger())
 	// Give goroutine a moment to start, then cancel.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(time.Millisecond)
 	cancel()
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(time.Millisecond)
 }
 
 // ---------------------------------------------------------------------------

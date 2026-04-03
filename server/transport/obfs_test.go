@@ -49,12 +49,14 @@ func newObfsPair(t *testing.T) (*ObfsConn, *ObfsConn) {
 // ---------------------------------------------------------------------------
 
 func TestObfsHandshakeSucceeds(t *testing.T) {
+	t.Parallel()
 	client, server := newObfsPair(t)
 	client.Close()
 	server.Close()
 }
 
 func TestObfsHandshakeWrongMessageType(t *testing.T) {
+	t.Parallel()
 	// Server sends a ClientHello instead of a ServerHello — client must reject it.
 	cRaw, sRaw := net.Pipe()
 
@@ -82,6 +84,7 @@ func TestObfsHandshakeWrongMessageType(t *testing.T) {
 }
 
 func TestObfsHandshakeTruncatedRecord(t *testing.T) {
+	t.Parallel()
 	cRaw, sRaw := net.Pipe()
 
 	go func() {
@@ -113,6 +116,7 @@ func TestObfsHandshakeTruncatedRecord(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestObfsWriteReadSmall(t *testing.T) {
+	t.Parallel()
 	client, server := newObfsPair(t)
 	defer client.Close()
 	defer server.Close()
@@ -134,6 +138,7 @@ func TestObfsWriteReadSmall(t *testing.T) {
 }
 
 func TestObfsWriteReadBidirectional(t *testing.T) {
+	t.Parallel()
 	client, server := newObfsPair(t)
 	defer client.Close()
 	defer server.Close()
@@ -176,6 +181,7 @@ func TestObfsWriteReadBidirectional(t *testing.T) {
 }
 
 func TestObfsWriteReadLargePayload(t *testing.T) {
+	t.Parallel()
 	// 48 KB — forces multiple 16383-byte records.
 	client, server := newObfsPair(t)
 	defer client.Close()
@@ -206,6 +212,7 @@ func TestObfsWriteReadLargePayload(t *testing.T) {
 }
 
 func TestObfsReadBuffering(t *testing.T) {
+	t.Parallel()
 	// Send one 10-byte record; read it back in 2-byte chunks to exercise readBuf.
 	client, server := newObfsPair(t)
 	defer client.Close()
@@ -237,6 +244,7 @@ func TestObfsReadBuffering(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestObfsAppDataRecordFormat(t *testing.T) {
+	t.Parallel()
 	payload := []byte("test payload")
 	rec := buildAppDataRecord(payload)
 
@@ -259,6 +267,7 @@ func TestObfsAppDataRecordFormat(t *testing.T) {
 }
 
 func TestObfsClientHelloFormat(t *testing.T) {
+	t.Parallel()
 	hello := buildClientHello()
 
 	// Must be a handshake record.
@@ -272,6 +281,7 @@ func TestObfsClientHelloFormat(t *testing.T) {
 }
 
 func TestObfsServerHelloFormat(t *testing.T) {
+	t.Parallel()
 	hello := buildServerHello()
 
 	if hello[0] != tlsRecordHandshake {
@@ -283,6 +293,7 @@ func TestObfsServerHelloFormat(t *testing.T) {
 }
 
 func TestObfsClientHelloRandomness(t *testing.T) {
+	t.Parallel()
 	// Two ClientHellos must differ (random fields).
 	h1 := buildClientHello()
 	h2 := buildClientHello()
@@ -292,6 +303,7 @@ func TestObfsClientHelloRandomness(t *testing.T) {
 }
 
 func TestObfsServerHelloRandomness(t *testing.T) {
+	t.Parallel()
 	h1 := buildServerHello()
 	h2 := buildServerHello()
 	if bytes.Equal(h1, h2) {
@@ -300,6 +312,7 @@ func TestObfsServerHelloRandomness(t *testing.T) {
 }
 
 func TestObfsClientHelloWithSNIContainsSNI(t *testing.T) {
+	t.Parallel()
 	// buildClientHelloWithSNI (from sni.go) must embed the SNI extension (type 0x0000).
 	hello := buildClientHelloWithSNI("www.youtube.com")
 	if len(hello) < ObfsHeaderSize+4 {
@@ -319,6 +332,7 @@ func TestObfsClientHelloWithSNIContainsSNI(t *testing.T) {
 }
 
 func TestObfsBuildSNIExtension(t *testing.T) {
+	t.Parallel()
 	// buildSNIExtension is defined in sni.go.
 	hostname := "www.youtube.com"
 	ext := buildSNIExtension(hostname)
@@ -334,6 +348,7 @@ func TestObfsBuildSNIExtension(t *testing.T) {
 }
 
 func TestObfsDifferentSNIDomainsDifferentHellos(t *testing.T) {
+	t.Parallel()
 	// ClientHellos with different SNIs must produce different on-wire bytes.
 	h1 := buildClientHelloWithSNI("www.youtube.com")
 	h2 := buildClientHelloWithSNI("www.cloudflare.com")
@@ -344,6 +359,7 @@ func TestObfsDifferentSNIDomainsDifferentHellos(t *testing.T) {
 }
 
 func TestObfsWithSNIHandshake(t *testing.T) {
+	t.Parallel()
 	// Verify that ObfsConn.WithSNI produces a ClientHello that the server
 	// accepts — i.e. the SNI-enhanced hello is backward-compatible.
 	cRaw, sRaw := net.Pipe()
@@ -381,6 +397,7 @@ func TestObfsWithSNIHandshake(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestObfsReadWrongContentType(t *testing.T) {
+	t.Parallel()
 	cRaw, sRaw := net.Pipe()
 	defer cRaw.Close()
 
@@ -400,6 +417,7 @@ func TestObfsReadWrongContentType(t *testing.T) {
 }
 
 func TestObfsReadZeroLengthRecord(t *testing.T) {
+	t.Parallel()
 	cRaw, sRaw := net.Pipe()
 	defer cRaw.Close()
 
@@ -419,6 +437,7 @@ func TestObfsReadZeroLengthRecord(t *testing.T) {
 }
 
 func TestObfsReadEOF(t *testing.T) {
+	t.Parallel()
 	cRaw, sRaw := net.Pipe()
 	sRaw.Close() // immediate EOF
 

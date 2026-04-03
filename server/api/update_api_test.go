@@ -11,6 +11,7 @@ import (
 )
 
 func TestGetClientVersionDefault(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	rec := do(t, h, http.MethodGet, "/api/v1/client/version", "", "")
 
@@ -26,6 +27,7 @@ func TestGetClientVersionDefault(t *testing.T) {
 }
 
 func TestGetClientVersionNoAuthRequired(t *testing.T) {
+	t.Parallel()
 	// Even with a token configured, GET /api/v1/client/version must be
 	// accessible without credentials so headless clients can poll freely.
 	h := newServer(t, api.Config{ListenAddr: ":0", APIToken: "secret"}, &mockServer{})
@@ -37,6 +39,7 @@ func TestGetClientVersionNoAuthRequired(t *testing.T) {
 }
 
 func TestSetClientVersionRequiresAuth(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.Config{ListenAddr: ":0", APIToken: "token"}, &mockServer{})
 
 	body, _ := json.Marshal(api.ClientVersionInfo{Version: "2.0.0", DownloadURL: "u", SHA256: "h"})
@@ -50,6 +53,7 @@ func TestSetClientVersionRequiresAuth(t *testing.T) {
 }
 
 func TestSetAndGetClientVersion(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.Config{ListenAddr: ":0", APIToken: "tok"}, &mockServer{})
 
 	want := api.ClientVersionInfo{
@@ -86,6 +90,7 @@ func TestSetAndGetClientVersion(t *testing.T) {
 }
 
 func TestSetClientVersionEmptyVersionRejected(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	rec := do(t, h, http.MethodPost, "/api/v1/client/version", "", `{"version":"","download_url":"u","sha256":"h"}`)
 	if rec.Code != http.StatusBadRequest {
@@ -94,6 +99,7 @@ func TestSetClientVersionEmptyVersionRejected(t *testing.T) {
 }
 
 func TestSetClientVersionInvalidJSON(t *testing.T) {
+	t.Parallel()
 	h := newServer(t, api.DefaultConfig(), &mockServer{})
 	rec := do(t, h, http.MethodPost, "/api/v1/client/version", "", "not-json")
 	if rec.Code != http.StatusBadRequest {
