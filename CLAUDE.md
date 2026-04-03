@@ -621,6 +621,26 @@ Wire format обеспечивает статистическую неразли
 **Тесты:** 46 тестов Python + 6 тестов Go, все pass
 **Запуск:** `cd client && python3 -m pytest test_autoupdate.py -v`; `cd server && go test ./api/ -v -cover`
 
+### ЗАДАЧА 33 — ВЫПОЛНЕНО (2026-04-03)
+**Файлы:** `client/multiserver.py`, `client/test_multiserver.py`
+
+Реализована multi-server поддержка с автоматическим переключением:
+- `ServerEndpoint{addr, name, connect_timeout}` — одна запись в пуле серверов; `to_vpn_config(key_pair)` — строит VPNConfig для подключения
+- `SelectionPolicy` — стратегия выбора: PRIORITY (всегда с 0-го, advance при failures), ROUND_ROBIN (циклический), FASTEST (по измеренной latency)
+- `MultiServerConfig` — конфигурация: servers, policy, probe_timeout, initial_delay, max_delay, backoff_factor, max_attempts_per_server, health_check_interval
+- `_probe_latency(addr, timeout)` — TCP-замер RTT; возвращает float('inf') при недоступности
+- `_probe_all(servers, timeout)` — параллельные замеры (daemon thread на каждый сервер), возвращает отсортированный список (fastest first)
+- `ServerSelector` — потокобезопасный выбор сервера: `prime()` — latency probe для FASTEST (идемпотентен), `reprobe()` — сброс кеша, `get(failure_count)` — следующий сервер согласно политике, `current_index(failure_count)` — индекс без объекта
+- `MultiServerState` — состояния: IDLE/CONNECTING/CONNECTED/RECONNECTING/STOPPED
+- `MultiServerManager(config, key_pair)` — основной класс: `start()`, `stop()`, `wait_connected(timeout)`, `active_endpoint`, `route_info`; колбэки `on_connected(ep, route)`, `on_disconnected(ep, exc)`, `on_switching(old_ep, new_ep, attempt)`; exponential backoff между попытками; фоновый health-check поток
+- `create_multi_server_manager(addrs, ...)` — фабричная функция по списку host:port строк
+
+**Perf 1:** `_get_cached_vpn_config` — кеш VPNConfig объектов по (endpoint_id, key_pair_id) — zero alloc на hot reconnect path при reconnect storms (> 10 Hz).
+**Perf 2:** `ServerSelector.get()` снимает lock за O(1) (snapshot ссылки на список вместо копии), вычисляет индекс сервера вне critical section — исключает lock contention при одновременных вызовах из reconnect loop.
+
+**Тесты:** 42 теста, все pass
+**Запуск:** `cd client && python3 -m pytest test_multiserver.py -v`
+
 ### ОПТИМИЗАЦИЯ СКОРОСТИ — ВЫПОЛНЕНО (2026-04-03)
 **Файлы:** `client/autoupdate.py`
 
