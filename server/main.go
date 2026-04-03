@@ -239,16 +239,17 @@ func (s *Server) Run(ctx context.Context) error {
 				continue
 			}
 		}
-		// Increase TCP socket buffers to match the bandwidth-delay product
-		// for Russia↔Kazakhstan (RTT ≈ 80-120 ms). Default Linux buffers
-		// (128-256 KB) cap throughput at ~2 Mbps; 8 MB allows ≥64 Mbps.
-		// setForcedSocketBuffers uses SO_RCVBUFFORCE/SO_SNDBUFFORCE (Linux,
-		// CAP_NET_ADMIN) to bypass the net.core.rmem_max kernel limit.
+		// Increase TCP socket buffers to match the bandwidth-delay product.
+		// Russia↔Kazakhstan real RTT ≈ 919ms (measured, not the original 80ms
+		// assumption). With 32 bond connections the per-connection share is:
+		//   BDP = 100 Mbps × 0.919s / 32 ≈ 360 KB.
+		// We use 4 MB (11× headroom) so that burst recovery after a loss event
+		// doesn't starve the congestion window. Previously 16 MB caused latency
+		// to spike (80ms → 321ms due to bufferbloat); 4 MB is the safe ceiling.
+		// setForcedSocketBuffers uses SO_RCVBUFFORCE/SO_SNDBUFFORCE on Linux
+		// (requires CAP_NET_ADMIN) to bypass net.core.rmem_max.
 		if tc, ok := conn.(*net.TCPConn); ok {
-			// 2 MB socket buffers. BDP = 50 Mbps × 80ms = 500 KB.
-		// 2 MB provides 4× headroom without causing bufferbloat.
-		// Previously 16 MB — caused latency spike from 80ms to 321ms.
-		setForcedSocketBuffers(tc, 2<<20)
+			setForcedSocketBuffers(tc, 4<<20) // 4 MB per bond connection
 			tc.SetNoDelay(true)               // disable Nagle — VPN packets must not be coalesced
 			// TCP keepalive: probe idle connections every 15 s with 3 retries.
 			// Detects dead connections in 30 s (15+3×5) — 2× faster than before.
@@ -617,14 +618,27 @@ func (s *Server) routeFromTun(ctx context.Context) {
 		// Round-robin across bonded streams (multiple TCP connections).
 		// Each connection has its own congestion window, so N connections
 		// yield ~N× throughput on lossy links.
-		ds := target.bond.next()
-		if ds == nil {
-			continue
+		//
+		// Resilient write: if a stream has closed (e.g., one of 32 bonds
+		// dropped), try the next one instead of silently dropping the packet.
+		// We try at most bond.count() streams to avoid an infinite loop when
+		// all bonds are dead (the outer tun.Read loop will exit on the next
+		// read error when the session is torn down).
+		bond := &target.bond
+		tried := bond.count()
+		sent := false
+		for i := 0; i < tried; i++ {
+			ds := bond.next()
+			if ds == nil {
+				break
+			}
+			if _, err := ds.Write(buf[:n]); err == nil {
+				target.bytesOut.Add(uint64(n))
+				sent = true
+				break
+			}
 		}
-
-		if _, err := ds.Write(buf[:n]); err == nil {
-			target.bytesOut.Add(uint64(n))
-		}
+		_ = sent
 	}
 }
 

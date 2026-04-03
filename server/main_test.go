@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -1685,4 +1686,105 @@ func streamReadFull(s *transport.Stream, buf []byte) (int, error) {
 		}
 	}
 	return total, nil
+}
+
+// ---------------------------------------------------------------------------
+// Throughput benchmarks — measure bond routing performance
+// ---------------------------------------------------------------------------
+
+// BenchmarkStreamBondWrite measures the throughput of streamBond.next()+Write
+// across N bonded streams using net.Pipe(). This is the server's hot path in
+// routeFromTun: read one TUN packet → pick next bond stream → write.
+func BenchmarkStreamBondWrite(b *testing.B) {
+	for _, numBonds := range []int{1, 8, 16, 32} {
+		numBonds := numBonds
+		b.Run(fmt.Sprintf("bonds=%d", numBonds), func(b *testing.B) {
+			// Build a bond of numBonds net.Pipe streams (no encryption overhead).
+			var bond streamBond
+			for i := 0; i < numBonds; i++ {
+				server, client := net.Pipe()
+				mux := transport.NewMux(server, false)
+				clMux := transport.NewMux(client, true)
+				// Drain the client side so writes don't block.
+				go func() {
+					for {
+						s, err := clMux.AcceptStream(context.Background())
+						if err != nil {
+							return
+						}
+						go func(st *transport.Stream) {
+							io.Copy(io.Discard, st) //nolint:errcheck
+						}(s)
+					}
+				}()
+				stream, err := mux.OpenStream()
+				if err != nil {
+					b.Fatal(err)
+				}
+				bond.add(stream)
+				b.Cleanup(func() { mux.Close(); clMux.Close(); server.Close(); client.Close() })
+			}
+
+			pkt := make([]byte, 1400) // typical IP packet
+			for i := range pkt {
+				pkt[i] = byte(i)
+			}
+			b.SetBytes(int64(len(pkt)))
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				ds := bond.next()
+				if ds == nil {
+					b.Fatal("no bond stream")
+				}
+				if _, err := ds.Write(pkt); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+		})
+	}
+}
+
+// BenchmarkNoiseConnThroughput measures the encrypt+write throughput of
+// noiseConn at various payload sizes. This is the per-bond-connection ceiling.
+func BenchmarkNoiseConnThroughput(b *testing.B) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, size := range []int{1400, 8192, 65535} {
+		size := size
+		b.Run(fmt.Sprintf("payload=%d", size), func(b *testing.B) {
+			server, client := net.Pipe()
+			defer server.Close()
+			defer client.Close()
+
+			// Drain server side.
+			go io.Copy(io.Discard, server) //nolint:errcheck
+
+			// Build a loopback noise session (client encrypts, server discards).
+			hs, _ := crypto.NewHandshake(crypto.Initiator, kp)
+			msg1, _ := hs.WriteMessage1()
+			// Simulate server side with a fresh handshake responder.
+			serverKP, _ := crypto.GenerateKeyPair()
+			shs, _ := crypto.NewHandshake(crypto.Responder, serverKP)
+			shs.ReadMessage1(msg1) //nolint:errcheck
+			msg2, _ := shs.WriteMessage2()
+			hs.ReadMessage2(msg2) //nolint:errcheck
+			msg3, sess, _ := hs.WriteMessage3()
+			shs.ReadMessage3(msg3) //nolint:errcheck
+
+			nc := newNoiseConn(client, sess)
+			payload := make([]byte, size)
+
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := nc.Write(payload); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }

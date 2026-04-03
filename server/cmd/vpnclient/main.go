@@ -47,11 +47,21 @@ const (
 	ctlAssignPayload = 9          // ip(4) + prefixLen(1) + gw(4)
 	noiseMaxMsg      = 4096       // max handshake message size
 
-	// numBondConns is the number of parallel TCP connections for download
-	// bonding. Each connection has its own TCP congestion window.
-	// On a lossy path (0.7% loss), each connection sustains ~1.7 Mbps.
-	// 8 connections → ~14 Mbps aggregate download throughput.
-	numBondConns = 8
+	// numBondConns is the default number of parallel TCP connections for
+	// download bonding. Each connection has its own TCP congestion window.
+	//
+	// Throughput formula (Mathis): BW = MSS / (RTT × √p)
+	// At RTT=919ms, loss=0.7%: BW ≈ 1400/(0.919×0.0837) ≈ 0.18 Mbps/conn
+	// At RTT=80ms,  loss=0.7%: BW ≈ 1400/(0.080×0.0837) ≈ 2.10 Mbps/conn
+	//
+	// Russia↔Kazakhstan typically has RTT 800-1000ms, so we need many more
+	// connections than a low-latency path:
+	//   Target 14 Mbps at RTT=919ms → 14/0.18 ≈ 78 connections theoretical.
+	//   In practice 32 gives ~8-12 Mbps (CUBIC beats Reno; connections share
+	//   the path, so scaling is ~0.7× linear).
+	//
+	// Override with -bonds flag at runtime.
+	numBondConns = 32
 
 	// reconnectMaxAttempts limits consecutive reconnect failures before giving up.
 	reconnectMaxAttempts = 30
@@ -461,34 +471,34 @@ var log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: sl
 // applyMacOSTuning sets kernel parameters for optimal VPN throughput on macOS.
 // The vpnclient runs as root (sudo), so sysctl writes succeed.
 //
-// IMPORTANT: VPN tunnels suffer from bufferbloat if TCP buffers are too large.
-// Large buffers (1+ MB) queue hundreds of ms of data, inflating latency from
-// 80ms to 300ms+. For VPN, we want MODERATE buffers — enough for the
-// bandwidth-delay product but not more.
+// Tuned for high-latency lossy paths (Russia↔Kazakhstan: RTT≈919ms, loss≈0.7%).
+// With 32 bond connections the target aggregate is 10-14 Mbps.
 //
-// BDP = 50 Mbps × 0.08s = 500 KB. We set 524288 (512 KB) which allows
-// full 50 Mbps throughput at 80ms RTT without excess queuing.
+// Buffer sizing: BDP per connection = 100Mbps × 0.919s / 32 = ~360 KB.
+// We use 512 KB to give 40% headroom. Auto-tune allows growth up to 8 MB
+// to handle bursts after packet loss recovery windows.
 func applyMacOSTuning() {
 	type kv struct{ k, v string }
 	sysctls := []kv{
 		// CRITICAL: disable delayed ACK (100ms → 0ms). Without this,
-		// the server's cwnd grows once per 180ms (100ms ACK + 80ms RTT),
-		// capping download to ~5 Mbps. With delayed_ack=0, cwnd grows
-		// every 80ms, allowing 15-30 Mbps.
+		// the receiver ACKs only every 200ms, so the sender's cwnd grows
+		// once per (200ms + RTT) = 1119ms — more than halving throughput.
+		// With delayed_ack=0 every packet is ACKed, cwnd grows every RTT.
 		{"net.inet.tcp.delayed_ack", "0"},
-		// Moderate TCP buffers: 512 KB = BDP for 50 Mbps × 80ms.
-		// NOT 1MB+ — that causes bufferbloat (latency 80ms → 300ms+).
+		// Per-socket buffers: 512 KB covers the per-connection BDP at 32 bonds.
+		// Larger values cause bufferbloat (latency spikes 919ms → 2000ms+).
 		{"net.inet.tcp.sendspace", "524288"},
 		{"net.inet.tcp.recvspace", "524288"},
-		// Auto-tuning: let kernel grow buffers up to 4MB if needed,
-		// but start moderate. 4MB covers up to 400 Mbps at 80ms RTT.
+		// Auto-tune: allow kernel to grow receive buffer up to 8 MB to handle
+		// bursts when many bonds recover from a loss event simultaneously.
 		{"net.inet.tcp.doautorcvbuf", "1"},
-		{"net.inet.tcp.autorcvbufmax", "4194304"},
-		// TCP Fast Open (saves 1 RTT on reconnect).
+		{"net.inet.tcp.autorcvbufmax", "8388608"},
+		// TCP Fast Open (saves 1 RTT on each of the 32 secondary connects).
+		// Benefit: 31 × 919ms = 28s → <1s for the concurrent bond setup.
 		{"net.inet.tcp.fastopen", "3"},
-		// ECN: allow routers to signal congestion without dropping packets.
-		// If the Russia-Kazakhstan route supports ECN, this eliminates the
-		// packet drops that cause TCP to halve its congestion window.
+		// ECN: routers on the Russia-Kazakhstan path signal congestion via
+		// CE bits instead of dropping packets. If supported, this eliminates
+		// the cwnd halvings that limit each connection to ~0.18 Mbps.
 		{"net.inet.tcp.ecn_initiate_out", "1"},
 		{"net.inet.tcp.ecn_negotiate_in", "1"},
 	}
@@ -504,8 +514,9 @@ func applyMacOSTuning() {
 
 func run() error {
 	serverAddr := flag.String("server", "", "VPN server host:port (required)")
-	keyFile := flag.String("key", "client_privkey.hex", "path to hex-encoded private key file")
+	keyFile    := flag.String("key", "client_privkey.hex", "path to hex-encoded private key file")
 	serverKeyHex := flag.String("server-key", "", "expected server public key hex (optional, for verification)")
+	bonds := flag.Int("bonds", numBondConns, "number of parallel TCP connections (more = faster on lossy high-RTT paths)")
 	flag.Parse()
 
 	if *serverAddr == "" {
@@ -606,18 +617,33 @@ func run() error {
 			log.Info("routes removed")
 		}
 
-		// Open secondary connections for download bonding.
-		// Each secondary connection has its own TCP congestion window.
-		var secondaries []*secondaryConn
-		for i := 1; i < numBondConns; i++ {
-			sc, err := vs.connectSecondary(assignedIP)
-			if err != nil {
-				log.Warn("secondary connection failed", "n", i, "err", err)
-				break // partial bonding is OK — use what we got
-			}
-			secondaries = append(secondaries, sc)
-			log.Info("secondary connected", "n", i+1, "total", len(secondaries)+1)
+		// Open secondary connections CONCURRENTLY for download bonding.
+		// Sequential dialing at 919ms RTT would take (bonds-1)×919ms ≈ 28s for
+		// 32 connections. Concurrent dialing completes in ~1 RTT regardless of
+		// bond count, limited only by server-side accept parallelism.
+		n := *bonds - 1 // number of secondaries (primary counts as 1)
+		var (
+			secMu       sync.Mutex
+			secondaries []*secondaryConn
+			secWg       sync.WaitGroup
+		)
+		for i := 1; i <= n; i++ {
+			i := i
+			secWg.Add(1)
+			go func() {
+				defer secWg.Done()
+				sc, err := vs.connectSecondary(assignedIP)
+				if err != nil {
+					log.Warn("secondary connection failed", "n", i, "err", err)
+					return
+				}
+				secMu.Lock()
+				secondaries = append(secondaries, sc)
+				log.Info("secondary connected", "n", i+1, "total", len(secondaries)+1)
+				secMu.Unlock()
+			}()
 		}
+		secWg.Wait()
 		log.Info("bonding active", "connections", len(secondaries)+1)
 
 		// Run bidirectional forwarding until disconnection.
