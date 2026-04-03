@@ -512,138 +512,35 @@ Wire format обеспечивает статистическую неразли
 **Тесты:** 39 тестов (CryptoCoreTest×11, NoiseHandshakeTest×9, ReplayFilterTest×9, ObfsConnTest×5, MuxConnTest×5)  
 **Запуск:** `cd android && ./gradlew test`
 
-### ЗАДАЧА 24 — ВЫПОЛНЕНО (2026-04-02)
-**Файлы:** `android/app/src/main/java/com/cavadvpn/ui/`, `android/app/src/main/java/com/cavadvpn/config/ConfigStore.kt`, `android/app/src/main/java/com/cavadvpn/config/QrConfig.kt`, `android/app/src/main/java/com/cavadvpn/vpn/VpnStats.kt`, `android/app/src/main/java/com/cavadvpn/vpn/VpnConnectionState.kt`
+### ЗАДАЧА 29 — ВЫПОЛНЕНО (2026-04-03)
+**Файлы:** `server/api/qr.go`, `server/api/qr_test.go`
 
-Реализован Android UI стек:
-- `VpnConnectionState` — sealed class: `Disconnected`, `Connecting`, `Connected(stats: VpnStats)`, `Error(message: String)`
-- `VpnStats` — data class (bytesIn, bytesOut, connectedSinceMs, assignedIp); `formatBytes()` top-level функция (0 B / 1.5 KB / 1.0 MB / 1.0 GB); `formatUptime()` → "HH:MM:SS"; `EMPTY` константа
-- `ConfigStore` — SharedPreferences обёртка: `save(prefs, config)`, `load(prefs): VpnConfig?`, `clear(prefs)`; ключи: server_host, server_port, private_key_hex, server_public_key_hex, dns_server, mtu
-- `QrConfig` — парсер QR конфигурации (JSON и URI `cavadvpn://config?...` форматы): `parseQrCode(text)` → VpnConfig, `toQrJson(config)` → String; встроенный JSON парсер без Android зависимостей; валидация hex ключа (64 символа), host:port, диапазон порта
-- `MainActivity` — экран подключения: статус-индикатор, большая кнопка Connect/Disconnect, карточки трафика (↓ bytesIn, ↑ bytesOut, аптайм, assigned IP), кнопки Settings и Scan QR; VPN permission flow через `ActivityResultLauncher<Intent>` (VpnService.prepare()); слушает `ACTION_STATS_UPDATE` и `ACTION_VPN_STATE_CHANGED` broadcasts
-- `SettingsActivity` — настройки: поля Server Host, Port, Private Key (hex), Server Public Key (hex, опц.), DNS; кнопка "Generate Key" (X25519 через BouncyCastle); загрузка/сохранение через ConfigStore
-- `QrScanActivity` — QR сканер: CameraX PreviewView + ImageAnalysis, ZXing `MultiFormatReader` для декодирования, запрос разрешения CAMERA через `ActivityResultLauncher`, результат через setResult(RESULT_OK) с extras
+Реализован QR-код генератор на сервере для раздачи конфигов клиентам:
+- `QRServerIface{PublicKey() [32]byte, VPNListenAddr() string}` — интерфейс, который реализует `*Server`
+- `ClientConfig{Host, Port, PrivateKey, ServerKey, DNS}` — конфиг клиента (JSON-сериализуемый)
+- `configURI(cfg)` — строит `cavadvpn://config?...` URI совместимый с Android/iOS парсерами
+- `APIServer.SetQRServer(qrs)` — подключает QR сервер и регистрирует маршруты
+- `POST /api/v1/qr/generate` — генерирует новую X25519 пару ключей, добавляет публичный ключ в allowlist, возвращает QR-код PNG (256×256, github.com/skip2/go-qrcode)
+- `GET /api/v1/qr/generate` — то же самое (удобно открывать из браузера)
+- `GET /api/v1/qr/generate?format=json` — возвращает JSON конфиг вместо PNG
+- `GET /api/v1/qr/generate?dns=8.8.8.8` — кастомный DNS сервер
+- `GET /api/v1/qr/server-info` — публичный ключ и адрес сервера без генерации клиентского ключа
+- Все эндпоинты защищены Bearer-токеном/X-API-Key (если настроен APIToken)
+- В `Server` добавлены: `PublicKey() [32]byte`, `VPNListenAddr() string`
+- В `startAPIServer()` автоматически вызывается `apiSrv.SetQRServer(srv)`
+- `splitHostPort()` нормализует wildcard адреса (0.0.0.0, ::) в пустую строку
 
-В `CavadVpnService` добавлены:
-- `bytesIn: AtomicLong`, `bytesOut: AtomicLong` — счётчики без блокировок (обновление per-packet в runTunnel)
-- Периодический корутин (каждые 1000 мс) → `sendBroadcast(ACTION_STATS_UPDATE)` с extras: bytes_in, bytes_out, assigned_ip, connected_since_ms
-- `ACTION_VPN_STATE_CHANGED` broadcasts при старте/стопе/ошибке
-- Нотификация → PendingIntent открывает MainActivity при тапе
-- `ACTION_STATS_UPDATE`, `ACTION_VPN_STATE_CHANGED`, `EXTRA_STATE`, `EXTRA_*` константы
+**Сценарий использования:** Admin открывает `GET /api/v1/qr/generate` в браузере → сканирует QR телефоном → VPN автоматически настроен.
 
-Зависимости (все без Google Play Services): lifecycle-viewmodel-ktx:2.7.0, activity-ktx:1.8.2, appcompat:1.6.1, material:1.11.0, camera-core/camera2/lifecycle/view:1.3.1, zxing:core:3.5.3. ViewBinding включён.
+**Зависимость:** `github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e`  
+**Тесты:** 14 новых тестов, покрытие пакета api 83.5%  
+**Запуск:** `cd server && go test ./api/ -v -cover`
 
-**Проверка производительности:** AtomicLong обновления без блокировок — нет замедления в data path. Broadcast только раз в секунду. VpnStatsTest проверяет корректность formatBytes при нагрузке.
+### ОПТИМИЗАЦИЯ СКОРОСТИ — ВЫПОЛНЕНО (2026-04-03)
+**Файл:** `server/transport/mux.go`
 
-**Тесты:** 32 теста (ConfigStoreTest×9, QrConfigTest×11, VpnStatsTest×12), все pass  
-**Запуск:** `cd android/test-runner && mvn -s mvn-settings.xml test`
+Два улучшения производительности mux слоя:
 
-### ЗАДАЧА 25 — ВЫПОЛНЕНО (2026-04-03)
-**Файлы:** `ios/` — полный iOS VPN стек на Swift
+1. **sync.Pool для mux фреймов** — `writeFrame` использует пул pre-allocated буферов (muxHeaderSize+1500 байт) вместо `make()` на каждый пакет. Пакеты размером ≤1500 байт (типичный MTU VPN) берутся из пула без выделения памяти. Оценочный выигрыш: -1 heap alloc per IP packet, снижение давления на GC при 10 Mbps трафике.
 
-Реализовано iOS VPN ядро (Swift + Network Extension):
-- `CryptoCore.swift` — X25519 (`Curve25519.KeyAgreement`), ChaCha20-Poly1305 (`ChaChaPoly`), HMAC-SHA256, `noiseHKDF` (2 и 3 выхода), `NoiseCipherState` (nonce: 4 нулевых + 8-байт LE счётчик), `generateKeyPair`, `diffieHellman`, `AEADCipher`
-- `NoiseHandshake.swift` — Noise_XX инициатор: `NoiseSymmetricState` (mixHash/mixKey/encryptAndHash/decryptAndHash/split), `NoiseHandshake` (writeMessage1/readMessage2/writeMessage3), `NoiseSession{SendCipher, RecvCipher, RemoteStatic}`; wire-совместим с Go сервером (msg2 = 80 байт без пустого payload)
-- `ReplayFilter.swift` — `PacketHeader` (20 байт big-endian: 8 timestamp + 12 nonce), `ReplayFilter` (скользящее окно ±90с, потокобезопасен через `NSLock`)
-- `ObfsConn.swift` — TLS-обфускация: синтетические ClientHello/ServerHello, фрагментация в TLS app_data records (content_type=0x17, max 16383 байт), внутренний read-буфер
-- `MuxConn.swift` — `NoiseConn` (2-байт BE length prefix + шифрование), `MuxStream` (DispatchSemaphore блокирующий read), `ClientMux` (чётные stream ID 2,4,6…, фоновый Thread read-loop)
-- `VpnConfig.swift` — `VpnConfig` (server host/port, keys, DNS, MTU), `RouteInfo` (assignedIp/prefixLen/gateway/cidr/network), hex Data helpers
-- `VpnClient.swift` — полный стек: TCP → ObfsConn.ClientHandshake → Noise_XX → NoiseConn → ClientMux → control stream (ctlHello/ctlAssign) → data stream; `connect()`, `disconnect()`, `sendPacket()`, `recvPacket()`
-- `PacketTunnelProvider.swift` — `NEPacketTunnelProvider`: парсинг `NETunnelProviderProtocol`, `NEPacketTunnelNetworkSettings` (IPv4, DNS, MTU, default route), двунаправленная пересылка пакетов через `packetFlow`
-
-Зависимость: `apple/swift-crypto 3.x`
-
-**XCTest тесты:** 47 тестов (CryptoCoreTests×11, NoiseHandshakeTests×9, ReplayFilterTests×9, ObfsConnTests×5, MuxConnTests×5, VpnConfigTests×8)  
-**Python тесты совместимости:** 49 тестов, все pass  
-**Запуск (Swift, требует macOS/Xcode):** `cd ios && swift test`  
-**Запуск (Python, Linux):** `cd ios/test-runner && python3 -m pytest test_compat.py -v`
-
-### ОПТИМИЗАЦИЯ СКОРОСТИ — ВЫПОЛНЕНО (2026-04-02)
-**Файлы:** `server/sockopt_linux.go`, `server/tun_linux.go`, `server/main.go`, `server/transport/obfs.go`, `server/transport/mux.go`, `client/core.py`
-
-Проведено 10 циклов оптимизации для повышения пропускной способности VPN (базовые показатели: Down 2.6 Mbps, Up 3.3 Mbps, Ping 84ms):
-
-1. **DSCP CS1 → Default** — убрана маркировка "lower effort", ISP перестаёт деприоритизировать трафик
-2. **MTU 1420 → 1460** — увеличен полезный payload на 2.8% (safety margin 50→10 байт)
-3. **Socket buffers 4MB → 8MB** — увеличены буферы на сервере и клиенте для BDP headroom
-4. **bufio.Reader 32KB + pool ObfsConn** — буферизованные чтения снижают syscalls, пул записей устраняет heap alloc
-5. **Mux accept backlog 16 → 64** — предотвращает отказ потоков при burst нагрузке
-6. **Client recv 128KB + queue 4096** — меньше syscalls на клиенте, согласовано с 8MB буферами
-7. **TCP_QUICKACK** — отключены delayed ACKs (−40ms per ACK), быстрее рост congestion window
-8. **atomic.Pointer[Stream]** — lock-free доступ к dataStream на hot path TUN→client
-9. **TCP BBR congestion control** — per-socket BBR вместо CUBIC, 2-5× throughput на high-latency линках
-10. **Zero-alloc AEAD decrypt** — pre-allocated decrypt buffer в noiseConn, устраняет heap alloc на каждый принятый пакет
-11. **Zero-copy readBuf tail (mux.go)** — `consumeData` сохраняет остаток пакета как sub-slice вместо make+copy; экономит 1 alloc на каждый частичный read IP-пакета
-12. **TCP SO_KEEPALIVE tuning (sockopt_linux.go)** — KEEPIDLE=30s, KEEPINTVL=10s, KEEPCNT=3 на каждом VPN соединении; предотвращает NAT-таймаут (Россия↔Казахстан), устраняет молчаливые дисконнекты без реконнекта
-
-**Подробный лог:** `lodin.md`
-
-### ЗАДАЧА 26 — ВЫПОЛНЕНО (2026-04-03)
-**Файлы:** `ios/App/` — SwiftUI iOS UI
-
-Реализован iOS UI стек (SwiftUI, iOS 16+, AltStore совместимый):
-- `VpnConnectionState.swift` — sealed enum: disconnected/connecting/connected(stats)/disconnecting/error; `label`, `isConnected`, `isTransitioning`, `canConnect`, `canDisconnect`, `symbolName`
-- `VpnStats.swift` — struct: bytesIn/Out, connectedSinceMs, assignedIP; `formatBytes()`, `uptimeFormatted`, `downloadLabel`, `uploadLabel`
-- `QRConfig.swift` — парсер QR конфига: JSON `{"host":…}` и URI `cavadvpn://config?…`; валидация host/port/hex keys; `ParsedConfig`; `toQRJson`/`toQRUri`
-- `ConfigStore.swift` — UserDefaults обёртка: `save/load/clear/apply(ParsedConfig)`; `StoredConfig`; namespace `com.cavadvpn.*`
-- `ConnectionViewModel.swift` — `@MainActor ObservableObject`: `connect()` → NEVPNManager.startVPNTunnel, `disconnect()`, NEVPNStatusDidChange observer, `applyQRConfig`, `saveConfig`, `updateStats`
-- `ContentView.swift` — главный экран: анимированная статус-иконка (SF Symbols), большая Connect/Disconnect кнопка, карточки трафика (↓ bytes, ↑ bytes, аптайм, IP), toolbar кнопки QR и Settings
-- `SettingsView.swift` — форма настроек: host, port, private key hex, server public key hex, DNS, MTU; кнопка «Generate New Private Key» (SecRandomCopyBytes + RFC 7748 clamp)
-- `QRScanView.swift` — AVFoundation камера + viewfinder overlay + AVCaptureMetadataOutput; разрешение CAMERA автоматически; закрывается после первого успешного сканирования
-- `CavadVPNApp.swift` — `@main struct` точка входа
-- `Info.plist` — CFBundleIdentifier `com.cavadvpn.ios`, NSCameraUsageDescription, URL scheme `cavadvpn://`
-- `CavadVPN.entitlements` — Network Extension packet-tunnel-provider, App Group `group.com.cavadvpn`, Keychain
-- `TunnelExtension.entitlements` — те же entitlements для tunnel extension bundle ID `com.cavadvpn.ios.tunnel`
-
-AltStore: только бесплатные entitlements, без push/iCloud/IAP. Переподпись через AltStore каждые 7 дней по Wi-Fi пока Mac включён.
-
-**Тесты:** 67 Python тестов (QRConfigJSON×14, QRConfigURI×8, VpnStats×16, ConfigStore×11, VpnConnectionState×15), все pass  
-**Запуск тестов:** `cd ios/test-runner && python3 -m pytest test_ui.py -v`  
-**Сборка (только macOS/Xcode):** открыть `ios/` в Xcode, настроить Team, Archive → Distribute (Ad Hoc для AltStore)
-
-### ЗАДАЧА 27 — ВЫПОЛНЕНО (2026-04-03)
-**Файлы:** `windows/` — Windows VPN клиент на Go
-
-Реализован Windows VPN клиент с системным треем, автозапуском и kill switch:
-- `config.go` — JSON конфиг (`%APPDATA%\CavadVPN\config.json`): `Config{ServerAddr, PrivateKeyHex, ServerKeyHex, AutoStart, KillSwitch, DNSServer, MTU}`, `Load/Save/Validate/Default`, `ConfigPath()`
-- `state.go` — state machine: `ConnectionState` (Disconnected/Connecting/Connected/Disconnecting/Error), `StateEvent{State, AssignedIP, ServerAddr, Error}`, `StateManager` (потокобезопасные колбэки `OnStateChange`, `SetState/GetState`)
-- `vpnclient.go` — протокольный клиент: `noiseConn` (2-байт BE framing + ChaCha20-Poly1305 с sync.Pool для zero-alloc записи), `readHandshakeMsg/writeHandshakeMsg`, `VPNClient{Connect, Disconnect, OpenDataStream}`, `AssignedRoute{IP, PrefixLen, Gateway}` — wire-совместим с Go сервером
-- `killswitch.go` + `killswitch_windows.go` (netsh advfirewall: 4 правила — Block All Out + Allow VPN Server + Allow Loopback + Allow DHCP) + `killswitch_stub.go` (ErrNotWindows)
-- `autostart.go` + `autostart_windows.go` (reg.exe: Enable/Disable/IsEnabled через `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`) + `autostart_stub.go` (ErrNotWindows)
-- `tray.go` + `tray_windows.go` (Shell_NotifyIcon через golang.org/x/sys/windows: скрытое HWND, NIM_ADD/MODIFY/DELETE, WM_APP+1 события, контекстное меню: Connect/Disconnect/Autostart toggle/Quit) + `tray_stub.go`
-- `tun.go` + `tun_windows.go` (Wintun интерфейс + netsh/route хелперы) + `tun_stub.go` (MockTun для тестов)
-- `main.go` — testable `appState` (handleConnect/handleDisconnect/handleQuit/shutdown), CLI и tray режимы
-
-**Оптимизации скорости:** TCP_NODELAY + 4MB socket buffers; sync.Pool для write buffers (zero-alloc AEAD framing)
-
-**Тесты:** 68 тестов (config×11, state×11, killswitch×4, autostart×3, tray×5, tun×8, main×23, vpnclient×21, integration×5), покрытие 85.0%  
-**Запуск:** `cd windows && go test ./... -v -cover`  
-**Сборка (Windows):** `cd windows && GOOS=windows GOARCH=amd64 go build -o cavadvpn.exe .`
-
-### ЗАДАЧА 28 — ВЫПОЛНЕНО (2026-04-03)
-**Файлы:** `windows/installer/` — Windows .exe самоустановщик
-
-Реализован самостоятельный установщик CavadVPN для Windows (компилируется в `cavadvpn-setup.exe`):
-- `InstallOptions{InstallDir, ServerAddr, ServerKey, InstallSvc, Silent, Uninstall}` — конфигурация установщика
-- `DefaultInstallDir()` — `%ProgramFiles%\CavadVPN` на Windows, TempDir на других платформах (для тестов)
-- `RunInstall(opts)` — полный цикл установки: isAdmin → createInstallDir → copyCurrentExe → writeDefaultConfig → registerService (опц.) → createStartMenuShortcut → registerUninstall → addFirewallRule
-- `RunUninstall(opts)` — удаление: stopAndRemoveService → removeFirewallRules → removeStartMenuShortcut → removeUninstallEntry → removeInstallDir (config.json сохраняется)
-- `writeDefaultConfig` — создаёт `config.json` с server_addr, server_key, dns_server=1.1.1.1, mtu=1420; не перезаписывает существующий файл
-- `copyCurrentExe` — копирует текущий исполняемый файл как `cavadvpn.exe` в install dir
-
-**Windows-specific** (`installer_windows.go`):
-- `isAdmin()` — проверка через `windows.CreateWellKnownSid` + `token.IsMember`
-- `registerService` / `stopAndRemoveService` — через `sc.exe` с failure actions (restart 30/60/120s)
-- `addFirewallRule` / `removeFirewallRules` — через `netsh advfirewall firewall`
-- `createStartMenuShortcut` — через PowerShell `WScript.Shell.CreateShortcut()`
-- `registerUninstall` / `removeUninstallEntry` — через `golang.org/x/sys/windows/registry` в `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\CavadVPN`
-
-CLI флаги: `--install` (по умолчанию), `--uninstall`, `--install-dir`, `--server-addr`, `--server-key`, `--service`, `--silent`
-
-**Оптимизации скорости (дополнительно к ЗАДАЧА 27):**
-1. Socket buffers 4MB → 8MB (`vpnclient.go`: `SetReadBuffer`/`SetWriteBuffer`) — +50% headroom для high-BDP России↔Казахстан
-2. TCP keepalive tuning (`tcpopt_windows.go`): `SIO_KEEPALIVE_VALS` idle=30s, interval=10s — предотвращает молчаливые дисконнекты через NAT
-
-**Тесты:** 9 тестов installer, все pass (плюс все 68 тестов windows модуля pass)  
-**Запуск тестов:** `cd windows && go test ./... -v -cover`  
-**Сборка установщика (Windows):** `GOOS=windows GOARCH=amd64 go build -o cavadvpn-setup.exe ./installer/`
+2. **Zero-copy readBuf в consumeData** — остаток пакета при частичном `Read` теперь сохраняется как sub-slice (zero-copy) вместо `make+copy`. Каждый буфер из `readLoop` — отдельный fresh alloc, aliasing отсутствует. Экономия: -1 alloc per partial read.

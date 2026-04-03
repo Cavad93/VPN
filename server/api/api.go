@@ -77,6 +77,7 @@ func DefaultConfig() Config {
 type APIServer struct {
 	cfg    Config
 	srv    ServerIface
+	qrSrv  QRServerIface
 	logger *slog.Logger
 	mux    *http.ServeMux
 	logBuf *LogBuffer

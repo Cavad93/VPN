@@ -23,13 +23,13 @@ import (
 	"sync"
 )
 
-// muxFramePool pools byte slices used to build mux frames and avoids a heap
-// allocation on every data packet.  Slices are returned with cap ≥ 1467 bytes
-// (7-byte header + 1460-byte TUN MTU).
+// muxFramePool holds pre-allocated frame buffers sized for typical MTU traffic
+// (muxHeaderSize + 1500 bytes). Buffers for oversized payloads are allocated
+// directly and not pooled to avoid holding large memory across goroutines.
 var muxFramePool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 0, muxHeaderSize+1460)
-		return &b
+		buf := make([]byte, muxHeaderSize+1500)
+		return &buf
 	},
 }
 
@@ -72,7 +72,7 @@ func NewMux(conn net.Conn, isClient bool) *Mux {
 	m := &Mux{
 		conn:     conn,
 		streams:  make(map[uint32]*Stream),
-		acceptCh: make(chan *Stream, 64),
+		acceptCh: make(chan *Stream, 16),
 		ctx:      ctx,
 		cancel:   cancel,
 	}
@@ -142,17 +142,19 @@ func (m *Mux) Close() error {
 // required for the Python client which expects one read_message() call to
 // return the complete frame (header + payload).
 //
-// The frame buffer is obtained from muxFramePool to avoid a heap allocation
-// on every data packet.
+// Optimisation: frames ≤ muxHeaderSize+1500 bytes are built from a sync.Pool
+// buffer, avoiding a heap allocation on every IP packet write.
 func (m *Mux) writeFrame(streamID uint32, fType uint8, payload []byte) error {
 	need := muxHeaderSize + len(payload)
 
-	// Borrow a buffer from the pool, grow if needed.
-	bp := muxFramePool.Get().(*[]byte)
-	if cap(*bp) < need {
-		*bp = make([]byte, need)
+	var frame []byte
+	var poolBuf *[]byte
+	if need <= muxHeaderSize+1500 {
+		poolBuf = muxFramePool.Get().(*[]byte)
+		frame = (*poolBuf)[:need]
+	} else {
+		frame = make([]byte, need)
 	}
-	frame := (*bp)[:need]
 
 	binary.BigEndian.PutUint32(frame[0:4], streamID)
 	frame[4] = fType
@@ -163,21 +165,15 @@ func (m *Mux) writeFrame(streamID uint32, fType uint8, payload []byte) error {
 	_, err := m.conn.Write(frame)
 	m.writeMu.Unlock()
 
-	// Return the buffer to the pool only after Write completes; the buffer
-	// must not be reused while it may still be in the kernel send buffer.
-	// (conn.Write on a noiseConn copies into its own allocation.)
-	muxFramePool.Put(bp)
-
+	if poolBuf != nil {
+		muxFramePool.Put(poolBuf)
+	}
 	return err
 }
 
 // readLoop reads frames from the underlying connection and dispatches them to
 // the appropriate Stream. It runs as a dedicated goroutine until an I/O error
 // (including a deliberate Close) terminates the connection.
-//
-// Uses a single large scratch buffer so that the header + payload of typical
-// VPN packets (≤ 1460 bytes) are read in one io.ReadFull call through the
-// underlying noiseConn, which already decrypts the entire mux frame at once.
 func (m *Mux) readLoop() {
 	hdr := make([]byte, muxHeaderSize)
 	for {
@@ -333,13 +329,11 @@ func (s *Stream) Read(p []byte) (int, error) {
 }
 
 // consumeData copies data into p and saves the overflow for the next Read.
-// The tail is stored as a zero-copy sub-slice of data to avoid a make+copy
-// allocation on every partial read (saves ~1 alloc per VPN packet at typical
-// 65535-byte Read buffers vs 1460-byte IP packets).
+// Optimisation: the overflow tail is kept as a sub-slice of data (zero-copy)
+// since each data slice is a fresh allocation from readLoop and is not reused.
 func (s *Stream) consumeData(p, data []byte) int {
 	n := copy(p, data)
 	if n < len(data) {
-		// data is a fresh allocation from readLoop — safe to hold a reference.
 		s.readBuf = data[n:]
 	}
 	return n

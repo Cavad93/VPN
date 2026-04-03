@@ -157,7 +157,7 @@ git push -u origin claude/create-claude-md-zT6Gk
   > Выполнено: `windows/installer/` — самостоятельный установщик на Go (компилируется в `cavadvpn-setup.exe`). Реализованы: `installer.go` (InstallOptions, RunInstall, RunUninstall, createInstallDir, copyCurrentExe, writeDefaultConfig, removeInstallDir), `installer_windows.go` (isAdmin через Windows token, registerService/stopAndRemoveService через sc.exe, addFirewallRule/removeFirewallRules через netsh, createStartMenuShortcut через PowerShell WScript.Shell, registerUninstall/removeUninstallEntry через HKLM registry), `installer_stub.go` (заглушки для не-Windows), `main.go` (CLI флаги: --install/--uninstall/--install-dir/--server-addr/--server-key/--service/--silent). Оптимизации: socket buffers 4MB→8MB (`vpnclient.go`), TCP keepalive idle=30s/interval=10s/count=3 (`tcpopt_windows.go`+`tcpopt_stub.go`). Тесты: 9 тестов, все pass. Запуск: `cd windows && go test ./installer/ -v`; Сборка (Windows): `GOOS=windows GOARCH=amd64 go build -o cavadvpn-setup.exe ./installer/`
 
 ### ФАЗА 10: Раздача друзьям
-- [ ] **ЗАДАЧА 29:** QR-код генератор на сервере — генерирует QR с конфигом клиента. Друг сканирует телефоном — всё настроено. `server/api/qr.go`
+- [x] **ЗАДАЧА 29:** QR-код генератор на сервере — генерирует QR с конфигом клиента. Друг сканирует телефоном — всё настроено. `server/api/qr.go`
 - [ ] **ЗАДАЧА 30:** Пригласительная ссылка — `http://IP/join/ТОКЕН` — открыл ссылку, скачал приложение под свою платформу, конфиг уже внутри.
 - [ ] **ЗАДАЧА 31:** Push уведомления на телефон — когда VPN отключился или сервер недоступен.
 - [ ] **ЗАДАЧА 32:** Автообновление клиента — новая версия скачивается и устанавливается без участия пользователя.

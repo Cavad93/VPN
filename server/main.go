@@ -237,6 +237,14 @@ func (s *Server) AllowedKeys() [][32]byte {
 	return out
 }
 
+// PublicKey returns the server's static X25519 public key.
+// Implements api.QRServerIface.
+func (s *Server) PublicKey() [32]byte { return s.staticKP.PublicKey }
+
+// VPNListenAddr returns the VPN server's listen address (host:port).
+// Implements api.QRServerIface.
+func (s *Server) VPNListenAddr() string { return s.cfg.ListenAddr }
+
 // DisconnectSession cancels the session with the given ID.
 // Returns true if the session existed.
 func (s *Server) DisconnectSession(id uint64) bool {
@@ -884,11 +892,13 @@ func main() {
 
 // startAPIServer launches the REST management API in a background goroutine.
 // If cfg.ListenAddr is empty the API is not started.
-func startAPIServer(ctx context.Context, cfg api.Config, srv api.ServerIface, logger *slog.Logger) {
+func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *slog.Logger) {
 	if cfg.ListenAddr == "" {
 		return
 	}
 	apiSrv := api.NewAPIServer(cfg, srv, logger)
+	// Enable QR code generation using the server's public key and listen address.
+	apiSrv.SetQRServer(srv)
 	go func() {
 		if err := apiSrv.Run(ctx); err != nil {
 			logger.Error("api server error", "err", err)
