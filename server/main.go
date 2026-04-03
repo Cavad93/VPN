@@ -650,33 +650,28 @@ func newNoiseConn(conn net.Conn, session *crypto.Session) *noiseConn {
 // wraps them in a single TLS record. This halves the number of TLS records
 // the Python client must read per message, doubling download throughput.
 //
-// Optimisation: EncryptTo writes ciphertext directly into the pool buffer,
-// then net.Buffers (writev) sends [length_prefix, ciphertext] atomically
-// without copying the ciphertext into a second staging buffer.
+// Optimisation: EncryptTo writes ciphertext directly into the pool frame
+// buffer at offset 2, eliminating both the intermediate ciphertext allocation
+// and the copy. Saves 2 allocations + 1 copy per packet.
 func (nc *noiseConn) Write(p []byte) (int, error) {
-	// Borrow a ciphertext buffer from the pool.
+	// Borrow a frame buffer from the pool.
 	ctLen := len(p) + 16 // plaintext + AEAD tag
+	need := 2 + ctLen
 	bp := noiseWritePool.Get().(*[]byte)
-	if cap(*bp) < ctLen {
-		*bp = make([]byte, ctLen)
+	if cap(*bp) < need {
+		*bp = make([]byte, need)
 	}
-	ctBuf := (*bp)[:ctLen]
+	frame := (*bp)[:need]
 
-	// Encrypt directly into pool buffer — zero intermediate allocation.
-	ciphertext, err := nc.session.SendCipher.EncryptTo(ctBuf[:0], p, nil)
+	// Encrypt directly into frame[2:], skipping the length prefix.
+	ciphertext, err := nc.session.SendCipher.EncryptTo(frame[2:2], p, nil)
 	if err != nil {
 		noiseWritePool.Put(bp)
 		return 0, fmt.Errorf("noiseConn encrypt: %w", err)
 	}
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(ciphertext)))
 
-	// Build 2-byte length prefix on the stack.
-	var lenPfx [2]byte
-	binary.BigEndian.PutUint16(lenPfx[:], uint16(len(ciphertext)))
-
-	// writev: kernel sends length prefix + ciphertext in one atomic write,
-	// and ObfsConn wraps the combined payload in a single TLS record.
-	bufs := net.Buffers{lenPfx[:], ciphertext}
-	_, err = bufs.WriteTo(nc.conn)
+	_, err = nc.conn.Write(frame[:2+len(ciphertext)])
 	noiseWritePool.Put(bp)
 	if err != nil {
 		return 0, err
