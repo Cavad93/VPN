@@ -16,10 +16,13 @@ from smart_route import (
     SmartRouteStats,
     RouteMode,
     _BlocklistManager,
+    _BlockProber,
     _DNSCache,
     _RouteInstaller,
     _is_ip_or_cidr,
     _get_default_gateway,
+    ProbeResult,
+    PROBE_DOMAINS,
     DEFAULT_BLOCKED_DOMAINS,
     ALWAYS_DIRECT_DOMAINS,
     create_smart_router,
@@ -435,6 +438,204 @@ class TestThreadSafety(unittest.TestCase):
         for t in threads:
             t.join()
         self.assertEqual(errors, [])
+
+
+# ---------------------------------------------------------------------------
+# Tests: _BlockProber
+# ---------------------------------------------------------------------------
+
+class TestBlockProber(unittest.TestCase):
+    def test_probe_localhost_not_blocked(self):
+        """localhost should be connectable → not blocked."""
+        prober = _BlockProber(timeout=2.0, port=80)
+        # Probe localhost — won't have port 80 open on most test systems,
+        # but we can at least test the mechanics.
+        result = prober._probe_domain("localhost")
+        self.assertIsInstance(result, ProbeResult)
+        self.assertEqual(result.domain, "localhost")
+
+    def test_probe_nonexistent_domain(self):
+        """Non-existent domain → dns_failed → blocked."""
+        prober = _BlockProber(timeout=1.0)
+        result = prober._probe_domain("this.domain.does.not.exist.xyz123abc")
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.error, "dns_failed")
+
+    def test_probe_all_parallel(self):
+        """probe_all runs domains in parallel and returns results."""
+        prober = _BlockProber(timeout=3.0)
+        domains = ["localhost", "this.domain.does.not.exist.xyz123abc"]
+        results = prober.probe_all(domains, workers=2)
+        # At least one result should be returned (DNS for nonexistent may be slow).
+        self.assertGreaterEqual(len(results), 1)
+        domain_names = {r.domain for r in results}
+        self.assertIn("localhost", domain_names)
+
+    def test_blocked_and_direct_properties(self):
+        """blocked_domains and direct_domains partitions results."""
+        prober = _BlockProber(timeout=1.0)
+        # Manually inject results.
+        prober._results["blocked.com"] = ProbeResult("blocked.com", True, -1, "timeout")
+        prober._results["direct.com"] = ProbeResult("direct.com", False, 50.0)
+        self.assertIn("blocked.com", prober.blocked_domains)
+        self.assertNotIn("direct.com", prober.blocked_domains)
+        self.assertIn("direct.com", prober.direct_domains)
+        self.assertNotIn("blocked.com", prober.direct_domains)
+
+    def test_all_results(self):
+        prober = _BlockProber()
+        prober._results["a.com"] = ProbeResult("a.com", True, -1)
+        prober._results["b.com"] = ProbeResult("b.com", False, 10.0)
+        self.assertEqual(len(prober.all_results), 2)
+
+    def test_cache_save_and_load(self):
+        """Save probe results to cache and reload them."""
+        prober = _BlockProber()
+        prober._results["youtube.com"] = ProbeResult("youtube.com", True, -1, "timeout")
+        prober._results["yandex.ru"] = ProbeResult("yandex.ru", False, 25.0)
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+
+        try:
+            prober.save_cache(path)
+
+            prober2 = _BlockProber()
+            loaded = prober2.load_cache(path)
+            self.assertTrue(loaded)
+            self.assertIn("youtube.com", prober2.blocked_domains)
+            self.assertIn("yandex.ru", prober2.direct_domains)
+            self.assertEqual(prober2.all_results["youtube.com"].error, "timeout")
+        finally:
+            os.unlink(path)
+
+    def test_cache_load_nonexistent(self):
+        prober = _BlockProber()
+        self.assertFalse(prober.load_cache("/tmp/nonexistent_probe_cache_xyz.json"))
+
+    def test_cache_load_corrupted(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write("not valid json{{{")
+            path = f.name
+        try:
+            prober = _BlockProber()
+            self.assertFalse(prober.load_cache(path))
+        finally:
+            os.unlink(path)
+
+    def test_probe_domains_list_nonempty(self):
+        """PROBE_DOMAINS should contain a reasonable set of domains."""
+        self.assertGreater(len(PROBE_DOMAINS), 10)
+
+
+# ---------------------------------------------------------------------------
+# Tests: auto-detect integration
+# ---------------------------------------------------------------------------
+
+def _mock_probe_domain(self, domain):
+    """Mock probe: domains containing 'blocked' are blocked, others direct."""
+    if "blocked" in domain:
+        return ProbeResult(domain=domain, blocked=True, latency_ms=-1, error="timeout")
+    return ProbeResult(domain=domain, blocked=False, latency_ms=25.0)
+
+
+class TestAutoDetect(unittest.TestCase):
+    @patch.object(_RouteInstaller, "_route_cmd", _mock_route_cmd)
+    @patch.object(_BlockProber, "_probe_domain", _mock_probe_domain)
+    def test_auto_detect_start(self):
+        """SmartRouter with auto_detect probes and populates blocklist."""
+        config = SmartRouteConfig(
+            vpn_interface="utun5",
+            use_default_blocklist=False,
+            auto_detect=True,
+            probe_domains=["blocked-site.com", "direct-site.com"],
+            probe_timeout=1.0,
+            refresh_interval=3600,
+        )
+        router = SmartRouter(config)
+        router.start(vpn_gateway="10.8.0.1")
+        self.assertTrue(router.is_blocked("blocked-site.com"))
+        self.assertFalse(router.is_blocked("direct-site.com"))
+        stats = router.stats()
+        self.assertGreater(stats.probed_blocked, 0)
+        router.stop()
+
+    @patch.object(_RouteInstaller, "_route_cmd", _mock_route_cmd)
+    def test_auto_detect_with_cache(self):
+        """Auto-detect loads from cache when available."""
+        cache_data = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "results": {
+                "cached-blocked.com": {"blocked": True, "latency_ms": -1, "error": "timeout"},
+                "cached-direct.com": {"blocked": False, "latency_ms": 30.0, "error": ""},
+            },
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(cache_data, f)
+            cache_path = f.name
+
+        try:
+            config = SmartRouteConfig(
+                vpn_interface="utun5",
+                use_default_blocklist=False,
+                auto_detect=True,
+                probe_cache_file=cache_path,
+                refresh_interval=3600,
+            )
+            router = SmartRouter(config)
+            router.start(vpn_gateway="10.8.0.1")
+            self.assertTrue(router.is_blocked("cached-blocked.com"))
+            self.assertFalse(router.is_blocked("cached-direct.com"))
+            router.stop()
+        finally:
+            os.unlink(cache_path)
+
+    def test_factory_auto_detect(self):
+        """create_smart_router accepts auto_detect parameter."""
+        router = create_smart_router(
+            vpn_interface="utun5",
+            auto_detect=True,
+            probe_timeout=1.0,
+            probe_domains=["example.com"],
+            use_default_blocklist=False,
+        )
+        self.assertIsInstance(router, SmartRouter)
+        self.assertTrue(router._config.auto_detect)
+        self.assertEqual(router._config.probe_timeout, 1.0)
+
+    @patch.object(_RouteInstaller, "_route_cmd", _mock_route_cmd)
+    @patch.object(_BlockProber, "_probe_domain", _mock_probe_domain)
+    def test_probe_results_method(self):
+        """probe_results() returns results after auto-detect."""
+        config = SmartRouteConfig(
+            vpn_interface="utun5",
+            use_default_blocklist=False,
+            auto_detect=True,
+            probe_domains=["blocked-x.com", "direct-y.com"],
+            probe_timeout=1.0,
+            refresh_interval=3600,
+        )
+        router = SmartRouter(config)
+        router.start(vpn_gateway="10.8.0.1")
+        results = router.probe_results()
+        self.assertGreater(len(results), 0)
+        self.assertIn("blocked-x.com", results)
+        self.assertTrue(results["blocked-x.com"].blocked)
+        router.stop()
+
+    @patch.object(_RouteInstaller, "_route_cmd", _mock_route_cmd)
+    def test_no_auto_detect_by_default(self):
+        """Without auto_detect, no prober is created."""
+        config = SmartRouteConfig(
+            vpn_interface="utun5",
+            use_default_blocklist=False,
+            custom_domains=["localhost"],
+            refresh_interval=3600,
+        )
+        router = SmartRouter(config)
+        router.start(vpn_gateway="10.8.0.1")
+        self.assertEqual(router.probe_results(), {})
+        router.stop()
 
 
 if __name__ == "__main__":

@@ -116,6 +116,79 @@ DEFAULT_BLOCKED_DOMAINS = [
     "www.meduza.io",
 ]
 
+# Domains to probe during auto-detection. Covers the most popular sites
+# that may or may not be blocked depending on region/ISP.
+# The prober tests each one and classifies as blocked or direct.
+PROBE_DOMAINS = [
+    # --- Likely blocked in Russia ---
+    "youtube.com",
+    "www.youtube.com",
+    "youtu.be",
+    "instagram.com",
+    "www.instagram.com",
+    "twitter.com",
+    "x.com",
+    "facebook.com",
+    "www.facebook.com",
+    "linkedin.com",
+    "www.linkedin.com",
+    "discord.com",
+    "discord.gg",
+    "discordapp.com",
+    "bbc.com",
+    "www.bbc.com",
+    "bbc.co.uk",
+    "medium.com",
+    "quora.com",
+    "soundcloud.com",
+    "twitch.tv",
+    "www.twitch.tv",
+    "meduza.io",
+    "www.meduza.io",
+    "spotify.com",
+    "open.spotify.com",
+    "reddit.com",
+    "www.reddit.com",
+    "pinterest.com",
+    "tumblr.com",
+    "archive.org",
+    "web.archive.org",
+    "protonmail.com",
+    "proton.me",
+    "signal.org",
+    "t.me",
+    "telegram.org",
+    # --- Likely NOT blocked (control group — should be direct) ---
+    "yandex.ru",
+    "ya.ru",
+    "vk.com",
+    "mail.ru",
+    "ok.ru",
+    "sberbank.ru",
+    "tinkoff.ru",
+    "gosuslugi.ru",
+    "mos.ru",
+    "wildberries.ru",
+    "ozon.ru",
+    "avito.ru",
+    "rutube.ru",
+    "ria.ru",
+    "lenta.ru",
+    "rbc.ru",
+    "dzen.ru",
+    "kinopoisk.ru",
+    # --- International but usually not blocked ---
+    "google.com",
+    "github.com",
+    "stackoverflow.com",
+    "apple.com",
+    "microsoft.com",
+    "amazon.com",
+    "cloudflare.com",
+    "wikipedia.org",
+    "whatsapp.com",
+]
+
 # Domains that should ALWAYS go direct (never through VPN).
 # Russian services, banks, government — always accessible, low latency matters.
 ALWAYS_DIRECT_DOMAINS = [
@@ -142,6 +215,10 @@ _DNS_CACHE_TTL = 600  # 10 minutes
 _DNS_RESOLVE_TIMEOUT = 5.0
 # Blocklist refresh interval.
 _BLOCKLIST_REFRESH_INTERVAL = 3600  # 1 hour
+# Probe timeout for auto-detection (seconds).
+_PROBE_TIMEOUT = 4.0
+# Probe concurrency.
+_PROBE_WORKERS = 20
 
 _DOMAIN_RE = re.compile(
     r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$"
@@ -197,6 +274,27 @@ class SmartRouteConfig:
     original_gateway: str = ""
     original_interface: str = ""
 
+    # --- Auto-detection ---
+    # When True, probe domains on connect to detect which are blocked.
+    # Overrides use_default_blocklist: actual reachability is tested.
+    auto_detect: bool = False
+
+    # Domains to probe during auto-detection.
+    # If empty, uses the built-in PROBE_DOMAINS list.
+    probe_domains: List[str] = field(default_factory=list)
+
+    # Timeout per probe (seconds). Lower = faster but may miss slow sites.
+    probe_timeout: float = _PROBE_TIMEOUT
+
+    # Port to probe (443 = HTTPS, most reliable for DPI detection).
+    probe_port: int = 443
+
+    # Path to cache file for probe results (avoids re-probing on reconnect).
+    probe_cache_file: Optional[str] = None
+
+    # How often to re-probe (seconds). 0 = only on start.
+    reprobe_interval: float = 3600.0
+
 
 @dataclass
 class SmartRouteStats:
@@ -208,6 +306,10 @@ class SmartRouteStats:
     dns_resolve_errors: int = 0
     blocklist_last_updated: str = ""
     mode: str = ""
+    probed_total: int = 0
+    probed_blocked: int = 0
+    probed_direct: int = 0
+    probe_duration_ms: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +604,176 @@ def _is_ip_or_cidr(s: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Auto-detection prober
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ProbeResult:
+    """Result of probing a single domain."""
+    domain: str
+    blocked: bool
+    latency_ms: float  # -1 if unreachable
+    error: str = ""
+
+
+class _BlockProber:
+    """
+    Probes domains to detect whether they are blocked.
+
+    Method: attempt a TCP connect to port 443 (HTTPS) for each domain.
+    - If connection succeeds within timeout → NOT blocked (direct).
+    - If connection fails (timeout, RST, connection refused, DNS NXDOMAIN)
+      → BLOCKED (route through VPN).
+
+    Uses parallel workers for speed (~20 concurrent probes).
+    Results can be cached to disk to avoid re-probing on reconnect.
+    """
+
+    def __init__(self, timeout: float = _PROBE_TIMEOUT, port: int = 443):
+        self._timeout = timeout
+        self._port = port
+        self._results: Dict[str, ProbeResult] = {}
+        self._lock = threading.Lock()
+
+    def probe_all(self, domains: List[str], workers: int = _PROBE_WORKERS) -> List[ProbeResult]:
+        """
+        Probe all domains in parallel. Returns list of ProbeResult.
+
+        Blocked domains: connection failed / timed out.
+        Direct domains: connection succeeded.
+        """
+        results: List[ProbeResult] = []
+        results_lock = threading.Lock()
+
+        def probe_one(domain: str):
+            result = self._probe_domain(domain)
+            with results_lock:
+                results.append(result)
+            with self._lock:
+                self._results[domain] = result
+
+        # Run in batches to limit concurrency.
+        for i in range(0, len(domains), workers):
+            batch = domains[i:i + workers]
+            threads = []
+            for d in batch:
+                t = threading.Thread(target=probe_one, args=(d,), daemon=True)
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join(timeout=self._timeout + 2)
+
+        return results
+
+    def _probe_domain(self, domain: str) -> ProbeResult:
+        """Probe a single domain with TCP connect to port 443."""
+        t0 = time.monotonic()
+        try:
+            sock = socket.create_connection(
+                (domain, self._port), timeout=self._timeout,
+            )
+            latency = (time.monotonic() - t0) * 1000
+            sock.close()
+            return ProbeResult(domain=domain, blocked=False, latency_ms=latency)
+        except socket.timeout:
+            return ProbeResult(domain=domain, blocked=True, latency_ms=-1,
+                               error="timeout")
+        except ConnectionRefusedError:
+            # Connection refused usually means the server exists but refuses
+            # our connection — this is NOT a block. Mark as direct.
+            latency = (time.monotonic() - t0) * 1000
+            return ProbeResult(domain=domain, blocked=False, latency_ms=latency,
+                               error="connection_refused")
+        except ConnectionResetError:
+            # RST is a strong signal of DPI blocking (injected RST).
+            return ProbeResult(domain=domain, blocked=True, latency_ms=-1,
+                               error="connection_reset")
+        except socket.gaierror:
+            # DNS resolution failed — might be DNS poisoning/blocking.
+            return ProbeResult(domain=domain, blocked=True, latency_ms=-1,
+                               error="dns_failed")
+        except OSError as e:
+            # Network unreachable, host unreachable, etc.
+            return ProbeResult(domain=domain, blocked=True, latency_ms=-1,
+                               error=str(e))
+
+    @property
+    def blocked_domains(self) -> Set[str]:
+        with self._lock:
+            return {d for d, r in self._results.items() if r.blocked}
+
+    @property
+    def direct_domains(self) -> Set[str]:
+        with self._lock:
+            return {d for d, r in self._results.items() if not r.blocked}
+
+    @property
+    def all_results(self) -> Dict[str, ProbeResult]:
+        with self._lock:
+            return dict(self._results)
+
+    # ------------------------------------------------------------------
+    # Cache persistence
+    # ------------------------------------------------------------------
+
+    def save_cache(self, path: str) -> None:
+        """Save probe results to a JSON file."""
+        with self._lock:
+            data = {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "results": {
+                    d: {"blocked": r.blocked, "latency_ms": r.latency_ms, "error": r.error}
+                    for d, r in self._results.items()
+                },
+            }
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+            logger.info("smart_route.probe_cache_saved", path=path,
+                        domains=len(self._results))
+        except OSError as e:
+            logger.warning("smart_route.probe_cache_save_error", error=str(e))
+
+    def load_cache(self, path: str) -> bool:
+        """
+        Load probe results from cache. Returns True if cache was loaded.
+        Cache is considered valid for 24 hours.
+        """
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            ts = data.get("timestamp", "")
+            # Check freshness (24h).
+            if ts:
+                import datetime
+                cached_time = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+                age = (datetime.datetime.utcnow() - cached_time).total_seconds()
+                if age > 86400:  # 24 hours
+                    logger.info("smart_route.probe_cache_expired", age_hours=age / 3600)
+                    return False
+
+            results = data.get("results", {})
+            with self._lock:
+                for domain, info in results.items():
+                    self._results[domain] = ProbeResult(
+                        domain=domain,
+                        blocked=info["blocked"],
+                        latency_ms=info.get("latency_ms", -1),
+                        error=info.get("error", ""),
+                    )
+            logger.info("smart_route.probe_cache_loaded", path=path,
+                        domains=len(results))
+            return True
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            return False
+
+
+import json  # needed for cache persistence
+
+
+# ---------------------------------------------------------------------------
 # Route installer
 # ---------------------------------------------------------------------------
 
@@ -611,6 +883,7 @@ class SmartRouter:
         self._config = config
         self._blocklist = _BlocklistManager(config)
         self._dns = _DNSCache(ttl=config.dns_ttl)
+        self._prober: Optional[_BlockProber] = None
         self._installer: Optional[_RouteInstaller] = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -618,6 +891,8 @@ class SmartRouter:
         self._lock = threading.Lock()
         # domain → resolved IPs (for route cleanup when domain is removed)
         self._domain_ips: Dict[str, Set[str]] = {}
+        # Auto-detect probe stats.
+        self._probe_duration_ms: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -626,6 +901,11 @@ class SmartRouter:
     def start(self, vpn_gateway: str = "") -> None:
         """
         Load blocklist, resolve domains, install routes, start background refresh.
+
+        If auto_detect is enabled, probes domains first to determine which are
+        blocked and which work directly. This MUST be called BEFORE the VPN
+        tunnel changes the default route, so probes go through the direct
+        connection.
 
         Args:
             vpn_gateway: IP of the VPN gateway (usually the assigned gateway
@@ -648,8 +928,12 @@ class SmartRouter:
             orig_interface=orig_if,
         )
 
-        # Load blocklist.
-        self._blocklist.load()
+        # --- Auto-detect mode ---
+        if self._config.auto_detect:
+            self._run_auto_detect()
+        else:
+            # Load static blocklist.
+            self._blocklist.load()
 
         # Initial DNS resolution and route installation.
         self._resolve_and_install()
@@ -695,8 +979,22 @@ class SmartRouter:
         """Remove a domain from the blocklist."""
         self._blocklist.remove_domain(domain)
 
+    def probe_results(self) -> Dict[str, ProbeResult]:
+        """Return probe results (only available in auto_detect mode)."""
+        if self._prober:
+            return self._prober.all_results
+        return {}
+
     def stats(self) -> SmartRouteStats:
         """Return current routing statistics."""
+        probed_total = 0
+        probed_blocked = 0
+        probed_direct = 0
+        if self._prober:
+            results = self._prober.all_results
+            probed_total = len(results)
+            probed_blocked = sum(1 for r in results.values() if r.blocked)
+            probed_direct = probed_total - probed_blocked
         return SmartRouteStats(
             blocked_domains=len(self._blocklist.blocked_domains),
             blocked_ips=len(self._blocklist.blocked_ips),
@@ -705,6 +1003,10 @@ class SmartRouter:
             dns_resolve_errors=self._dns.error_count,
             blocklist_last_updated=self._blocklist.last_updated,
             mode=self._config.mode.value,
+            probed_total=probed_total,
+            probed_blocked=probed_blocked,
+            probed_direct=probed_direct,
+            probe_duration_ms=self._probe_duration_ms,
         )
 
     def blocked_domains(self) -> Set[str]:
@@ -726,6 +1028,63 @@ class SmartRouter:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _run_auto_detect(self) -> None:
+        """
+        Probe domains to detect which are blocked. Must be called BEFORE
+        VPN changes the default route so that probes use the direct path.
+        """
+        self._prober = _BlockProber(
+            timeout=self._config.probe_timeout,
+            port=self._config.probe_port,
+        )
+
+        # Try to load cached results first.
+        cache_loaded = False
+        if self._config.probe_cache_file:
+            cache_loaded = self._prober.load_cache(self._config.probe_cache_file)
+
+        if not cache_loaded:
+            # Determine which domains to probe.
+            domains = self._config.probe_domains or list(PROBE_DOMAINS)
+            # Add any custom domains.
+            for d in self._config.custom_domains:
+                d = d.strip().lower()
+                if d and d not in domains:
+                    domains.append(d)
+
+            logger.info("smart_route.auto_detect_starting", domains=len(domains))
+            t0 = time.monotonic()
+            results = self._prober.probe_all(domains)
+            self._probe_duration_ms = (time.monotonic() - t0) * 1000
+
+            blocked = [r for r in results if r.blocked]
+            direct = [r for r in results if not r.blocked]
+            logger.info(
+                "smart_route.auto_detect_complete",
+                total=len(results),
+                blocked=len(blocked),
+                direct=len(direct),
+                duration_ms=round(self._probe_duration_ms),
+            )
+
+            # Log blocked domains for visibility.
+            if blocked:
+                blocked_names = sorted(r.domain for r in blocked)
+                logger.info("smart_route.blocked_detected",
+                            domains=", ".join(blocked_names[:20]),
+                            total=len(blocked_names))
+
+            # Save cache for next reconnect.
+            if self._config.probe_cache_file:
+                self._prober.save_cache(self._config.probe_cache_file)
+
+        # Load static config first (custom_domains, file, URLs), then add
+        # probe results — load() replaces the domain set, so add_domain()
+        # must come after.
+        self._blocklist.load()
+        for domain in self._prober.blocked_domains:
+            self._blocklist.add_domain(domain)
 
     def _resolve_and_install(self) -> None:
         """Resolve all blocked domains and install VPN routes for their IPs."""
@@ -796,6 +1155,10 @@ def create_smart_router(
     blocklist_urls: Optional[List[str]] = None,
     always_direct: Optional[List[str]] = None,
     use_default_blocklist: bool = True,
+    auto_detect: bool = False,
+    probe_cache_file: Optional[str] = None,
+    probe_timeout: float = _PROBE_TIMEOUT,
+    probe_domains: Optional[List[str]] = None,
 ) -> SmartRouter:
     """
     Create a SmartRouter with sensible defaults.
@@ -807,6 +1170,10 @@ def create_smart_router(
         blocklist_urls: URLs to fetch blocklists from.
         always_direct: Domains that should never go through VPN.
         use_default_blocklist: Include hardcoded Russian blocklist.
+        auto_detect: Probe domains at startup to detect blocks.
+        probe_cache_file: Path to cache probe results (JSON).
+        probe_timeout: Timeout per probe in seconds.
+        probe_domains: Domains to probe (defaults to PROBE_DOMAINS).
     """
     config = SmartRouteConfig(
         vpn_interface=vpn_interface,
@@ -815,5 +1182,9 @@ def create_smart_router(
         blocklist_urls=blocklist_urls or [],
         always_direct=always_direct or [],
         use_default_blocklist=use_default_blocklist,
+        auto_detect=auto_detect,
+        probe_cache_file=probe_cache_file,
+        probe_timeout=probe_timeout,
+        probe_domains=probe_domains or [],
     )
     return SmartRouter(config)
