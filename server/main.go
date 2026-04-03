@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -914,11 +915,10 @@ func init() {
 	// and benefits more from fewer GC pauses than from lower memory usage.
 	// This approximately halves GC frequency. The memory trade-off is acceptable:
 	// even at 100 sessions the server uses <100 MB heap.
-	if os.Getenv("GOGC") == "" {
-		os.Setenv("GOGC", "200") //nolint:errcheck
-	}
-	// GOMEMLIMIT: let Go's soft memory limit auto-tune; don't set a hard limit
-	// since the server runs dedicated.
+	//
+	// debug.SetGCPercent is used instead of os.Setenv("GOGC") because the runtime
+	// reads GOGC before init() runs — Setenv would be too late.
+	debug.SetGCPercent(200)
 }
 
 func main() {

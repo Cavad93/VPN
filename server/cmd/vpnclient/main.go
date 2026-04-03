@@ -178,9 +178,11 @@ func (vs *vpnSession) connect() (
 	tc := rawConn.(*net.TCPConn)
 	// Disable Nagle — VPN packets must not be coalesced.
 	_ = tc.SetNoDelay(true)
-	// 8 MB socket buffers — match server-side BDP headroom.
-	_ = tc.SetReadBuffer(8 * 1024 * 1024)
-	_ = tc.SetWriteBuffer(8 * 1024 * 1024)
+	// 16 MB socket buffers — matched to server-side sysctl/netsh tuning.
+	// BDP at 128 Mbps × 93 ms RTT = 1.5 MB; 16 MB provides 10× headroom
+	// for bursts and ensures the TCP window can grow to full link speed.
+	_ = tc.SetReadBuffer(16 * 1024 * 1024)
+	_ = tc.SetWriteBuffer(16 * 1024 * 1024)
 	// TCP keepalive: prevents ISP NAT/firewall from dropping "idle" connections.
 	// This is the PRIMARY fix for the 29-minute disconnect issue.
 	// Russian/Kazakh ISPs expire TCP NAT entries after 60–120 s of no TCP-level
