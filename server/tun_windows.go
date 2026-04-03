@@ -20,6 +20,10 @@ type windowsTun struct {
 	session    wintun.Session
 	closeEvent windows.Handle
 	closeOnce  sync.Once
+	wrMu       sync.Mutex // AllocateSendPacket+SendPacket are NOT thread-safe;
+	// without this lock, 32 handleDataStream goroutines corrupt the Wintun send
+	// ring buffer concurrently, producing garbled IP packets that TCP rejects as
+	// bad checksums — identical to the macOS wrBuf race fixed in tun_darwin.go.
 }
 
 // OpenTun creates a Wintun TUN adapter with the given name and starts a session.
@@ -89,13 +93,24 @@ func (t *windowsTun) Read(p []byte) (int, error) {
 }
 
 // Write sends an IP packet through the TUN adapter.
+//
+// wrMu serialises concurrent calls: the Wintun C library ring buffer is not
+// thread-safe for concurrent writers.  Without this lock, 32 goroutines from
+// handleDataStream (one per bond stream) call AllocateSendPacket and SendPacket
+// simultaneously, overwriting each other's ring-buffer slots and producing
+// corrupted IP packets.  The kernel drops them as bad checksums, which TCP
+// misinterprets as congestion loss, halving every connection's CWND — the
+// primary cause of throughput being ~50% of theoretical maximum.
 func (t *windowsTun) Write(p []byte) (int, error) {
+	t.wrMu.Lock()
 	packet, err := t.session.AllocateSendPacket(len(p))
 	if err != nil {
+		t.wrMu.Unlock()
 		return 0, fmt.Errorf("windowsTun: AllocateSendPacket: %w", err)
 	}
 	copy(packet, p)
 	t.session.SendPacket(packet)
+	t.wrMu.Unlock()
 	return len(p), nil
 }
 
