@@ -109,6 +109,15 @@ class VpnClient(private val config: VpnConfig) {
     }
 
     /**
+     * Sends [len] bytes from [buf] starting at offset 0 — avoids copying a partially-filled
+     * TUN read buffer.
+     */
+    fun sendPacket(buf: ByteArray, len: Int) {
+        checkNotNull(dataStream) { "not connected" }
+        dataStream!!.write(buf, 0, len)
+    }
+
+    /**
      * Receives a raw IPv4 packet from the data stream.
      * Blocks until a packet arrives or the stream closes.
      */

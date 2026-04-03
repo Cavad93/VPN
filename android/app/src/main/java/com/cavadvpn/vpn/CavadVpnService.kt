@@ -203,12 +203,13 @@ class CavadVpnService : VpnService() {
         coroutineScope {
             // TUN → server
             val tunToServer = launch(Dispatchers.IO) {
-                val buf = ByteArray(client.routeInfo?.let { 1500 } ?: 1500)
+                // 65536 covers any IPv4 packet (max 65535 bytes); buffer is reused each iteration
+                val buf = ByteArray(65536)
                 try {
                     while (isActive) {
                         val len = tunIn.read(buf)
                         if (len <= 0) break
-                        client.sendPacket(buf.copyOf(len))
+                        client.sendPacket(buf, len) // zero-copy: no buf.copyOf(len)
                         bytesOut.addAndGet(len.toLong())
                     }
                 } catch (e: Exception) {

@@ -68,9 +68,19 @@ class MuxStream(
      */
     fun write(data: ByteArray) {
         check(!closed.get()) { "stream $streamId is closed" }
-        var offset = 0
-        while (offset < data.size) {
-            val end = minOf(offset + MAX_MUX_PAYLOAD, data.size)
+        write(data, 0, data.size)
+    }
+
+    /**
+     * Sends [length] bytes from [data] starting at [dataOffset] as one or more DATA frames.
+     * Avoids a copy in the caller (e.g. TUN read buffer partial fill).
+     */
+    fun write(data: ByteArray, dataOffset: Int, length: Int) {
+        check(!closed.get()) { "stream $streamId is closed" }
+        var offset = dataOffset
+        val end0 = dataOffset + length
+        while (offset < end0) {
+            val end = minOf(offset + MAX_MUX_PAYLOAD, end0)
             mux.writeFrame(streamId, FRAME_DATA, data, offset, end - offset)
             offset = end
         }
@@ -130,8 +140,13 @@ class MuxStream(
         }
     }
 
-    // Called by the read-loop to deliver incoming data
-    internal fun deliver(data: ByteArray) { queue.offer(data) }
+    // Called by the read-loop to deliver incoming data (slice of decrypted frame — no copy)
+    internal fun deliver(data: ByteArray, offset: Int, length: Int) {
+        if (length <= 0) return
+        // Extract the slice so the full decrypted frame buffer can be GC'd independently
+        val slice = data.copyOfRange(offset, offset + length)
+        queue.offer(slice)
+    }
 
     // Called by the read-loop when the remote sends FIN
     internal fun signalFin() {
@@ -225,13 +240,16 @@ class ClientMux(private val conn: NoiseConn) {
 
             if (frameData.size < MUX_HEADER_SIZE) continue
 
-            val buf = ByteBuffer.wrap(frameData)
-            val sid = buf.int
-            val frameType = buf.get()
-            val payloadLen = buf.short.toInt() and 0xFFFF
-            val payload = if (payloadLen > 0 && frameData.size >= MUX_HEADER_SIZE + payloadLen) {
-                frameData.copyOfRange(MUX_HEADER_SIZE, MUX_HEADER_SIZE + payloadLen)
-            } else ByteArray(0)
+            // Decode 7-byte header without ByteBuffer allocation
+            val sid = ((frameData[0].toInt() and 0xFF) shl 24) or
+                      ((frameData[1].toInt() and 0xFF) shl 16) or
+                      ((frameData[2].toInt() and 0xFF) shl  8) or
+                       (frameData[3].toInt() and 0xFF)
+            val frameType = frameData[4]
+            val payloadLen = ((frameData[5].toInt() and 0xFF) shl 8) or (frameData[6].toInt() and 0xFF)
+            // Reuse the decrypted frame buffer — deliver the slice instead of copying
+            val payloadStart = MUX_HEADER_SIZE
+            val hasPayload = payloadLen > 0 && frameData.size >= payloadStart + payloadLen
 
             val stream = synchronized(streamsLock) { streams[sid] }
 
@@ -244,7 +262,7 @@ class ClientMux(private val conn: NoiseConn) {
                     }
                 }
                 FRAME_DATA -> {
-                    if (stream != null && payload.isNotEmpty()) stream.deliver(payload)
+                    if (stream != null && hasPayload) stream.deliver(frameData, payloadStart, payloadLen)
                 }
                 FRAME_FIN -> {
                     stream?.signalFin()
