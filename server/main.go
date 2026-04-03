@@ -681,6 +681,14 @@ func (nc *noiseConn) Write(p []byte) (int, error) {
 }
 
 // Read decrypts the next frame into p.
+//
+// Optimisation: reads the entire noise frame (2-byte length + ciphertext) from
+// ObfsConn in a single Read call instead of two separate io.ReadFull calls.
+// Since noiseConn.Write always sends [length‖ciphertext] as one ObfsConn.Write,
+// each TLS record contains exactly one complete noise frame. A single Read into
+// the 65 KB recvBuf triggers ObfsConn's zero-alloc fast path (read directly
+// into the caller's buffer without intermediate make([]byte)), eliminating one
+// heap allocation per received packet.
 func (nc *noiseConn) Read(p []byte) (int, error) {
 	// Drain buffered remainder first.
 	if len(nc.readBuf) > 0 {
@@ -689,33 +697,47 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
-	// Read 2-byte length prefix into the start of the reusable buffer so we
-	// avoid a separate stack allocation.
-	if _, err := io.ReadFull(nc.conn, nc.recvBuf[:2]); err != nil {
+	// Read the complete noise frame from ObfsConn in one call.
+	// ObfsConn returns exactly one TLS record payload per Read, and each
+	// record contains one complete noise frame [2-byte len ‖ ciphertext].
+	// Passing the full recvBuf (65 KB) triggers ObfsConn's zero-alloc fast
+	// path: the TLS payload is read directly into recvBuf without make().
+	n, err := nc.conn.Read(nc.recvBuf[:])
+	if err != nil {
 		return 0, err
 	}
-	frameLen := int(binary.BigEndian.Uint16(nc.recvBuf[:2]))
-	if frameLen > maxNoiseFrame {
-		return 0, fmt.Errorf("noiseConn: frame too large (%d)", frameLen)
+	if n < 2 {
+		return 0, fmt.Errorf("noiseConn: frame too short (%d bytes)", n)
 	}
 
-	// Read the encrypted frame into the reusable buffer — zero allocation.
-	if _, err := io.ReadFull(nc.conn, nc.recvBuf[:frameLen]); err != nil {
-		return 0, err
+	frameLen := int(binary.BigEndian.Uint16(nc.recvBuf[:2]))
+	if frameLen == 0 || frameLen > maxNoiseFrame {
+		return 0, fmt.Errorf("noiseConn: frame size %d out of range", frameLen)
+	}
+
+	// Common case: the entire ciphertext arrived in the same TLS record.
+	// Rare fallback: read remaining bytes if the TLS record was short.
+	have := n - 2
+	if have < frameLen {
+		if _, err := io.ReadFull(nc.conn, nc.recvBuf[n:2+frameLen]); err != nil {
+			return 0, err
+		}
 	}
 
 	// Decrypt into pre-allocated buffer — zero allocation per packet.
-	plaintext, err := nc.session.RecvCipher.DecryptTo(nc.decryptBuf[:], nc.recvBuf[:frameLen], nil)
+	plaintext, err := nc.session.RecvCipher.DecryptTo(nc.decryptBuf[:], nc.recvBuf[2:2+frameLen], nil)
 	if err != nil {
 		return 0, fmt.Errorf("noiseConn decrypt: %w", err)
 	}
 
-	n := copy(p, plaintext)
-	if n < len(plaintext) {
+	nc2 := copy(p, plaintext)
+	if nc2 < len(plaintext) {
 		// Rare: caller's buffer smaller than one decrypted packet.
-		nc.readBuf = append(nc.readBuf[:0], plaintext[n:]...)
+		// Zero-copy: sub-slice of decryptBuf, safe because decryptBuf
+		// is not overwritten until the next decrypt (readBuf is drained first).
+		nc.readBuf = plaintext[nc2:]
 	}
-	return n, nil
+	return nc2, nil
 }
 
 func (nc *noiseConn) Close() error                       { return nc.conn.Close() }

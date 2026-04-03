@@ -88,19 +88,31 @@ func (nc *noiseConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// Read decrypts the next frame into p. Single-read optimisation: reads the
+// entire noise frame from ObfsConn in one call, triggering ObfsConn's
+// zero-alloc fast path (payload read directly into recvBuf without make()).
 func (nc *noiseConn) Read(p []byte) (int, error) {
 	for len(nc.readBuf) == 0 {
-		if _, err := io.ReadFull(nc.conn, nc.recvBuf[:2]); err != nil {
+		// Single Read into the full recvBuf triggers ObfsConn's zero-alloc path.
+		nr, err := nc.conn.Read(nc.recvBuf[:])
+		if err != nil {
 			return 0, err
+		}
+		if nr < 2 {
+			return 0, fmt.Errorf("noiseConn: frame too short (%d)", nr)
 		}
 		fl := int(binary.BigEndian.Uint16(nc.recvBuf[:2]))
-		if fl == 0 || fl > len(nc.recvBuf) {
+		if fl == 0 || fl > len(nc.recvBuf)-2 {
 			return 0, fmt.Errorf("noiseConn: bad frame len %d", fl)
 		}
-		if _, err := io.ReadFull(nc.conn, nc.recvBuf[:fl]); err != nil {
-			return 0, err
+		// Common case: TLS record contained the complete noise frame.
+		// Rare fallback: read remaining ciphertext bytes.
+		if have := nr - 2; have < fl {
+			if _, err := io.ReadFull(nc.conn, nc.recvBuf[nr:2+fl]); err != nil {
+				return 0, err
+			}
 		}
-		plain, err := nc.session.RecvCipher.DecryptTo(nc.decryptBuf[:], nc.recvBuf[:fl], nil)
+		plain, err := nc.session.RecvCipher.DecryptTo(nc.decryptBuf[:], nc.recvBuf[2:2+fl], nil)
 		if err != nil {
 			return 0, fmt.Errorf("noiseConn decrypt: %w", err)
 		}
@@ -298,6 +310,36 @@ func (vs *vpnSession) connect() (
 
 var log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+// applyMacOSTuning sets kernel parameters for optimal TCP throughput on macOS.
+// The vpnclient runs as root, so sysctl writes succeed. Best-effort: failures
+// are logged but do not prevent the VPN from starting.
+//
+// Key settings:
+//   - maxsockbuf=16 MB: allows SO_RCVBUF/SO_SNDBUF up to 16 MB per socket
+//   - sendspace/recvspace=1 MB: default TCP buffer per new socket (auto-tuning
+//     grows it further). macOS default is 128 KB which limits initial throughput.
+//   - tcp_fastopen=3: enable TFO for both client and server
+//   - delayed_ack=0: disable 100 ms delayed ACK timer (macOS equivalent of
+//     Linux TCP_QUICKACK). This is the highest-impact fix for download speed:
+//     without it, the server's congestion window can only grow once per
+//     100 ms + 93 ms = 193 ms round-trip, capping download at ~5 Mbps.
+func applyMacOSTuning() {
+	sysctls := map[string]string{
+		"kern.ipc.maxsockbuf":          "16777216",
+		"net.inet.tcp.sendspace":       "1048576",
+		"net.inet.tcp.recvspace":       "1048576",
+		"net.inet.tcp.delayed_ack":     "0",
+		"net.inet.tcp.mssdflt":         "1440",
+		"net.inet.tcp.win_scale_factor": "8",
+		"net.inet.tcp.fastopen":        "3",
+	}
+	for k, v := range sysctls {
+		if out, err := exec.Command("sysctl", "-w", k+"="+v).CombinedOutput(); err != nil {
+			log.Debug("sysctl failed (non-fatal)", "key", k, "err", string(out))
+		}
+	}
+}
+
 func run() error {
 	serverAddr := flag.String("server", "", "VPN server host:port (required)")
 	keyFile := flag.String("key", "client_privkey.hex", "path to hex-encoded private key file")
@@ -308,6 +350,10 @@ func run() error {
 		flag.Usage()
 		return fmt.Errorf("flag -server is required")
 	}
+
+	// Apply macOS TCP kernel tuning before opening any sockets.
+	// Must run as root (vpnclient always runs with sudo).
+	applyMacOSTuning()
 
 	// Load or generate the client key pair.
 	kp, err := loadKey(*keyFile)

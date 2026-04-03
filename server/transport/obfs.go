@@ -153,20 +153,47 @@ func (c *ObfsConn) Write(p []byte) (int, error) {
 // Read reads data from incoming TLS application_data records.
 // Implements io.Reader.  Bytes that do not fit into p are buffered for the
 // next call.
+//
+// Optimisation: when the caller's buffer p is large enough to hold the entire
+// TLS record payload, the payload is read directly into p without any
+// intermediate allocation. This eliminates one make([]byte, ~1460) per packet
+// on the hot path (~2500 allocs/s at 30 Mbps). The caller (noiseConn.Read)
+// always passes a 65 KB buffer, so this fast path hits ~100% of the time.
 func (c *ObfsConn) Read(p []byte) (int, error) {
 	if len(c.readBuf) > 0 {
 		n := copy(p, c.readBuf)
 		c.readBuf = c.readBuf[n:]
 		return n, nil
 	}
-	payload, err := c.readRecord(tlsRecordAppData)
-	if err != nil {
+
+	// Read the TLS record header to learn the payload length.
+	if _, err := io.ReadFull(c.bufr, c.hdr[:]); err != nil {
+		return 0, err
+	}
+	if c.hdr[0] != tlsRecordAppData {
+		return 0, errors.New("obfs: unexpected TLS record content type")
+	}
+	length := int(binary.BigEndian.Uint16(c.hdr[3:5]))
+	if length == 0 || length > maxObfsPayload {
+		return 0, errors.New("obfs: invalid TLS record length")
+	}
+
+	if len(p) >= length {
+		// Fast path: caller's buffer is large enough — read directly into p.
+		// Zero allocation, zero copy.
+		if _, err := io.ReadFull(c.bufr, p[:length]); err != nil {
+			return 0, err
+		}
+		return length, nil
+	}
+
+	// Slow path: payload larger than p — allocate, copy what fits, buffer rest.
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(c.bufr, payload); err != nil {
 		return 0, err
 	}
 	n := copy(p, payload)
 	if n < len(payload) {
-		// Save the remainder for the next Read call as a zero-copy sub-slice.
-		// Safe because readRecord allocates a fresh buffer for each TLS record.
 		c.readBuf = payload[n:]
 	}
 	return n, nil
@@ -195,7 +222,8 @@ func (c *ObfsConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteD
 // ---------------------------------------------------------------------------
 
 // readRecord reads exactly one TLS record and validates its content type.
-// It reuses c.hdr to avoid a heap allocation on every call in the hot path.
+// Used only during handshake; the hot-path Read() inlines the header parsing
+// to avoid the intermediate allocation.
 // Reads go through the buffered reader (c.bufr) to reduce syscalls.
 func (c *ObfsConn) readRecord(wantType byte) ([]byte, error) {
 	if _, err := io.ReadFull(c.bufr, c.hdr[:]); err != nil {
