@@ -1,3 +1,5 @@
+//go:build darwin
+
 // cmd/vpnclient — native Go VPN client for macOS.
 //
 // Replaces the Python client. Uses the same crypto and transport packages as

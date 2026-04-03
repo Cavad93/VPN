@@ -1,4 +1,4 @@
-vpnclient
-vpnclient_amd64
-vpnclient_arm64
-server
+/vpnclient
+/vpnclient_amd64
+/vpnclient_arm64
+/server
