@@ -1,124 +1,98 @@
-/// ReplayFilter.swift — Sliding window replay protection
-///
-/// Wire-compatible with Go server (server/crypto/replay.go) and Python/Kotlin implementations.
-///
-/// Each packet carries a 20-byte header:
-///   - 8 bytes: timestamp (seconds since Unix epoch, big-endian uint64)
-///   - 12 bytes: random nonce
-///
-/// The filter rejects packets that are:
-///   - More than 90 seconds in the past
-///   - More than 90 seconds in the future
-///   - Previously seen (replay)
+// ReplayFilter.swift — Sliding window replay protection (±90 seconds)
+// Wire-compatible with Go server crypto/replay.go
 
 import Foundation
 
 // MARK: - Constants
 
-private let PACKET_HEADER_SIZE = 20  // 8 (timestamp) + 12 (nonce)
-private let WINDOW_SECONDS: Int64 = 90
+/// Size in bytes of an encoded PacketHeader.
+public let packetHeaderSize = 20
+
+/// Sliding window half-width in seconds.
+public let replayWindowSecs: Int64 = 90
 
 // MARK: - PacketHeader
 
-/// 20-byte packet header: timestamp (8 bytes) + nonce (12 bytes).
-public struct PacketHeader {
-    public let timestamp: UInt64  // Unix seconds
-    public let nonce: [UInt8]     // 12 random bytes
+/// Per-packet timestamp + nonce used for replay protection.
+/// Encoding: 8-byte big-endian timestamp + 12-byte nonce = 20 bytes.
+public struct PacketHeader: Equatable {
+    public let timestamp: Int64  // Unix seconds
+    public let nonce: Data       // 12 bytes
 
-    public init(timestamp: UInt64, nonce: [UInt8]) {
-        precondition(nonce.count == 12, "PacketHeader: nonce must be 12 bytes")
+    public init(timestamp: Int64, nonce: Data) {
+        precondition(nonce.count == nonceSize, "nonce must be \(nonceSize) bytes")
         self.timestamp = timestamp
-        self.nonce = nonce
+        self.nonce     = nonce
     }
 
-    /// Create a new header with current time and random nonce.
-    public static func create() -> PacketHeader {
-        let ts = UInt64(Date().timeIntervalSince1970)
-        let nonce = generateRandomBytes(count: 12)
-        return PacketHeader(timestamp: ts, nonce: nonce)
-    }
-
-    /// Serialize to 20 bytes: timestamp (8, big-endian) + nonce (12).
-    public func encode() -> [UInt8] {
-        var buf = [UInt8](repeating: 0, count: PACKET_HEADER_SIZE)
-        var ts = timestamp
-        for i in stride(from: 7, through: 0, by: -1) {
-            buf[i] = UInt8(ts & 0xFF)
-            ts >>= 8
-        }
-        buf.replaceSubrange(8..<20, with: nonce)
+    /// Encodes the header as 20 bytes (big-endian timestamp + nonce).
+    public func encode() -> Data {
+        var buf = Data(capacity: packetHeaderSize)
+        var ts = timestamp.bigEndian
+        withUnsafeBytes(of: &ts) { buf.append(contentsOf: $0) }
+        buf.append(nonce)
         return buf
-    }
-
-    /// Deserialize from 20 bytes.
-    public static func decode(_ data: [UInt8]) throws -> PacketHeader {
-        guard data.count >= PACKET_HEADER_SIZE else {
-            throw ReplayError.headerTooShort(data.count)
-        }
-        var ts: UInt64 = 0
-        for i in 0..<8 {
-            ts = (ts << 8) | UInt64(data[i])
-        }
-        let nonce = Array(data[8..<20])
-        return PacketHeader(timestamp: ts, nonce: nonce)
     }
 }
 
-// MARK: - ReplayError
+/// Creates a PacketHeader with the current Unix second and a random nonce.
+public func newPacketHeader() -> PacketHeader {
+    let nonce = generateRandomData(count: nonceSize)
+    return PacketHeader(timestamp: Int64(Date().timeIntervalSince1970), nonce: nonce)
+}
 
-public enum ReplayError: Error {
-    case headerTooShort(Int)
-    case tooOld
-    case tooFuture
-    case duplicate
+/// Deserialises a PacketHeader from data (must be at least 20 bytes).
+public func decodePacketHeader(_ data: Data) throws -> PacketHeader {
+    guard data.count >= packetHeaderSize else {
+        throw ReplayError.dataTooShort(data.count)
+    }
+    let tsBytes = data.prefix(8)
+    let ts = tsBytes.withUnsafeBytes { $0.load(as: Int64.self).bigEndian }
+    let nonce = data[8 ..< 20]
+    return PacketHeader(timestamp: ts, nonce: Data(nonce))
 }
 
 // MARK: - ReplayFilter
 
-/// Thread-safe sliding window replay filter.
-///
-/// Stores seen nonces grouped by second-granularity timestamp bucket.
-/// Automatically cleans up old buckets during Check().
-public class ReplayFilter {
-    // Map from timestamp (seconds) to set of nonce strings seen in that second
+/// Thread-safe replay filter with a ±REPLAY_WINDOW_SECS sliding time window.
+/// Packets outside the window or with a previously seen (timestamp, nonce) pair
+/// are rejected.
+public final class ReplayFilter {
+    // second → set of hex-encoded nonces seen in that second
     private var buckets: [Int64: Set<String>] = [:]
     private let lock = NSLock()
 
     public init() {}
 
-    /// Check if a packet header is valid (not replayed, not stale, not from the future).
-    /// On success, records the nonce so future duplicates are rejected.
-    ///
-    /// - Throws: ReplayError if packet is rejected
-    public func check(_ header: PacketHeader) throws {
-        let now = Int64(Date().timeIntervalSince1970)
-        let pktTime = Int64(header.timestamp)
-
-        if pktTime < now - WINDOW_SECONDS {
-            throw ReplayError.tooOld
-        }
-        if pktTime > now + WINDOW_SECONDS {
-            throw ReplayError.tooFuture
-        }
-
-        let nonceKey = header.nonce.map { String(format: "%02x", $0) }.joined()
-
+    /// Returns `true` if `header` is a fresh packet (and records it).
+    /// Returns `false` if the packet is a replay or outside the time window.
+    @discardableResult
+    public func check(_ header: PacketHeader) -> Bool {
         lock.lock()
         defer { lock.unlock() }
 
-        // Check for duplicate
-        if buckets[pktTime]?.contains(nonceKey) == true {
-            throw ReplayError.duplicate
+        let nowSec = Int64(Date().timeIntervalSince1970)
+        let windowStart = nowSec - replayWindowSecs
+        let windowEnd   = nowSec + replayWindowSecs
+
+        guard header.timestamp >= windowStart, header.timestamp <= windowEnd else {
+            return false
         }
 
-        // Record nonce
-        if buckets[pktTime] == nil {
-            buckets[pktTime] = Set<String>()
-        }
-        buckets[pktTime]!.insert(nonceKey)
+        // Evict stale buckets
+        buckets = buckets.filter { $0.key >= windowStart }
 
-        // Cleanup old buckets
-        let cutoff = now - WINDOW_SECONDS - 1
-        buckets = buckets.filter { $0.key > cutoff }
+        let nonceHex = header.nonce.map { String(format: "%02x", $0) }.joined()
+        if buckets[header.timestamp]?.contains(nonceHex) == true {
+            return false
+        }
+        buckets[header.timestamp, default: []].insert(nonceHex)
+        return true
     }
+}
+
+// MARK: - Errors
+
+public enum ReplayError: Error {
+    case dataTooShort(Int)
 }

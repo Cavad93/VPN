@@ -1,121 +1,78 @@
-/// NoiseHandshake.swift — Noise_XX handshake (initiator/client side)
-///
-/// Pattern:  -> e  |  <- e, ee, s, es  |  -> s, se
-///
-/// Wire-compatible with:
-///   - Go server (server/crypto/handshake.go)
-///   - Python client (client/core.py — NoiseHandshake class)
-///   - Kotlin Android (NoiseHandshake.kt)
+// NoiseHandshake.swift — Noise_XX initiator handshake (wire-compatible with Go server)
+//
+// Pattern:
+//   -> e              (Message 1: 32 bytes)
+//   <- e, ee, s, es   (Message 2: 80 bytes)
+//   -> s, se          (Message 3: 48 bytes)
 
 import Foundation
 import Crypto
 
-// MARK: - Protocol name
+// MARK: - Protocol constants
 
-private let PROTOCOL_NAME = "Noise_XX_25519_ChaChaPoly_SHA256"
-
-// MARK: - NoiseCipherState
-
-/// Manages a ChaCha20-Poly1305 cipher with an auto-incrementing nonce counter.
-///
-/// Nonce format: 4 zero bytes + 8-byte little-endian counter (12 bytes total).
-/// This matches the Python and Kotlin implementations.
-public class NoiseCipherState {
-    private var key: [UInt8]
-    private var counter: UInt64 = 0
-
-    public init(key: [UInt8]) {
-        precondition(key.count == KEY_SIZE, "NoiseCipherState: key must be \(KEY_SIZE) bytes")
-        self.key = key
-    }
-
-    public func encrypt(_ plaintext: [UInt8], aad: [UInt8] = []) throws -> [UInt8] {
-        let nonce = buildNonce(counter)
-        counter += 1
-        return try chaCha20Poly1305Encrypt(key: key, nonce: nonce, plaintext: plaintext, aad: aad)
-    }
-
-    public func decrypt(_ ciphertext: [UInt8], aad: [UInt8] = []) throws -> [UInt8] {
-        let nonce = buildNonce(counter)
-        counter += 1
-        return try chaCha20Poly1305Decrypt(key: key, nonce: nonce, ciphertext: ciphertext, aad: aad)
-    }
-
-    /// Build 12-byte nonce: 4 zero bytes + 8-byte little-endian counter.
-    private func buildNonce(_ n: UInt64) -> [UInt8] {
-        var nonce = [UInt8](repeating: 0, count: NONCE_SIZE)
-        // bytes 0..3 are already zero
-        // bytes 4..11: little-endian uint64
-        var val = n
-        for i in 4..<12 {
-            nonce[i] = UInt8(val & 0xFF)
-            val >>= 8
-        }
-        return nonce
-    }
-}
+private let protocolName = "Noise_XX_25519_ChaChaPoly_SHA256"
 
 // MARK: - NoiseSymmetricState
 
 /// Tracks the chaining key and transcript hash during a Noise handshake.
-internal class NoiseSymmetricState {
-    var ck: [UInt8]
-    var h: [UInt8]
-    var cs: NoiseCipherState?
+final class NoiseSymmetricState {
+    private(set) var h: Data    // transcript hash
+    private(set) var ck: Data   // chaining key
+    private var cs: NoiseCipherState
 
     init() {
-        let nameBytes = Array(PROTOCOL_NAME.utf8)
-        // Noise spec: if len(name) <= HASHLEN, pad with zeros; else SHA-256
-        let initial: [UInt8]
-        if nameBytes.count <= KEY_SIZE {
-            var padded = [UInt8](repeating: 0, count: KEY_SIZE)
+        let nameBytes = Data(protocolName.utf8)
+        // Per Noise spec: if len(name) <= HASHLEN, pad with zeros; else SHA-256.
+        let initial: Data
+        if nameBytes.count <= keySize {
+            var padded = Data(repeating: 0, count: keySize)
             padded.replaceSubrange(0..<nameBytes.count, with: nameBytes)
             initial = padded
         } else {
-            initial = Array(SHA256.hash(data: Data(nameBytes)))
+            initial = Data(SHA256.hash(data: nameBytes))
         }
-        self.ck = initial
-        self.h = initial
+        h  = initial
+        ck = initial
+        cs = NoiseCipherState()
     }
 
-    func mixHash(_ data: [UInt8]) {
+    func mixHash(_ data: Data) {
         var hasher = SHA256()
-        hasher.update(data: Data(h))
-        hasher.update(data: Data(data))
-        h = Array(hasher.finalize())
+        hasher.update(data: h)
+        hasher.update(data: data)
+        h = Data(hasher.finalize())
     }
 
-    func mixKey(_ ikm: [UInt8]) {
+    func mixKey(_ ikm: Data) {
         let outputs = noiseHKDF(ck: ck, ikm: ikm, n: 2)
         ck = outputs[0]
-        cs = NoiseCipherState(key: outputs[1])
+        cs = NoiseCipherState()
+        cs.initializeKey(outputs[1])
     }
 
-    func encryptAndHash(_ plaintext: [UInt8]) throws -> [UInt8] {
-        let ciphertext: [UInt8]
-        if let cs = cs {
-            ciphertext = try cs.encrypt(plaintext, aad: h)
-        } else {
-            ciphertext = plaintext
-        }
+    func encryptAndHash(_ plaintext: Data) throws -> Data {
+        let ciphertext = try cs.hasKey
+            ? cs.encrypt(plaintext: plaintext, aad: h)
+            : plaintext
         mixHash(ciphertext)
         return ciphertext
     }
 
-    func decryptAndHash(_ ciphertext: [UInt8]) throws -> [UInt8] {
-        let plaintext: [UInt8]
-        if let cs = cs {
-            plaintext = try cs.decrypt(ciphertext, aad: h)
-        } else {
-            plaintext = ciphertext
-        }
+    func decryptAndHash(_ ciphertext: Data) throws -> Data {
+        let plaintext = try cs.hasKey
+            ? cs.decrypt(ciphertext: ciphertext, aad: h)
+            : ciphertext
         mixHash(ciphertext)
         return plaintext
     }
 
     func split() -> (NoiseCipherState, NoiseCipherState) {
-        let outputs = noiseHKDF(ck: ck, ikm: [], n: 2)
-        return (NoiseCipherState(key: outputs[0]), NoiseCipherState(key: outputs[1]))
+        let outputs = noiseHKDF(ck: ck, ikm: Data(), n: 2)
+        let c1 = NoiseCipherState()
+        c1.initializeKey(outputs[0])
+        let c2 = NoiseCipherState()
+        c2.initializeKey(outputs[1])
+        return (c1, c2)
     }
 }
 
@@ -123,117 +80,102 @@ internal class NoiseSymmetricState {
 
 /// Result of a completed Noise_XX handshake.
 public struct NoiseSession {
-    /// Cipher for encrypting outgoing messages (initiator → responder).
     public let sendCipher: NoiseCipherState
-    /// Cipher for decrypting incoming messages (responder → initiator).
     public let recvCipher: NoiseCipherState
-    /// 32-byte public key of the authenticated remote peer.
-    public let remoteStatic: [UInt8]
+    public let remoteStatic: Data  // 32-byte peer public key
 
-    public init(sendCipher: NoiseCipherState, recvCipher: NoiseCipherState, remoteStatic: [UInt8]) {
-        self.sendCipher = sendCipher
-        self.recvCipher = recvCipher
+    init(sendCipher: NoiseCipherState, recvCipher: NoiseCipherState, remoteStatic: Data) {
+        self.sendCipher   = sendCipher
+        self.recvCipher   = recvCipher
         self.remoteStatic = remoteStatic
     }
 }
 
-// MARK: - Noise errors
+// MARK: - NoiseHandshake
 
-public enum NoiseError: Error {
-    case invalidStep(Int)
-    case messageTooShort(Int, Int)
-}
-
-// MARK: - NoiseHandshake (initiator)
-
-/// Noise_XX handshake for the initiator (client) role.
-///
-/// Pattern:
-/// ```
-/// -> e              (message 1: send ephemeral public key)
-/// <- e, ee, s, es   (message 2: recv responder's ephemeral + encrypted static)
-/// -> s, se          (message 3: send encrypted initiator static)
-/// ```
-public class NoiseHandshake {
+/// Noise_XX initiator (client-side) handshake.
+public final class NoiseHandshake {
     private let staticKP: KeyPair
     private let ss = NoiseSymmetricState()
-    private var e: KeyPair?        // our ephemeral key pair
-    private var re: [UInt8]?       // remote ephemeral public key
-    private var rs: [UInt8]?       // remote static public key
+    private var ephemeralKP: KeyPair?
+    private var remoteEphemeral: Data?
+    private var remoteStatic: Data?
     private var step = 0
 
-    public init(staticKeyPair: KeyPair) {
-        self.staticKP = staticKeyPair
-        // Empty prologue: mix hash of empty bytes
-        ss.mixHash([])
+    public init(staticKP: KeyPair) {
+        self.staticKP = staticKP
+        ss.mixHash(Data()) // empty prologue
     }
 
-    /// Message 1 (-> e): generate ephemeral key pair, mix hash, return 32-byte public key.
-    public func writeMessage1() throws -> [UInt8] {
+    // MARK: Message 1: -> e
+
+    /// Generates an ephemeral key pair, mixes the public key into h, and returns the 32-byte public key.
+    public func writeMessage1() throws -> Data {
         guard step == 0 else { throw NoiseError.invalidStep(step) }
         let eph = generateKeyPair()
-        e = eph
-        ss.mixHash(eph.publicKeyBytes)
+        ephemeralKP = eph
+        ss.mixHash(eph.publicKey)
         step = 1
-        return eph.publicKeyBytes
+        return eph.publicKey
     }
 
-    /// Message 2 (<- e, ee, s, es): process 80-byte server message.
-    /// Expected format: re_pub(32) + EncryptAndHash(s)(48)
-    public func readMessage2(_ msg: [UInt8]) throws {
+    // MARK: Message 2: <- e, ee, s, es
+
+    /// Processes the 80-byte server message: re.pub(32) + EncryptAndHash(s)(48).
+    public func readMessage2(_ msg: Data) throws {
         guard step == 1 else { throw NoiseError.invalidStep(step) }
-        let minLen = KEY_SIZE + KEY_SIZE + AEAD_OVERHEAD  // 80 bytes
-        guard msg.count >= minLen else {
-            throw NoiseError.messageTooShort(msg.count, minLen)
-        }
+        let minLen = keySize + keySize + aeadOverhead   // 32 + 32 + 16 = 80
+        guard msg.count >= minLen else { throw NoiseError.messageTooShort(msg.count, minLen) }
+        guard let eph = ephemeralKP else { throw NoiseError.internalError("no ephemeral key") }
 
-        // <- e: remote ephemeral
-        let re_ = Array(msg[0..<KEY_SIZE])
-        re = re_
-        ss.mixHash(re_)
+        // <- e
+        let re = msg.prefix(keySize)
+        remoteEphemeral = re
+        ss.mixHash(re)
 
-        // ee: DH(e_init, e_resp)
-        guard let e = e else { throw NoiseError.invalidStep(step) }
-        let ee = try diffieHellman(privateKey: e.privateKey, publicKeyBytes: re_)
+        // ee = DH(e_init, e_resp)
+        let ee = try diffieHellman(privateKey: eph.privateKey, publicKey: Data(re))
         ss.mixKey(ee)
 
-        // s: decrypt remote static public key
-        let encS = Array(msg[KEY_SIZE..<(KEY_SIZE + KEY_SIZE + AEAD_OVERHEAD)])
-        let plainS = try ss.decryptAndHash(encS)
-        rs = plainS
+        // s: decrypt remote static
+        let encS = msg[keySize ..< keySize + keySize + aeadOverhead]
+        let rs = try ss.decryptAndHash(Data(encS))
+        remoteStatic = rs
 
-        // es: DH(e_init, s_resp)
-        guard let rs = rs else { throw NoiseError.invalidStep(step) }
-        let es = try diffieHellman(privateKey: e.privateKey, publicKeyBytes: rs)
+        // es = DH(e_init, s_resp)
+        let es = try diffieHellman(privateKey: eph.privateKey, publicKey: rs)
         ss.mixKey(es)
 
         step = 2
     }
 
-    /// Message 3 (-> s, se): encrypt static key, perform se DH, split into session ciphers.
-    /// Returns (48-byte message, NoiseSession).
-    public func writeMessage3() throws -> ([UInt8], NoiseSession) {
+    // MARK: Message 3: -> s, se
+
+    /// Encrypts our static public key, does se DH mix, splits into send/recv ciphers.
+    /// - Returns: `(48-byte message, NoiseSession)`
+    public func writeMessage3() throws -> (Data, NoiseSession) {
         guard step == 2 else { throw NoiseError.invalidStep(step) }
+        guard let re = remoteEphemeral else { throw NoiseError.internalError("no remote ephemeral") }
+        guard let rs = remoteStatic    else { throw NoiseError.internalError("no remote static") }
 
         // s: encrypt our static public key
-        let encS = try ss.encryptAndHash(staticKP.publicKeyBytes)
+        let encS = try ss.encryptAndHash(staticKP.publicKey)
 
-        // se: DH(s_init, e_resp)
-        guard let re = re else { throw NoiseError.invalidStep(step) }
-        let se = try diffieHellman(privateKey: staticKP.privateKey, publicKeyBytes: re)
+        // se = DH(s_init, e_resp)
+        let se = try diffieHellman(privateKey: staticKP.privateKey, publicKey: re)
         ss.mixKey(se)
 
-        // split into send/recv ciphers
-        let (sendCipher, recvCipher) = ss.split()
-
-        guard let rs = rs else { throw NoiseError.invalidStep(step) }
-        let session = NoiseSession(
-            sendCipher: sendCipher,
-            recvCipher: recvCipher,
-            remoteStatic: rs
-        )
-
+        // split
+        let (sendCs, recvCs) = ss.split()
         step = 3
-        return (encS, session)
+        return (encS, NoiseSession(sendCipher: sendCs, recvCipher: recvCs, remoteStatic: rs))
     }
+}
+
+// MARK: - Errors
+
+public enum NoiseError: Error {
+    case invalidStep(Int)
+    case messageTooShort(Int, Int)
+    case internalError(String)
 }

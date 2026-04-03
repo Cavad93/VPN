@@ -538,6 +538,26 @@ Wire format обеспечивает статистическую неразли
 **Тесты:** 32 теста (ConfigStoreTest×9, QrConfigTest×11, VpnStatsTest×12), все pass  
 **Запуск:** `cd android/test-runner && mvn -s mvn-settings.xml test`
 
+### ЗАДАЧА 25 — ВЫПОЛНЕНО (2026-04-03)
+**Файлы:** `ios/` — полный iOS VPN стек на Swift
+
+Реализовано iOS VPN ядро (Swift + Network Extension):
+- `CryptoCore.swift` — X25519 (`Curve25519.KeyAgreement`), ChaCha20-Poly1305 (`ChaChaPoly`), HMAC-SHA256, `noiseHKDF` (2 и 3 выхода), `NoiseCipherState` (nonce: 4 нулевых + 8-байт LE счётчик), `generateKeyPair`, `diffieHellman`, `AEADCipher`
+- `NoiseHandshake.swift` — Noise_XX инициатор: `NoiseSymmetricState` (mixHash/mixKey/encryptAndHash/decryptAndHash/split), `NoiseHandshake` (writeMessage1/readMessage2/writeMessage3), `NoiseSession{SendCipher, RecvCipher, RemoteStatic}`; wire-совместим с Go сервером (msg2 = 80 байт без пустого payload)
+- `ReplayFilter.swift` — `PacketHeader` (20 байт big-endian: 8 timestamp + 12 nonce), `ReplayFilter` (скользящее окно ±90с, потокобезопасен через `NSLock`)
+- `ObfsConn.swift` — TLS-обфускация: синтетические ClientHello/ServerHello, фрагментация в TLS app_data records (content_type=0x17, max 16383 байт), внутренний read-буфер
+- `MuxConn.swift` — `NoiseConn` (2-байт BE length prefix + шифрование), `MuxStream` (DispatchSemaphore блокирующий read), `ClientMux` (чётные stream ID 2,4,6…, фоновый Thread read-loop)
+- `VpnConfig.swift` — `VpnConfig` (server host/port, keys, DNS, MTU), `RouteInfo` (assignedIp/prefixLen/gateway/cidr/network), hex Data helpers
+- `VpnClient.swift` — полный стек: TCP → ObfsConn.ClientHandshake → Noise_XX → NoiseConn → ClientMux → control stream (ctlHello/ctlAssign) → data stream; `connect()`, `disconnect()`, `sendPacket()`, `recvPacket()`
+- `PacketTunnelProvider.swift` — `NEPacketTunnelProvider`: парсинг `NETunnelProviderProtocol`, `NEPacketTunnelNetworkSettings` (IPv4, DNS, MTU, default route), двунаправленная пересылка пакетов через `packetFlow`
+
+Зависимость: `apple/swift-crypto 3.x`
+
+**XCTest тесты:** 47 тестов (CryptoCoreTests×11, NoiseHandshakeTests×9, ReplayFilterTests×9, ObfsConnTests×5, MuxConnTests×5, VpnConfigTests×8)  
+**Python тесты совместимости:** 49 тестов, все pass  
+**Запуск (Swift, требует macOS/Xcode):** `cd ios && swift test`  
+**Запуск (Python, Linux):** `cd ios/test-runner && python3 -m pytest test_compat.py -v`
+
 ### ОПТИМИЗАЦИЯ СКОРОСТИ — ВЫПОЛНЕНО (2026-04-02)
 **Файлы:** `server/sockopt_linux.go`, `server/tun_linux.go`, `server/main.go`, `server/transport/obfs.go`, `server/transport/mux.go`, `client/core.py`
 

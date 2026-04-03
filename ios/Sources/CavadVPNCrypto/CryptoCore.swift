@@ -1,155 +1,168 @@
-/// CryptoCore.swift — X25519 key exchange + ChaCha20-Poly1305 AEAD + HMAC-SHA256
-///
-/// Wire-compatible with the Go server (server/crypto/crypto.go) and Python client (client/core.py).
+// CryptoCore.swift — X25519 DH + ChaCha20-Poly1305 + HMAC-SHA256
+// Wire-compatible with Go server crypto package and Python/Kotlin clients.
 
 import Foundation
 import Crypto
 
 // MARK: - Constants
 
-public let KEY_SIZE = 32
-public let AEAD_OVERHEAD = 16  // ChaCha20-Poly1305 tag size
-public let NONCE_SIZE = 12
+/// Size in bytes of an X25519 key and ChaCha20-Poly1305 key.
+public let keySize = 32
 
-// MARK: - Key Pair
+/// Size in bytes of a ChaCha20-Poly1305 nonce.
+public let nonceSize = 12
 
-/// An X25519 key pair used for Diffie-Hellman and Noise handshake.
+/// Authentication tag overhead in bytes for ChaCha20-Poly1305.
+public let aeadOverhead = 16
+
+// MARK: - KeyPair
+
+/// An X25519 key pair holding both the private and public key as raw 32-byte Data.
 public struct KeyPair {
-    public let privateKey: Curve25519.KeyAgreement.PrivateKey
-    public let publicKeyBytes: [UInt8]  // 32 raw bytes
+    public let privateKey: Data   // 32 bytes, RFC 7748 clamped
+    public let publicKey: Data    // 32 bytes
 
-    public var publicKey: [UInt8] { publicKeyBytes }
-
-    public init(privateKey: Curve25519.KeyAgreement.PrivateKey) {
+    public init(privateKey: Data, publicKey: Data) {
+        precondition(privateKey.count == keySize, "privateKey must be \(keySize) bytes")
+        precondition(publicKey.count == keySize,  "publicKey must be \(keySize) bytes")
         self.privateKey = privateKey
-        self.publicKeyBytes = Array(privateKey.publicKey.rawRepresentation)
-    }
-
-    /// Initialize from raw 32-byte private key bytes.
-    public init(privateKeyBytes: [UInt8]) throws {
-        guard privateKeyBytes.count == KEY_SIZE else {
-            throw CryptoError.invalidKeySize(privateKeyBytes.count)
-        }
-        let priv = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: Data(privateKeyBytes))
-        self.privateKey = priv
-        self.publicKeyBytes = Array(priv.publicKey.rawRepresentation)
+        self.publicKey  = publicKey
     }
 }
 
-// MARK: - Errors
-
-public enum CryptoError: Error {
-    case invalidKeySize(Int)
-    case dhWeakKey
-    case decryptionFailed
-    case invalidNonceSize(Int)
-}
-
-// MARK: - Key Generation
-
-/// Generate a new X25519 key pair. RFC 7748 clamping is applied automatically by swift-crypto.
+/// Generates a fresh X25519 key pair. RFC 7748 clamping is applied by swift-crypto.
 public func generateKeyPair() -> KeyPair {
-    let priv = Curve25519.KeyAgreement.PrivateKey()
-    return KeyPair(privateKey: priv)
+    let privKey = Curve25519.KeyAgreement.PrivateKey()
+    let privBytes = Data(privKey.rawRepresentation)
+    let pubBytes  = Data(privKey.publicKey.rawRepresentation)
+    return KeyPair(privateKey: privBytes, publicKey: pubBytes)
 }
 
-// MARK: - Diffie-Hellman
-
-/// Perform X25519 Diffie-Hellman. Returns 32-byte shared secret.
-/// Throws if result is the all-zero weak key.
-public func diffieHellman(privateKey: Curve25519.KeyAgreement.PrivateKey, publicKeyBytes: [UInt8]) throws -> [UInt8] {
-    let pubKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(publicKeyBytes))
-    let sharedSecret = try privateKey.sharedSecretFromKeyAgreement(with: pubKey)
-    // Extract raw bytes from SharedSecret via withUnsafeBytes
-    let bytes: [UInt8] = sharedSecret.withUnsafeBytes { Array($0) }
-    if bytes.allSatisfy({ $0 == 0 }) {
-        throw CryptoError.dhWeakKey
+/// Performs X25519 Diffie-Hellman.
+/// - Returns: 32-byte shared secret.
+/// - Throws: `CryptoError.weakKey` if result is the all-zero point.
+public func diffieHellman(privateKey: Data, publicKey: Data) throws -> Data {
+    guard privateKey.count == keySize, publicKey.count == keySize else {
+        throw CryptoError.invalidKeySize
     }
-    return bytes
-}
-
-// MARK: - Random Bytes
-
-/// Generate cryptographically random bytes.
-public func generateRandomBytes(count: Int) -> [UInt8] {
-    var bytes = [UInt8](repeating: 0, count: count)
-    for i in bytes.indices {
-        bytes[i] = UInt8.random(in: 0...255)
+    let priv = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKey)
+    let pub  = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: publicKey)
+    let sharedSecret = try priv.sharedSecretFromKeyAgreement(with: pub)
+    let secret = sharedSecret.withUnsafeBytes { Data($0) }
+    if secret == Data(repeating: 0, count: keySize) {
+        throw CryptoError.weakKey
     }
-    return bytes
-}
-
-/// Generate a cryptographically random 12-byte nonce.
-public func generateNonce() -> [UInt8] {
-    return generateRandomBytes(count: NONCE_SIZE)
-}
-
-// MARK: - ChaCha20-Poly1305 AEAD
-
-/// Encrypt plaintext with ChaCha20-Poly1305. Returns ciphertext + 16-byte auth tag.
-public func chaCha20Poly1305Encrypt(
-    key: [UInt8],
-    nonce: [UInt8],
-    plaintext: [UInt8],
-    aad: [UInt8] = []
-) throws -> [UInt8] {
-    guard key.count == KEY_SIZE else { throw CryptoError.invalidKeySize(key.count) }
-    guard nonce.count == NONCE_SIZE else { throw CryptoError.invalidNonceSize(nonce.count) }
-
-    let symmetricKey = SymmetricKey(data: Data(key))
-    let nonceData = try ChaChaPoly.Nonce(data: Data(nonce))
-    let sealedBox = try ChaChaPoly.seal(Data(plaintext), using: symmetricKey, nonce: nonceData, authenticating: Data(aad))
-    // ChaChaPoly.seal returns ciphertext + tag concatenated
-    return Array(sealedBox.ciphertext) + Array(sealedBox.tag)
-}
-
-/// Decrypt ciphertext (with appended 16-byte tag) using ChaCha20-Poly1305.
-public func chaCha20Poly1305Decrypt(
-    key: [UInt8],
-    nonce: [UInt8],
-    ciphertext: [UInt8],
-    aad: [UInt8] = []
-) throws -> [UInt8] {
-    guard key.count == KEY_SIZE else { throw CryptoError.invalidKeySize(key.count) }
-    guard nonce.count == NONCE_SIZE else { throw CryptoError.invalidNonceSize(nonce.count) }
-    guard ciphertext.count >= AEAD_OVERHEAD else { throw CryptoError.decryptionFailed }
-
-    let symmetricKey = SymmetricKey(data: Data(key))
-    let nonceData = try ChaChaPoly.Nonce(data: Data(nonce))
-
-    let ct = Data(ciphertext.prefix(ciphertext.count - AEAD_OVERHEAD))
-    let tag = Data(ciphertext.suffix(AEAD_OVERHEAD))
-    let sealedBox = try ChaChaPoly.SealedBox(nonce: nonceData, ciphertext: ct, tag: tag)
-    let plaintext = try ChaChaPoly.open(sealedBox, using: symmetricKey, authenticating: Data(aad))
-    return Array(plaintext)
-}
-
-// MARK: - HMAC-SHA256
-
-/// Compute HMAC-SHA256(key, data).
-public func hmacSHA256(key: [UInt8], data: [UInt8]) -> [UInt8] {
-    let symKey = SymmetricKey(data: Data(key))
-    let mac = HMAC<SHA256>.authenticationCode(for: Data(data), using: symKey)
-    return Array(mac)
+    return secret
 }
 
 // MARK: - Noise HKDF
 
 /// Noise protocol HKDF using HMAC-SHA256.
 /// Returns n (2 or 3) 32-byte outputs.
-///
-/// ```
-/// TEMP = HMAC-SHA256(key=ck, data=ikm)
-/// k1   = HMAC-SHA256(key=TEMP, data=[0x01])
-/// k2   = HMAC-SHA256(key=k1,   data=[0x02])
-/// k3   = HMAC-SHA256(key=k2,   data=[0x03])   // only if n == 3
-/// ```
-public func noiseHKDF(ck: [UInt8], ikm: [UInt8], n: Int) -> [[UInt8]] {
+public func noiseHKDF(ck: Data, ikm: Data, n: Int) -> [Data] {
     precondition(n == 2 || n == 3, "noiseHKDF: n must be 2 or 3")
     let temp = hmacSHA256(key: ck, data: ikm)
-    let k1 = hmacSHA256(key: temp, data: [0x01])
-    let k2 = hmacSHA256(key: temp, data: k1 + [0x02])
-    if n == 2 { return [k1, k2] }
-    let k3 = hmacSHA256(key: temp, data: k2 + [0x03])
-    return [k1, k2, k3]
+    let o1 = hmacSHA256(key: temp, data: Data([0x01]))
+    let o2 = hmacSHA256(key: temp, data: o1 + Data([0x02]))
+    if n == 2 { return [o1, o2] }
+    let o3 = hmacSHA256(key: temp, data: o2 + Data([0x03]))
+    return [o1, o2, o3]
+}
+
+/// Computes HMAC-SHA256.
+public func hmacSHA256(key: Data, data: Data) -> Data {
+    let mac = HMAC<SHA256>.authenticationCode(for: data, using: SymmetricKey(data: key))
+    return Data(mac)
+}
+
+// MARK: - ChaCha20-Poly1305 low-level helpers
+
+/// Encrypts plaintext with ChaCha20-Poly1305.
+public func chaChaEncrypt(key: Data, nonce: Data, plaintext: Data, aad: Data = Data()) throws -> Data {
+    guard key.count == keySize else { throw CryptoError.invalidKeySize }
+    guard nonce.count == nonceSize else { throw CryptoError.invalidNonceSize }
+    let symKey = SymmetricKey(data: key)
+    let nonceObj = try ChaChaPoly.Nonce(data: nonce)
+    let box = try ChaChaPoly.seal(plaintext, using: symKey, nonce: nonceObj, authenticating: aad)
+    // ciphertext + tag (no nonce prefix in box.combined; combined = nonce(12)+ct+tag)
+    return box.ciphertext + box.tag
+}
+
+/// Decrypts ciphertext (ciphertext+tag) with ChaCha20-Poly1305.
+public func chaChaDecrypt(key: Data, nonce: Data, ciphertext: Data, aad: Data = Data()) throws -> Data {
+    guard key.count == keySize else { throw CryptoError.invalidKeySize }
+    guard nonce.count == nonceSize else { throw CryptoError.invalidNonceSize }
+    guard ciphertext.count >= aeadOverhead else { throw CryptoError.ciphertextTooShort }
+    let symKey = SymmetricKey(data: key)
+    let nonceObj = try ChaChaPoly.Nonce(data: nonce)
+    let ct  = ciphertext.prefix(ciphertext.count - aeadOverhead)
+    let tag = ciphertext.suffix(aeadOverhead)
+    let box = try ChaChaPoly.SealedBox(nonce: nonceObj, ciphertext: ct, tag: tag)
+    return try ChaChaPoly.open(box, using: symKey, authenticating: aad)
+}
+
+/// Generates 12 cryptographically random bytes for use as a nonce.
+public func generateNonce() -> Data {
+    return generateRandomData(count: nonceSize)
+}
+
+/// Generates `count` cryptographically random bytes.
+public func generateRandomData(count: Int) -> Data {
+    var bytes = [UInt8](repeating: 0, count: count)
+    for i in bytes.indices { bytes[i] = UInt8.random(in: 0...255) }
+    return Data(bytes)
+}
+
+// MARK: - NoiseCipherState
+
+/// Manages a ChaCha20-Poly1305 cipher with an auto-incrementing nonce counter.
+/// Nonce = 4 zero bytes + 8-byte little-endian counter (12 bytes total).
+public final class NoiseCipherState {
+    private var key: Data?
+    private var counter: UInt64 = 0
+
+    public init() {}
+
+    public func initializeKey(_ key: Data) {
+        precondition(key.count == keySize)
+        self.key = key
+        self.counter = 0
+    }
+
+    public var hasKey: Bool { key != nil }
+
+    public func encrypt(plaintext: Data, aad: Data = Data()) throws -> Data {
+        guard let k = key else { return plaintext }
+        let nonce = buildNonce(counter)
+        counter += 1
+        return try chaChaEncrypt(key: k, nonce: nonce, plaintext: plaintext, aad: aad)
+    }
+
+    public func decrypt(ciphertext: Data, aad: Data = Data()) throws -> Data {
+        guard let k = key else { return ciphertext }
+        let nonce = buildNonce(counter)
+        counter += 1
+        return try chaChaDecrypt(key: k, nonce: nonce, ciphertext: ciphertext, aad: aad)
+    }
+
+    private func buildNonce(_ n: UInt64) -> Data {
+        var buf = Data(repeating: 0, count: nonceSize)
+        // 4 zero bytes, then 8-byte LE counter
+        var le = n.littleEndian
+        withUnsafeBytes(of: &le) { leBytes in
+            buf.replaceSubrange(4..<12, with: leBytes)
+        }
+        return buf
+    }
+}
+
+// MARK: - Errors
+
+public enum CryptoError: Error, Equatable {
+    case invalidKeySize
+    case invalidNonceSize
+    case ciphertextTooShort
+    case weakKey
+    case authenticationFailure
+    case invalidData(String)
 }
