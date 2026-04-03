@@ -164,7 +164,47 @@ fun generateNonce(): ByteArray {
 // ---------------------------------------------------------------------------
 
 /**
- * Low-level ChaCha20-Poly1305 encrypt/decrypt using BouncyCastle.
+ * Encrypt using a pre-created ChaCha20Poly1305 cipher instance (avoids allocation per call).
+ * Used by [NoiseCipherState] which holds the cipher as a field.
+ */
+internal fun encryptWithCipher(
+    cipher: org.bouncycastle.crypto.modes.ChaCha20Poly1305,
+    key: ByteArray,
+    nonce: ByteArray,
+    plaintext: ByteArray,
+    aad: ByteArray
+): ByteArray {
+    cipher.init(true, AEADParameters(KeyParameter(key), 128, nonce, aad))
+    val output = ByteArray(cipher.getOutputSize(plaintext.size))
+    val len = cipher.processBytes(plaintext, 0, plaintext.size, output, 0)
+    cipher.doFinal(output, len)
+    return output
+}
+
+/**
+ * Decrypt using a pre-created ChaCha20Poly1305 cipher instance (avoids allocation per call).
+ */
+internal fun decryptWithCipher(
+    cipher: org.bouncycastle.crypto.modes.ChaCha20Poly1305,
+    key: ByteArray,
+    nonce: ByteArray,
+    ciphertext: ByteArray,
+    aad: ByteArray
+): ByteArray {
+    cipher.init(false, AEADParameters(KeyParameter(key), 128, nonce, aad))
+    val output = ByteArray(cipher.getOutputSize(ciphertext.size))
+    val len = cipher.processBytes(ciphertext, 0, ciphertext.size, output, 0)
+    try {
+        cipher.doFinal(output, len)
+    } catch (e: org.bouncycastle.crypto.InvalidCipherTextException) {
+        throw SecurityException("ChaCha20-Poly1305 authentication failed: ${e.message}", e)
+    }
+    return output
+}
+
+/**
+ * Low-level ChaCha20-Poly1305 — creates new cipher each call.
+ * Only for one-shot use (handshake). Hot path uses encryptWithCipher/decryptWithCipher.
  */
 private fun chaCha20Poly1305(
     encrypt: Boolean,
@@ -173,19 +213,7 @@ private fun chaCha20Poly1305(
     input: ByteArray,
     aad: ByteArray
 ): ByteArray {
-    // Use BouncyCastle's ChaCha20-Poly1305 AEAD mode
     val cipher = org.bouncycastle.crypto.modes.ChaCha20Poly1305()
-    val keyParam = KeyParameter(key)
-    val params = AEADParameters(keyParam, 128 /* tag bits */, nonce, aad)
-    cipher.init(encrypt, params)
-
-    val outputSize = cipher.getOutputSize(input.size)
-    val output = ByteArray(outputSize)
-    val len = cipher.processBytes(input, 0, input.size, output, 0)
-    try {
-        cipher.doFinal(output, len)
-    } catch (e: org.bouncycastle.crypto.InvalidCipherTextException) {
-        throw SecurityException("ChaCha20-Poly1305 authentication failed: ${e.message}", e)
-    }
-    return output
+    return if (encrypt) encryptWithCipher(cipher, key, nonce, input, aad)
+    else decryptWithCipher(cipher, key, nonce, input, aad)
 }

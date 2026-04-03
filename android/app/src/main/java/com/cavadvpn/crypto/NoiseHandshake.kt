@@ -1,7 +1,5 @@
 package com.cavadvpn.crypto
 
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.security.MessageDigest
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -12,26 +10,38 @@ const val PROTOCOL_NAME = "Noise_XX_25519_ChaChaPoly_SHA256"
 /**
  * Post-handshake cipher state using ChaCha20-Poly1305 with incrementing nonce counter.
  * Nonce: 4 zero bytes + 8-byte little-endian counter.
+ *
+ * The ChaCha20Poly1305 cipher is created ONCE and re-initialized per packet
+ * (avoids object allocation on every encrypt/decrypt — same fix as Go/Python).
  */
 class NoiseCipherState(key: ByteArray) {
     private val key: ByteArray = key.copyOf(KEY_SIZE)
     private var counter: Long = 0L
+    // Cipher created once; re-initialized with new nonce on each call.
+    private val cipher = org.bouncycastle.crypto.modes.ChaCha20Poly1305()
+    private val nonceBuf = ByteArray(NONCE_SIZE) // reused, avoids allocation per packet
 
     fun encrypt(plaintext: ByteArray, aad: ByteArray = ByteArray(0)): ByteArray {
-        val nonce = buildNonce(counter++)
-        return encrypt(key, nonce, plaintext, aad)
+        buildNonce(counter++, nonceBuf)
+        return encryptWithCipher(cipher, key, nonceBuf, plaintext, aad)
     }
 
     fun decrypt(ciphertext: ByteArray, aad: ByteArray = ByteArray(0)): ByteArray {
-        val nonce = buildNonce(counter++)
-        return decrypt(key, nonce, ciphertext, aad)
+        buildNonce(counter++, nonceBuf)
+        return decryptWithCipher(cipher, key, nonceBuf, ciphertext, aad)
     }
 
-    private fun buildNonce(n: Long): ByteArray {
-        val buf = ByteBuffer.allocate(NONCE_SIZE).order(ByteOrder.LITTLE_ENDIAN)
-        buf.putInt(0)
-        buf.putLong(n)
-        return buf.array()
+    private fun buildNonce(n: Long, buf: ByteArray) {
+        // 4 zero bytes + 8-byte little-endian counter
+        buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 0
+        buf[4]  = (n         ).toByte()
+        buf[5]  = (n ushr  8 ).toByte()
+        buf[6]  = (n ushr 16 ).toByte()
+        buf[7]  = (n ushr 24 ).toByte()
+        buf[8]  = (n ushr 32 ).toByte()
+        buf[9]  = (n ushr 40 ).toByte()
+        buf[10] = (n ushr 48 ).toByte()
+        buf[11] = (n ushr 56 ).toByte()
     }
 }
 
