@@ -27,8 +27,12 @@
 .PARAMETER Once
     Check once and exit.
 
+.PARAMETER ServerArgs
+    Command-line arguments passed to the VPN server binary on restart.
+
 .EXAMPLE
     .\auto_update.ps1 -RepoDir C:\CavadVPN\repo -Branch claude/investigate-vpn-performance-IJ0iX
+    .\auto_update.ps1 -RepoDir C:\CavadVPN\repo -ServerArgs "-addr 0.0.0.0:8443 -tun-cidr 10.8.0.1/24 -api-addr 127.0.0.1:8080"
 #>
 
 param(
@@ -44,6 +48,8 @@ param(
     [string]$ServiceName = "CavadVPN",
 
     [string]$LogFile = "C:\CavadVPN\auto-update.log",
+
+    [string]$ServerArgs = "-addr 0.0.0.0:8443 -tun-cidr 10.8.0.1/24 -api-addr 127.0.0.1:8080",
 
     [switch]$Once
 )
@@ -164,8 +170,8 @@ function Invoke-GracefulRestart {
         Stop-Process -Id $proc.Id -Force
         Start-Sleep -Seconds 2
 
-        Write-Log "INFO" "Starting $BinaryPath..."
-        Start-Process -FilePath $BinaryPath -WindowStyle Hidden
+        Write-Log "INFO" "Starting $BinaryPath $ServerArgs..."
+        Start-Process -FilePath $BinaryPath -ArgumentList $ServerArgs -WindowStyle Hidden
         Start-Sleep -Seconds 2
 
         $newProc = Get-Process -Name "cavad-vpn" -ErrorAction SilentlyContinue
