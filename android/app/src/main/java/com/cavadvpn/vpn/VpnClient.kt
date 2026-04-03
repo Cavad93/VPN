@@ -16,7 +16,7 @@ import java.nio.ByteBuffer
 // Control stream message types (must match Go server)
 private const val CTL_HELLO  : Byte = 0x01
 private const val CTL_ASSIGN : Byte = 0x02
-private const val CTL_ERROR  : Byte = 0x03
+private const val CTL_ERROR  : Byte = 0xFF.toByte()
 private const val CTL_ASSIGN_PAYLOAD_LEN = 9  // ip(4) + prefixLen(1) + gateway(4)
 
 /**

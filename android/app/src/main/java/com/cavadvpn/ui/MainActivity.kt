@@ -24,6 +24,7 @@ import com.cavadvpn.vpn.EXTRA_PRIVATE_KEY
 import com.cavadvpn.vpn.EXTRA_SERVER_HOST
 import com.cavadvpn.vpn.EXTRA_SERVER_PORT
 import com.cavadvpn.vpn.EXTRA_SERVER_PUBLIC_KEY
+import com.cavadvpn.vpn.EXTRA_ERROR_MSG
 import com.cavadvpn.vpn.EXTRA_STATE
 import com.cavadvpn.vpn.EXTRA_STATS_ASSIGNED_IP
 import com.cavadvpn.vpn.EXTRA_STATS_BYTES_IN
@@ -92,7 +93,8 @@ class MainActivity : AppCompatActivity() {
                 }
                 ACTION_VPN_STATE_CHANGED -> {
                     val state = intent.getStringExtra(EXTRA_STATE) ?: return
-                    handleStateChange(state)
+                    val errorMsg = intent.getStringExtra(EXTRA_ERROR_MSG)
+                    handleStateChange(state, errorMsg)
                 }
             }
         }
@@ -214,7 +216,7 @@ class MainActivity : AppCompatActivity() {
         btnConnectDisconnect.text = getString(R.string.action_disconnect)
     }
 
-    private fun handleStateChange(state: String) {
+    private fun handleStateChange(state: String, errorMsg: String? = null) {
         when (state) {
             "CONNECTED" -> {
                 isConnected = true
@@ -231,7 +233,11 @@ class MainActivity : AppCompatActivity() {
             }
             "ERROR" -> {
                 isConnected = false
-                tvStatus.text = getString(R.string.status_error)
+                tvStatus.text = if (errorMsg != null) {
+                    "${getString(R.string.status_error)}: $errorMsg"
+                } else {
+                    getString(R.string.status_error)
+                }
                 btnConnectDisconnect.text = getString(R.string.action_connect)
             }
         }

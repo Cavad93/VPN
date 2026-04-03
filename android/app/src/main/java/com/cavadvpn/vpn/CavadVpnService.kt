@@ -34,6 +34,7 @@ const val EXTRA_PRIVATE_KEY       = "private_key_hex"
 const val EXTRA_SERVER_PUBLIC_KEY = "server_public_key_hex"
 
 const val EXTRA_STATE               = "state"
+const val EXTRA_ERROR_MSG           = "error_msg"
 const val EXTRA_STATS_BYTES_IN      = "bytes_in"
 const val EXTRA_STATS_BYTES_OUT     = "bytes_out"
 const val EXTRA_STATS_CONNECTED_SINCE = "connected_since_ms"
@@ -113,7 +114,7 @@ class CavadVpnService : VpnService() {
             return
         }
 
-        stopVpn() // clean up any existing session
+        cleanupResources() // clean up any existing session (NOT stopVpn — stopSelf would kill us)
 
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Connecting…"))
@@ -172,7 +173,7 @@ class CavadVpnService : VpnService() {
                 Log.d(TAG, "VPN coroutine cancelled")
             } catch (e: Exception) {
                 Log.e(TAG, "VPN connection failed: ${e.message}", e)
-                broadcastState("ERROR")
+                broadcastState("ERROR", e.message ?: e.javaClass.simpleName)
                 // Clean up but do NOT call stopVpn() → stopSelf() here.
                 // That would cause Android to potentially restart the service.
                 // Instead, just clean up resources and let the user manually reconnect.
@@ -301,9 +302,10 @@ class CavadVpnService : VpnService() {
         sendBroadcast(intent)
     }
 
-    private fun broadcastState(state: String) {
+    private fun broadcastState(state: String, errorMsg: String? = null) {
         val intent = Intent(ACTION_VPN_STATE_CHANGED).apply {
             putExtra(EXTRA_STATE, state)
+            if (errorMsg != null) putExtra(EXTRA_ERROR_MSG, errorMsg)
             setPackage(packageName)
         }
         sendBroadcast(intent)
