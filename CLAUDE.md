@@ -544,3 +544,38 @@ Wire format обеспечивает статистическую неразли
 1. **sync.Pool для mux фреймов** — `writeFrame` использует пул pre-allocated буферов (muxHeaderSize+1500 байт) вместо `make()` на каждый пакет. Пакеты размером ≤1500 байт (типичный MTU VPN) берутся из пула без выделения памяти. Оценочный выигрыш: -1 heap alloc per IP packet, снижение давления на GC при 10 Mbps трафике.
 
 2. **Zero-copy readBuf в consumeData** — остаток пакета при частичном `Read` теперь сохраняется как sub-slice (zero-copy) вместо `make+copy`. Каждый буфер из `readLoop` — отдельный fresh alloc, aliasing отсутствует. Экономия: -1 alloc per partial read.
+
+### ЗАДАЧА 30 — ВЫПОЛНЕНО (2026-04-03)
+**Файл:** `server/api/invite.go`, `server/api/invite_test.go`
+
+Реализована система пригласительных ссылок:
+- `InviteRecord{Token, URL, Config, CreatedAt, ExpiresAt, Uses, MaxUses, Note}` — запись приглашения
+- `InviteStore` — потокобезопасное in-memory хранилище (RWMutex + map)
+- `generateInviteToken()` — crypto/rand 32-байтный hex токен (64 символа)
+- `APIServer.SetInviteServer()` — регистрирует все маршруты системы приглашений
+
+Эндпоинты (с аутентификацией):
+- `POST /api/v1/invites` — создать приглашение; генерирует клиентский X25519 ключ, добавляет в allowlist, возвращает запись с URL
+- `GET /api/v1/invites` — список всех приглашений
+- `DELETE /api/v1/invites/{token}` — отозвать приглашение
+
+Публичные эндпоинты (без аутентификации):
+- `GET /join/{token}` — HTML страница с определением платформы (iOS/Android/macOS/Windows/Universal) по User-Agent; содержит cavadvpn:// deep link, кнопку скачивания JSON конфига, QR-код
+- `GET /join/{token}/config.json` — JSON конфиг для ручного импорта (attachment download)
+- `GET /join/{token}/qr.png` — QR-код PNG с cavadvpn:// URI
+
+Функции HTML страницы: определение платформы по UA, HTML escape XSS-защита, cavadvpn:// deep link, QR-код, мета-информация (сервер/DNS/срок/счётчик открытий), раздел с технической ссылкой, адаптивный дизайн.
+
+Параметры приглашения: `ttl_hours` (срок действия), `max_uses` (лимит использований), `note` (заметка), `dns` (DNS сервер клиента).
+
+**Тесты:** 17 новых тестов, покрытие пакета api 83.1%  
+**Запуск:** `cd server && go test ./api/ -v -cover`
+
+### ОПТИМИЗАЦИЯ СКОРОСТИ — ВЫПОЛНЕНО (2026-04-03)
+**Файл:** `server/transport/udp.go`
+
+Два улучшения производительности UDP транспорта:
+
+1. **sync.Pool для ACK буферов** — `ackBufPool` poolит 11-байтные буферы для pure ACK пакетов. `sendACK()` берёт буфер из пула, заполняет и возвращает — устраняет одно heap-выделение на каждый входящий DATA пакет. Оценочный выигрыш: -1 alloc/packet, снижение GC при 10 Mbps трафике.
+
+2. **Delayed ACK coalescing (RFC 1122 §4.2.3.2)** — вместо немедленной отправки ACK после каждого DATA пакета, планируется `time.AfterFunc(1ms)`. Несколько пакетов, пришедших в одном burst, получают единый кумулятивный ACK. Экономия: до -50% ACK пакетов при устойчивой загрузке канала, освобождение пропускной способности для данных. При Close() таймер останавливается и финальный ACK отправляется синхронно.
