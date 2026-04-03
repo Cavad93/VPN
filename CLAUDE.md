@@ -600,3 +600,22 @@ AltStore: только бесплатные entitlements, без push/iCloud/IAP
 **Тесты:** 67 Python тестов (QRConfigJSON×14, QRConfigURI×8, VpnStats×16, ConfigStore×11, VpnConnectionState×15), все pass  
 **Запуск тестов:** `cd ios/test-runner && python3 -m pytest test_ui.py -v`  
 **Сборка (только macOS/Xcode):** открыть `ios/` в Xcode, настроить Team, Archive → Distribute (Ad Hoc для AltStore)
+
+### ЗАДАЧА 27 — ВЫПОЛНЕНО (2026-04-03)
+**Файлы:** `windows/` — Windows VPN клиент на Go
+
+Реализован Windows VPN клиент с системным треем, автозапуском и kill switch:
+- `config.go` — JSON конфиг (`%APPDATA%\CavadVPN\config.json`): `Config{ServerAddr, PrivateKeyHex, ServerKeyHex, AutoStart, KillSwitch, DNSServer, MTU}`, `Load/Save/Validate/Default`, `ConfigPath()`
+- `state.go` — state machine: `ConnectionState` (Disconnected/Connecting/Connected/Disconnecting/Error), `StateEvent{State, AssignedIP, ServerAddr, Error}`, `StateManager` (потокобезопасные колбэки `OnStateChange`, `SetState/GetState`)
+- `vpnclient.go` — протокольный клиент: `noiseConn` (2-байт BE framing + ChaCha20-Poly1305 с sync.Pool для zero-alloc записи), `readHandshakeMsg/writeHandshakeMsg`, `VPNClient{Connect, Disconnect, OpenDataStream}`, `AssignedRoute{IP, PrefixLen, Gateway}` — wire-совместим с Go сервером
+- `killswitch.go` + `killswitch_windows.go` (netsh advfirewall: 4 правила — Block All Out + Allow VPN Server + Allow Loopback + Allow DHCP) + `killswitch_stub.go` (ErrNotWindows)
+- `autostart.go` + `autostart_windows.go` (reg.exe: Enable/Disable/IsEnabled через `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`) + `autostart_stub.go` (ErrNotWindows)
+- `tray.go` + `tray_windows.go` (Shell_NotifyIcon через golang.org/x/sys/windows: скрытое HWND, NIM_ADD/MODIFY/DELETE, WM_APP+1 события, контекстное меню: Connect/Disconnect/Autostart toggle/Quit) + `tray_stub.go`
+- `tun.go` + `tun_windows.go` (Wintun интерфейс + netsh/route хелперы) + `tun_stub.go` (MockTun для тестов)
+- `main.go` — testable `appState` (handleConnect/handleDisconnect/handleQuit/shutdown), CLI и tray режимы
+
+**Оптимизации скорости:** TCP_NODELAY + 4MB socket buffers; sync.Pool для write buffers (zero-alloc AEAD framing)
+
+**Тесты:** 68 тестов (config×11, state×11, killswitch×4, autostart×3, tray×5, tun×8, main×23, vpnclient×21, integration×5), покрытие 85.0%  
+**Запуск:** `cd windows && go test ./... -v -cover`  
+**Сборка (Windows):** `cd windows && GOOS=windows GOARCH=amd64 go build -o cavadvpn.exe .`
