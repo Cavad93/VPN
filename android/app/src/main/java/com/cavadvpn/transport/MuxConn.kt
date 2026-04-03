@@ -5,8 +5,10 @@ import com.cavadvpn.crypto.NoiseSession
 import java.io.EOFException
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.BlockingQueue
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 
 // Mux frame types
@@ -162,11 +164,11 @@ class MuxStream(
  * reads Noise messages and dispatches mux frames to the appropriate [MuxStream].
  */
 class ClientMux(private val conn: NoiseConn) {
-    private val streams   = HashMap<Int, MuxStream>()
-    private val streamsLock = Any()
-    private val writeLock   = Any()
-    private var nextId      = 2 // even IDs for client
-    private val closed      = AtomicBoolean(false)
+    // ConcurrentHashMap: lock-free reads on the dispatch hot path
+    private val streams   = ConcurrentHashMap<Int, MuxStream>()
+    private val writeLock = Any()
+    private val nextId    = AtomicInteger(2) // even IDs for client; CAS increments
+    private val closed    = AtomicBoolean(false)
 
     private val reader = Thread(::readLoop, "cavadvpn-mux-reader").also {
         it.isDaemon = true
@@ -178,14 +180,9 @@ class ClientMux(private val conn: NoiseConn) {
      */
     fun openStream(): MuxStream {
         check(!closed.get()) { "mux is closed" }
-        val sid: Int
-        val stream: MuxStream
-        synchronized(streamsLock) {
-            sid = nextId
-            nextId += 2
-            stream = MuxStream(sid, this)
-            streams[sid] = stream
-        }
+        val sid = nextId.getAndAdd(2) // atomic; no lock needed
+        val stream = MuxStream(sid, this)
+        streams[sid] = stream
         writeFrame(sid, FRAME_SYN, ByteArray(0), 0, 0)
         return stream
     }
@@ -193,10 +190,8 @@ class ClientMux(private val conn: NoiseConn) {
     /** Closes all streams and the underlying connection. */
     fun close() {
         if (closed.compareAndSet(false, true)) {
-            synchronized(streamsLock) {
-                streams.values.forEach { it.signalFin() }
-                streams.clear()
-            }
+            streams.values.forEach { it.signalFin() }
+            streams.clear()
             try { conn.close() } catch (_: Exception) {}
             reader.interrupt()
         }
@@ -220,7 +215,7 @@ class ClientMux(private val conn: NoiseConn) {
     }
 
     internal fun removeStream(streamId: Int) {
-        synchronized(streamsLock) { streams.remove(streamId) }
+        streams.remove(streamId) // ConcurrentHashMap — no lock needed
     }
 
     private fun readLoop() {
@@ -230,10 +225,8 @@ class ClientMux(private val conn: NoiseConn) {
             } catch (e: Exception) {
                 if (!closed.get()) {
                     closed.set(true)
-                    synchronized(streamsLock) {
-                        streams.values.forEach { it.signalFin() }
-                        streams.clear()
-                    }
+                    streams.values.forEach { it.signalFin() }
+                    streams.clear()
                 }
                 break
             }
@@ -251,14 +244,13 @@ class ClientMux(private val conn: NoiseConn) {
             val payloadStart = MUX_HEADER_SIZE
             val hasPayload = payloadLen > 0 && frameData.size >= payloadStart + payloadLen
 
-            val stream = synchronized(streamsLock) { streams[sid] }
+            val stream = streams[sid] // lock-free read from ConcurrentHashMap
 
             when (frameType) {
                 FRAME_SYN -> {
                     if (stream == null) {
-                        // Server opened a stream — register it
-                        val newStream = MuxStream(sid, this)
-                        synchronized(streamsLock) { streams[sid] = newStream }
+                        // Server opened a stream — register it (putIfAbsent is atomic)
+                        streams.putIfAbsent(sid, MuxStream(sid, this))
                     }
                 }
                 FRAME_DATA -> {

@@ -36,8 +36,10 @@ type sockaddrCtl struct {
 
 // tunDevice represents an open macOS utun interface.
 type tunDevice struct {
-	fd   int
-	name string
+	fd      int
+	name    string
+	readBuf [65536 + utunHdrLen]byte // pre-allocated: eliminates per-packet make() in Read
+	wrBuf   [65536 + utunHdrLen]byte // pre-allocated: eliminates per-packet make() in Write
 }
 
 // openTun opens a utun device.  The kernel assigns the next free interface
@@ -97,9 +99,9 @@ func openTun() (*tunDevice, error) {
 func (t *tunDevice) Name() string { return t.name }
 
 // Read reads one raw IPv4 packet, stripping the 4-byte utun AF header.
+// Uses pre-allocated readBuf — zero heap allocation per call.
 func (t *tunDevice) Read(buf []byte) (int, error) {
-	tmp := make([]byte, len(buf)+utunHdrLen)
-	n, err := syscall.Read(t.fd, tmp)
+	n, err := syscall.Read(t.fd, t.readBuf[:])
 	if err != nil {
 		return 0, &net.OpError{Op: "read", Net: "tun", Err: err}
 	}
@@ -107,17 +109,18 @@ func (t *tunDevice) Read(buf []byte) (int, error) {
 		return 0, nil
 	}
 	payload := n - utunHdrLen
-	copy(buf, tmp[utunHdrLen:n])
+	copy(buf, t.readBuf[utunHdrLen:n])
 	return payload, nil
 }
 
 // Write writes a raw IPv4 packet, prepending the 4-byte AF_INET utun header.
+// Uses pre-allocated wrBuf — zero heap allocation per call.
 func (t *tunDevice) Write(pkt []byte) (int, error) {
-	frame := make([]byte, utunHdrLen+len(pkt))
+	total := utunHdrLen + len(pkt)
 	// AF_INET = 2, big-endian 4 bytes: 0x00 0x00 0x00 0x02
-	frame[3] = byte(afInet)
-	copy(frame[utunHdrLen:], pkt)
-	if _, err := syscall.Write(t.fd, frame); err != nil {
+	t.wrBuf[0] = 0; t.wrBuf[1] = 0; t.wrBuf[2] = 0; t.wrBuf[3] = byte(afInet)
+	copy(t.wrBuf[utunHdrLen:], pkt)
+	if _, err := syscall.Write(t.fd, t.wrBuf[:total]); err != nil {
 		return 0, &net.OpError{Op: "write", Net: "tun", Err: err}
 	}
 	return len(pkt), nil
