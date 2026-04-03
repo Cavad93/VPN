@@ -28,6 +28,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/cavad93/vpn/server/perf"
 )
 
 // SessionInfo holds read-only statistics for one active client session.
@@ -80,10 +82,11 @@ type APIServer struct {
 	qrSrv       QRServerIface
 	invites     *InviteStore
 	notifSvc    NotificationService
-	logger      *slog.Logger
-	mux         *http.ServeMux
-	logBuf      *LogBuffer
-	updateStore *updateStore
+	logger        *slog.Logger
+	mux           *http.ServeMux
+	logBuf        *LogBuffer
+	updateStore   *updateStore
+	perfCollector *perf.Collector
 }
 
 // NewAPIServer creates a new APIServer and registers all routes.

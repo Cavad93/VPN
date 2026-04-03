@@ -27,6 +27,7 @@ import (
 	"github.com/cavad93/vpn/server/api"
 	"github.com/cavad93/vpn/server/crypto"
 	"github.com/cavad93/vpn/server/notify"
+	"github.com/cavad93/vpn/server/perf"
 	"github.com/cavad93/vpn/server/transport"
 )
 
@@ -168,6 +169,9 @@ type Server struct {
 	// notifSvc is optional; when set, push notifications are fired on
 	// session connect / disconnect events.
 	notifSvc *notify.NotificationService
+	// Perf is the performance metrics collector. When non-nil, hot-path
+	// instrumentation records latency histograms and packet counters.
+	Perf *perf.Collector
 }
 
 // NewServer creates a new Server. allowedKeys may be nil/empty to allow any key.
@@ -340,11 +344,18 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// Noise_XX handshake
+	// Noise_XX handshake (with perf tracking)
+	var hsStart time.Time
+	if s.Perf != nil {
+		hsStart = time.Now()
+	}
 	session, err := s.doNoiseHandshake(obfs)
 	if err != nil {
 		s.logger.Warn("noise handshake failed", "err", err)
 		return
+	}
+	if s.Perf != nil {
+		s.Perf.TrackLatency(perf.StageHandshake, time.Since(hsStart))
 	}
 
 	// Check if this key is allowed
@@ -355,6 +366,11 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 	// Wrap in encrypted noise conn
 	nc := newNoiseConn(obfs, session)
+	if s.Perf != nil {
+		nc.withPerf(s.Perf)
+		s.Perf.ActiveSessions.Add(1)
+		s.Perf.TotalSessions.Add(1)
+	}
 
 	// Create mux (server = not client)
 	mux := transport.NewMux(nc, false)
@@ -405,6 +421,9 @@ func (s *Server) runPrimaryConn(ctx context.Context, session *crypto.Session, ct
 	defer func() {
 		cancel()
 		mux.Close()
+		if s.Perf != nil {
+			s.Perf.ActiveSessions.Add(-1)
+		}
 		s.mu.Lock()
 		delete(s.sessions, cs.id)
 		s.mu.Unlock()
@@ -550,6 +569,7 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 	bp := streamReadBufPool.Get().(*[]byte)
 	buf := *bp
 	defer streamReadBufPool.Put(bp)
+	pc := s.Perf // local copy avoids nil check in hot loop when perf is nil
 	for {
 		n, err := stream.Read(buf)
 		if err != nil {
@@ -560,9 +580,15 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 			continue
 		}
 
-		// tun.Write is a synchronous syscall; buf is safe to reuse after it returns.
+		if pc != nil {
+			t0 := time.Now()
+			s.tun.Write(buf[:n]) //nolint:errcheck
+			pc.TrackLatency(perf.StageTunWrite, time.Since(t0))
+			pc.TrackPacket(perf.StageTunWrite, n)
+		} else {
+			s.tun.Write(buf[:n]) //nolint:errcheck
+		}
 		cs.bytesIn.Add(uint64(n))
-		s.tun.Write(buf[:n]) //nolint:errcheck
 	}
 }
 
@@ -591,7 +617,12 @@ func (s *Server) routeFromTun(ctx context.Context) {
 	bp := tunReadBufPool.Get().(*[]byte)
 	buf := *bp
 	defer tunReadBufPool.Put(bp)
+	pc := s.Perf // local copy for hot loop
 	for {
+		var t0 time.Time
+		if pc != nil {
+			t0 = time.Now()
+		}
 		n, err := s.tun.Read(buf)
 		if err != nil {
 			// Normal shutdown path: ctx cancelled → TUN closed → read error.
@@ -602,6 +633,10 @@ func (s *Server) routeFromTun(ctx context.Context) {
 				s.logger.Warn("tun read error", "err", err)
 				continue
 			}
+		}
+		if pc != nil {
+			pc.TrackLatency(perf.StageTunRead, time.Since(t0))
+			pc.TrackPacket(perf.StageTunRead, n)
 		}
 		if n < 20 {
 			continue
@@ -616,14 +651,6 @@ func (s *Server) routeFromTun(ctx context.Context) {
 		target := val.(*clientSession)
 
 		// Round-robin across bonded streams (multiple TCP connections).
-		// Each connection has its own congestion window, so N connections
-		// yield ~N× throughput on lossy links.
-		//
-		// Resilient write: if a stream has closed (e.g., one of 32 bonds
-		// dropped), try the next one instead of silently dropping the packet.
-		// We try at most bond.count() streams to avoid an infinite loop when
-		// all bonds are dead (the outer tun.Read loop will exit on the next
-		// read error when the session is torn down).
 		bond := &target.bond
 		tried := bond.count()
 		sent := false
@@ -774,11 +801,19 @@ type noiseConn struct {
 	// decryptBuf is a pre-allocated destination buffer for AEAD decryption,
 	// eliminating the make() call inside aead.Open on every received packet.
 	decryptBuf [65535]byte
+	// perf is an optional perf collector for latency tracking.
+	perf *perf.Collector
 }
 
 // newNoiseConn creates a noiseConn wrapping conn with the given session.
 func newNoiseConn(conn net.Conn, session *crypto.Session) *noiseConn {
 	return &noiseConn{conn: conn, session: session}
+}
+
+// withPerf attaches a perf Collector for latency tracking.
+func (nc *noiseConn) withPerf(pc *perf.Collector) *noiseConn {
+	nc.perf = pc
+	return nc
 }
 
 // Write encrypts p and writes it with a 2-byte big-endian length prefix.
@@ -790,6 +825,10 @@ func newNoiseConn(conn net.Conn, session *crypto.Session) *noiseConn {
 // buffer at offset 2, eliminating both the intermediate ciphertext allocation
 // and the copy. Saves 2 allocations + 1 copy per packet.
 func (nc *noiseConn) Write(p []byte) (int, error) {
+	var t0 time.Time
+	if nc.perf != nil {
+		t0 = time.Now()
+	}
 	// Borrow a frame buffer from the pool.
 	ctLen := len(p) + 16 // plaintext + AEAD tag
 	need := 2 + ctLen
@@ -804,6 +843,9 @@ func (nc *noiseConn) Write(p []byte) (int, error) {
 	if err != nil {
 		noiseWritePool.Put(bp)
 		return 0, fmt.Errorf("noiseConn encrypt: %w", err)
+	}
+	if nc.perf != nil {
+		nc.perf.TrackLatency(perf.StageNoiseEnc, time.Since(t0))
 	}
 	binary.BigEndian.PutUint16(frame[:2], uint16(len(ciphertext)))
 
@@ -860,9 +902,16 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 	}
 
 	// Decrypt into pre-allocated buffer — zero allocation per packet.
+	var decStart time.Time
+	if nc.perf != nil {
+		decStart = time.Now()
+	}
 	plaintext, err := nc.session.RecvCipher.DecryptTo(nc.decryptBuf[:], nc.recvBuf[2:2+frameLen], nil)
 	if err != nil {
 		return 0, fmt.Errorf("noiseConn decrypt: %w", err)
+	}
+	if nc.perf != nil {
+		nc.perf.TrackLatency(perf.StageNoiseDec, time.Since(decStart))
 	}
 
 	nc2 := copy(p, plaintext)
@@ -1122,6 +1171,8 @@ func main() {
 		logger.Error("failed to create server", "err", err)
 		os.Exit(1)
 	}
+	// Attach the performance metrics collector.
+	srv.Perf = perf.NewCollector()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -1150,6 +1201,10 @@ func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *sl
 	apiSrv.SetQRServer(srv)
 	// Enable push notification subscription management via the REST API.
 	apiSrv.SetNotificationService(notifSvc)
+	// Enable performance metrics endpoints.
+	if srv.Perf != nil {
+		apiSrv.SetPerfCollector(srv.Perf)
+	}
 
 	go func() {
 		<-ctx.Done()

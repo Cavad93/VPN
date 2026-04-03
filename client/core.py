@@ -548,13 +548,21 @@ class NoiseConn:
     with a 2-byte big-endian uint16.
     """
 
-    def __init__(self, obfs: ObfsConn, session: NoiseSession) -> None:
+    def __init__(self, obfs: ObfsConn, session: NoiseSession, perf=None) -> None:
         self._obfs = obfs
         self._session = session
         self._read_buf = b""
+        self._perf = perf  # optional PerfCollector
 
     def write_message(self, plaintext: bytes) -> None:
-        ciphertext = self._session.send_cipher.encrypt(plaintext)
+        if self._perf:
+            import time as _t
+            from perf_collector import Stage
+            _t0 = _t.monotonic()
+            ciphertext = self._session.send_cipher.encrypt(plaintext)
+            self._perf.track_latency(Stage.NOISE_ENCRYPT, _t.monotonic() - _t0)
+        else:
+            ciphertext = self._session.send_cipher.encrypt(plaintext)
         # Build length prefix + ciphertext in one concatenation (bytes + bytes
         # is faster than bytearray construction for typical packet sizes ≤1500).
         self._obfs.write(struct.pack(">H", len(ciphertext)) + ciphertext)
@@ -564,6 +572,13 @@ class NoiseConn:
         len_bytes = self._read_exactly_raw(2)
         frame_len = int.from_bytes(len_bytes, "big")
         frame = self._read_exactly_raw(frame_len)
+        if self._perf:
+            import time as _t
+            from perf_collector import Stage
+            _t0 = _t.monotonic()
+            result = self._session.recv_cipher.decrypt(frame)
+            self._perf.track_latency(Stage.NOISE_DECRYPT, _t.monotonic() - _t0)
+            return result
         return self._session.recv_cipher.decrypt(frame)
 
     def _read_exactly_raw(self, n: int) -> bytes:
@@ -844,7 +859,7 @@ class VPNClient:
       data stream (raw IP packets)
     """
 
-    def __init__(self, config: VPNConfig) -> None:
+    def __init__(self, config: VPNConfig, perf=None) -> None:
         self._config = config
         self._sock: Optional[socket.socket] = None
         self._obfs: Optional[ObfsConn] = None
@@ -854,6 +869,7 @@ class VPNClient:
         self._route_info: Optional[RouteInfo] = None
         self._connected = threading.Event()
         self._log = logger.bind(server=config.server_addr)
+        self._perf = perf  # optional PerfCollector instance
 
     def connect(self) -> RouteInfo:
         """
@@ -906,12 +922,18 @@ class VPNClient:
         self._log.debug("obfs_handshake_done")
 
         # 3. Noise_XX handshake
+        if self._perf:
+            import time as _t
+            _hs_start = _t.monotonic()
         session = self._do_noise_handshake(kp)
+        if self._perf:
+            from perf_collector import Stage
+            self._perf.track_latency(Stage.HANDSHAKE, _t.monotonic() - _hs_start)
         self._log.info("noise_handshake_done",
                        remote_key=session.remote_static.hex())
 
         # 4. Post-handshake encrypted transport
-        self._noise_conn = NoiseConn(self._obfs, session)
+        self._noise_conn = NoiseConn(self._obfs, session, perf=self._perf)
 
         # 5. Mux
         self._mux = ClientMux(self._noise_conn)
@@ -958,12 +980,19 @@ class VPNClient:
         if not self._connected.is_set() or self._data_stream is None:
             raise IOError("VPN not connected")
         self._data_stream.write(pkt)
+        if self._perf:
+            from perf_collector import Stage
+            self._perf.track_packet(Stage.TUN_WRITE, len(pkt))
 
     def recv_packet(self) -> bytes:
         """Receive a raw IP packet from the data stream."""
         if not self._connected.is_set() or self._data_stream is None:
             raise IOError("VPN not connected")
-        return self._data_stream.read()
+        data = self._data_stream.read()
+        if self._perf:
+            from perf_collector import Stage
+            self._perf.track_packet(Stage.TUN_READ, len(data))
+        return data
 
     # -- internal helpers ---------------------------------------------------
 
