@@ -368,8 +368,6 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	nc := newNoiseConn(obfs, session)
 	if s.Perf != nil {
 		nc.withPerf(s.Perf)
-		s.Perf.ActiveSessions.Add(1)
-		s.Perf.TotalSessions.Add(1)
 	}
 
 	// Create mux (server = not client)
@@ -451,6 +449,10 @@ func (s *Server) runPrimaryConn(ctx context.Context, session *crypto.Session, ct
 		}
 	}()
 
+	if s.Perf != nil {
+		s.Perf.ActiveSessions.Add(1)
+		s.Perf.TotalSessions.Add(1)
+	}
 	s.logger.Info("new session", "id", cs.id, "key", hex.EncodeToString(session.RemoteStatic[:]))
 
 	// Handle IP assignment via the control stream (ctlHello already consumed).
@@ -582,7 +584,19 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 	defer streamReadBufPool.Put(bp)
 	pc := s.Perf // local copy avoids nil check in hot loop when perf is nil
 	for {
+		var ingressStart time.Time
+		if pc != nil {
+			ingressStart = time.Now()
+		}
+
+		var muxReadStart time.Time
+		if pc != nil {
+			muxReadStart = time.Now()
+		}
 		n, err := stream.Read(buf)
+		if pc != nil {
+			pc.TrackLatency(perf.StageMuxRead, time.Since(muxReadStart))
+		}
 		if err != nil {
 			return
 		}
@@ -596,6 +610,7 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 			s.tun.Write(buf[:n]) //nolint:errcheck
 			pc.TrackLatency(perf.StageTunWrite, time.Since(t0))
 			pc.TrackPacket(perf.StageTunWrite, n)
+			pc.TrackLatency(perf.StageFullIngress, time.Since(ingressStart))
 		} else {
 			s.tun.Write(buf[:n]) //nolint:errcheck
 		}
@@ -670,11 +685,21 @@ func (s *Server) routeFromTun(ctx context.Context) {
 			if ds == nil {
 				break
 			}
+			var muxWriteStart time.Time
+			if pc != nil {
+				muxWriteStart = time.Now()
+			}
 			if _, err := ds.Write(buf[:n]); err == nil {
+				if pc != nil {
+					pc.TrackLatency(perf.StageMuxWrite, time.Since(muxWriteStart))
+				}
 				target.bytesOut.Add(uint64(n))
 				sent = true
 				break
 			}
+		}
+		if pc != nil {
+			pc.TrackLatency(perf.StageFullEgress, time.Since(t0))
 		}
 		_ = sent
 	}
@@ -860,8 +885,15 @@ func (nc *noiseConn) Write(p []byte) (int, error) {
 	}
 	binary.BigEndian.PutUint16(frame[:2], uint16(len(ciphertext)))
 
+	var obfsStart time.Time
+	if nc.perf != nil {
+		obfsStart = time.Now()
+	}
 	_, err = nc.conn.Write(frame[:2+len(ciphertext)])
 	noiseWritePool.Put(bp)
+	if nc.perf != nil {
+		nc.perf.TrackLatency(perf.StageObfsWrite, time.Since(obfsStart))
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -890,7 +922,14 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 	// record contains one complete noise frame [2-byte len ‖ ciphertext].
 	// Passing the full recvBuf (65 KB) triggers ObfsConn's zero-alloc fast
 	// path: the TLS payload is read directly into recvBuf without make().
+	var obfsReadStart time.Time
+	if nc.perf != nil {
+		obfsReadStart = time.Now()
+	}
 	n, err := nc.conn.Read(nc.recvBuf[:])
+	if nc.perf != nil {
+		nc.perf.TrackLatency(perf.StageObfsRead, time.Since(obfsReadStart))
+	}
 	if err != nil {
 		return 0, err
 	}
