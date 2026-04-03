@@ -2,3 +2,5 @@
 /vpnclient_amd64
 /vpnclient_arm64
 /server
+/server.exe
+*.exe
