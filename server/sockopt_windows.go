@@ -3,7 +3,9 @@
 package main
 
 import (
+	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"syscall"
 	"unsafe"
@@ -34,12 +36,11 @@ const sioTCPSetACKFrequency = 0x98000017
 //   - ecncapability=enabled: Explicit Congestion Notification reduces loss-based
 //     retransmissions on congested paths.
 func applySysctls() {
-	// Best-effort — errors are ignored. If any command fails, the VPN
-	// still works, just with default (slower) TCP settings.
+	// Each command is logged so the admin can verify which settings applied.
 	cmds := [][]string{
 		// Largest TCP receive window (up to 16 MB). Default "normal" caps ~256 KB.
 		{"netsh", "int", "tcp", "set", "global", "autotuninglevel=experimental"},
-		// CTCP: better than CUBIC on high-latency links (93 ms RTT).
+		// CTCP: uses both loss and delay signals for congestion control.
 		{"netsh", "int", "tcp", "set", "global", "congestionprovider=ctcp"},
 		// ECN: reduce loss-based retransmissions.
 		{"netsh", "int", "tcp", "set", "global", "ecncapability=enabled"},
@@ -47,17 +48,22 @@ func applySysctls() {
 		{"netsh", "int", "tcp", "set", "global", "rss=enabled"},
 		// TCP timestamps: more accurate RTT measurement for congestion control.
 		{"netsh", "int", "tcp", "set", "global", "timestamps=enabled"},
-		// Initial congestion window = 40 MSS ≈ 58 KB.
-		// Default is 10 MSS (14.5 KB). With 80 ms RTT, a 14 KB IW means the
-		// first burst is only 14KB/0.08s = 175 KB/s. With 40 MSS, the first
-		// burst is 58KB/0.08s = 725 KB/s, and the window ramps up ~3× faster
-		// from there. CRITICAL for download speed.
-		{"netsh", "int", "tcp", "set", "global", "initialcongestionwindow=40"},
+		// Initial congestion window = 100 MSS ≈ 146 KB.
+		// With 80 ms RTT and 0.7% packet loss on the Kazakhstan→Russia route,
+		// the per-connection cwnd stabilizes at ~17 KB. A large IW gets the
+		// first burst through faster before losses kick in. Combined with
+		// multi-connection bonding (8 connections), this yields ~14 Mbps.
+		{"netsh", "int", "tcp", "set", "global", "initialcongestionwindow=100"},
 		// Enable IP forwarding on all interfaces — required for TUN routing.
 		{"netsh", "int", "ipv4", "set", "global", "forwarding=enabled"},
 	}
 	for _, args := range cmds {
-		exec.Command(args[0], args[1:]...).Run() //nolint:errcheck
+		out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[sysctl] FAIL %v: %s\n", args, string(out))
+		} else {
+			fmt.Fprintf(os.Stderr, "[sysctl] OK   %v\n", args)
+		}
 	}
 }
 

@@ -42,8 +42,15 @@ const (
 	ctlHello         = byte(0x01)
 	ctlAssign        = byte(0x02)
 	ctlError         = byte(0xFF)
-	ctlAssignPayload = 9    // ip(4) + prefixLen(1) + gw(4)
-	noiseMaxMsg      = 4096 // max handshake message size
+	ctlSecondary     = byte(0x03) // attach secondary download connection
+	ctlAssignPayload = 9          // ip(4) + prefixLen(1) + gw(4)
+	noiseMaxMsg      = 4096       // max handshake message size
+
+	// numBondConns is the number of parallel TCP connections for download
+	// bonding. Each connection has its own TCP congestion window.
+	// On a lossy path (0.7% loss), each connection sustains ~1.7 Mbps.
+	// 8 connections → ~14 Mbps aggregate download throughput.
+	numBondConns = 8
 
 	// reconnectMaxAttempts limits consecutive reconnect failures before giving up.
 	reconnectMaxAttempts = 30
@@ -310,6 +317,140 @@ func (vs *vpnSession) connect() (
 	return dataStream, mux, assignedIP, gateway, cleanupMux, nil
 }
 
+// secondaryConn holds the state for one bonded secondary connection.
+type secondaryConn struct {
+	dataStream *transport.Stream
+	mux        *transport.Mux
+	cleanup    func()
+}
+
+// connectSecondary opens a secondary TCP connection to the server and
+// attaches it to the existing session (identified by assignedIP). The server
+// adds this connection's data stream to the session's streamBond, giving it
+// an additional TCP congestion window for download traffic.
+func (vs *vpnSession) connectSecondary(assignedIP string) (*secondaryConn, error) {
+	// 1. TCP connect with same tuning as primary.
+	rawConn, err := net.DialTimeout("tcp", vs.serverAddr, 15*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("secondary tcp dial: %w", err)
+	}
+	tc := rawConn.(*net.TCPConn)
+	_ = tc.SetNoDelay(true)
+	_ = tc.SetReadBuffer(2 * 1024 * 1024)
+	_ = tc.SetWriteBuffer(2 * 1024 * 1024)
+	_ = tc.SetKeepAlive(true)
+	_ = tc.SetKeepAlivePeriod(15 * time.Second)
+	if raw, err := tc.SyscallConn(); err == nil {
+		raw.Control(func(fd uintptr) {
+			syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, 0x201, 16384) //nolint:errcheck
+		})
+	}
+	cleanupConn := func() { rawConn.Close() }
+
+	// 2. TLS obfuscation.
+	obfs := transport.NewObfsConn(rawConn)
+	if err := obfs.ClientHandshake(); err != nil {
+		cleanupConn()
+		return nil, fmt.Errorf("secondary obfs: %w", err)
+	}
+
+	// 3. Noise handshake (full mutual auth, same key pair).
+	hs, err := crypto.NewHandshake(crypto.Initiator, vs.kp)
+	if err != nil {
+		cleanupConn()
+		return nil, fmt.Errorf("secondary noise init: %w", err)
+	}
+	msg1, err := hs.WriteMessage1()
+	if err != nil {
+		cleanupConn()
+		return nil, err
+	}
+	if err := writeHandshakeMsg(obfs, msg1); err != nil {
+		cleanupConn()
+		return nil, err
+	}
+	msg2, err := readHandshakeMsg(obfs)
+	if err != nil {
+		cleanupConn()
+		return nil, err
+	}
+	if err := hs.ReadMessage2(msg2); err != nil {
+		cleanupConn()
+		return nil, err
+	}
+	msg3, session, err := hs.WriteMessage3()
+	if err != nil {
+		cleanupConn()
+		return nil, err
+	}
+	if err := writeHandshakeMsg(obfs, msg3); err != nil {
+		cleanupConn()
+		return nil, err
+	}
+
+	// Verify server key if configured.
+	if vs.serverKeyHex != "" {
+		if hex.EncodeToString(session.RemoteStatic[:]) != strings.ToLower(vs.serverKeyHex) {
+			cleanupConn()
+			return nil, fmt.Errorf("secondary: server key mismatch")
+		}
+	}
+
+	// 4. Mux + secondary control stream.
+	nc := &noiseConn{conn: obfs, session: session}
+	mux := transport.NewMux(nc, true)
+	cleanupMux := func() { mux.Close(); cleanupConn() }
+
+	ctlStream, err := mux.OpenStream()
+	if err != nil {
+		cleanupMux()
+		return nil, fmt.Errorf("secondary open ctl: %w", err)
+	}
+
+	// Send ctlSecondary + 4-byte assigned IP.
+	ip := net.ParseIP(assignedIP).To4()
+	if ip == nil {
+		ctlStream.Close()
+		cleanupMux()
+		return nil, fmt.Errorf("secondary: invalid assigned IP %q", assignedIP)
+	}
+	ctlMsg := make([]byte, 5)
+	ctlMsg[0] = ctlSecondary
+	copy(ctlMsg[1:5], ip)
+	if _, err := ctlStream.Write(ctlMsg); err != nil {
+		ctlStream.Close()
+		cleanupMux()
+		return nil, fmt.Errorf("secondary write ctl: %w", err)
+	}
+
+	// Read server response (1 byte).
+	var resp [1]byte
+	if _, err := io.ReadFull(ctlStream, resp[:]); err != nil {
+		ctlStream.Close()
+		cleanupMux()
+		return nil, fmt.Errorf("secondary read resp: %w", err)
+	}
+	ctlStream.Close()
+
+	if resp[0] != ctlAssign {
+		cleanupMux()
+		return nil, fmt.Errorf("secondary: server rejected (0x%02x)", resp[0])
+	}
+
+	// 5. Open data stream.
+	ds, err := mux.OpenStream()
+	if err != nil {
+		cleanupMux()
+		return nil, fmt.Errorf("secondary open data: %w", err)
+	}
+
+	return &secondaryConn{
+		dataStream: ds,
+		mux:        mux,
+		cleanup:    cleanupMux,
+	}, nil
+}
+
 // ---------------------------------------------------------------------------
 // Main VPN logic with auto-reconnect
 // ---------------------------------------------------------------------------
@@ -344,6 +485,11 @@ func applyMacOSTuning() {
 		{"net.inet.tcp.autorcvbufmax", "4194304"},
 		// TCP Fast Open (saves 1 RTT on reconnect).
 		{"net.inet.tcp.fastopen", "3"},
+		// ECN: allow routers to signal congestion without dropping packets.
+		// If the Russia-Kazakhstan route supports ECN, this eliminates the
+		// packet drops that cause TCP to halve its congestion window.
+		{"net.inet.tcp.ecn_initiate_out", "1"},
+		{"net.inet.tcp.ecn_negotiate_in", "1"},
 	}
 	for _, s := range sysctls {
 		out, err := exec.Command("sysctl", "-w", s.k+"="+s.v).CombinedOutput()
@@ -459,11 +605,28 @@ func run() error {
 			log.Info("routes removed")
 		}
 
+		// Open secondary connections for download bonding.
+		// Each secondary connection has its own TCP congestion window.
+		var secondaries []*secondaryConn
+		for i := 1; i < numBondConns; i++ {
+			sc, err := vs.connectSecondary(assignedIP)
+			if err != nil {
+				log.Warn("secondary connection failed", "n", i, "err", err)
+				break // partial bonding is OK — use what we got
+			}
+			secondaries = append(secondaries, sc)
+			log.Info("secondary connected", "n", i+1, "total", len(secondaries)+1)
+		}
+		log.Info("bonding active", "connections", len(secondaries)+1)
+
 		// Run bidirectional forwarding until disconnection.
 		log.Info("VPN running — press Ctrl+C to disconnect")
-		disconnectErr := runForwarding(ctx, tun, dataStream)
+		disconnectErr := runForwarding(ctx, tun, dataStream, secondaries)
 
 		// Cleanup this session.
+		for _, sc := range secondaries {
+			sc.cleanup()
+		}
 		removeRoutes()
 		cleanup()
 
@@ -479,42 +642,48 @@ func run() error {
 }
 
 // runForwarding performs bidirectional TUN↔VPN packet forwarding with an
-// application-level keepalive. Returns nil on clean shutdown (ctx cancelled),
-// or an error on connection loss.
-func runForwarding(ctx context.Context, tun *tunDevice, dataStream *transport.Stream) error {
-	errCh := make(chan error, 2)
+// application-level keepalive. Multiple data streams (primary + secondaries)
+// are used for download bonding — each runs in its own receive goroutine.
+// Returns nil on clean shutdown (ctx cancelled), or an error on connection loss.
+func runForwarding(ctx context.Context, tun *tunDevice, primaryStream *transport.Stream, secondaries []*secondaryConn) error {
+	errCh := make(chan error, 2+len(secondaries))
 	var wg sync.WaitGroup
 
-	// Application-level keepalive: sends a tiny (4-byte) packet through the
-	// data stream every 15 s. This keeps the VPN tunnel "alive" for any
-	// middlebox that inspects payload flow, not just TCP segments.
-	// The server ignores packets < 20 bytes (not valid IPv4).
+	// Collect all streams for upload round-robin.
+	allStreams := make([]*transport.Stream, 0, 1+len(secondaries))
+	allStreams = append(allStreams, primaryStream)
+	for _, sc := range secondaries {
+		allStreams = append(allStreams, sc.dataStream)
+	}
+	var uploadIdx atomic.Uint32
+
+	// Application-level keepalive on primary stream.
 	keepaliveDone := make(chan struct{})
 	go func() {
 		defer close(keepaliveDone)
 		ticker := time.NewTicker(keepaliveInterval)
 		defer ticker.Stop()
-		// 4-byte keepalive "packet" — not valid IPv4, ignored by server TUN writer.
 		ping := []byte{0x00, 0x00, 0x00, 0x00}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if _, err := dataStream.Write(ping); err != nil {
-					return // connection dead, forwarding goroutines will report it
+				if _, err := primaryStream.Write(ping); err != nil {
+					return
 				}
 			}
 		}
 	}()
 
-	// TUN → VPN
+	// TUN → VPN (upload): round-robin across all connections.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 65536)
+		n := uint32(len(allStreams))
 		for {
-			n, err := tun.Read(buf)
+			nr, err := tun.Read(buf)
 			if err != nil {
 				select {
 				case <-ctx.Done():
@@ -524,10 +693,11 @@ func runForwarding(ctx context.Context, tun *tunDevice, dataStream *transport.St
 				}
 				return
 			}
-			if n < 20 {
+			if nr < 20 {
 				continue
 			}
-			if _, err := dataStream.Write(buf[:n]); err != nil {
+			idx := uploadIdx.Add(1) % n
+			if _, err := allStreams[idx].Write(buf[:nr]); err != nil {
 				select {
 				case <-ctx.Done():
 					errCh <- nil
@@ -539,36 +709,42 @@ func runForwarding(ctx context.Context, tun *tunDevice, dataStream *transport.St
 		}
 	}()
 
-	// VPN → TUN
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 65536)
-		for {
-			n, err := dataStream.Read(buf)
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					errCh <- nil
-				default:
-					errCh <- fmt.Errorf("vpn read: %w", err)
+	// VPN → TUN (download): one goroutine per stream.
+	// Each goroutine reads from its stream and writes to the shared TUN.
+	startRecvGoroutine := func(stream *transport.Stream, label string) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 65536)
+			for {
+				n, err := stream.Read(buf)
+				if err != nil {
+					select {
+					case <-ctx.Done():
+					default:
+						errCh <- fmt.Errorf("%s read: %w", label, err)
+					}
+					return
 				}
-				return
-			}
-			if n < 20 {
-				continue
-			}
-			if _, err := tun.Write(buf[:n]); err != nil {
-				select {
-				case <-ctx.Done():
-					errCh <- nil
-				default:
-					errCh <- fmt.Errorf("tun write: %w", err)
+				if n < 20 {
+					continue
 				}
-				return
+				if _, err := tun.Write(buf[:n]); err != nil {
+					select {
+					case <-ctx.Done():
+					default:
+						errCh <- fmt.Errorf("tun write: %w", err)
+					}
+					return
+				}
 			}
-		}
-	}()
+		}()
+	}
+
+	startRecvGoroutine(primaryStream, "primary")
+	for i, sc := range secondaries {
+		startRecvGoroutine(sc.dataStream, fmt.Sprintf("secondary-%d", i+1))
+	}
 
 	// Wait for first error or clean shutdown.
 	var result error
@@ -579,7 +755,6 @@ func runForwarding(ctx context.Context, tun *tunDevice, dataStream *transport.St
 		result = err
 	}
 
-	// Stop keepalive and wait for goroutines.
 	<-keepaliveDone
 	return result
 }

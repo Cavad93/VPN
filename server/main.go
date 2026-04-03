@@ -34,7 +34,8 @@ import (
 const (
 	ctlHello            = uint8(0x01) // client→server: request IP assignment
 	ctlAssign           = uint8(0x02) // server→client: IP assignment response
-	ctlError            = uint8(0x03) // server→client: error
+	ctlError            = uint8(0xFF) // server→client: error
+	ctlSecondary        = uint8(0x03) // client→server: attach secondary download connection
 	ctlAssignPayloadLen = 9           // 4(ip) + 1(prefix_len) + 4(gateway)
 
 	noiseHandshakeMsgMaxSize = 4096
@@ -66,6 +67,55 @@ func DefaultConfig() Config {
 // SessionStats is an alias for api.SessionInfo — exported for compatibility.
 type SessionStats = api.SessionInfo
 
+// streamBond distributes download traffic across multiple parallel TCP
+// connections. Each connection has its own TCP congestion window; the
+// aggregate throughput ≈ N × per-connection throughput. With 0.7% packet
+// loss limiting each connection to ~1.7 Mbps, 8 connections yield ~14 Mbps.
+type streamBond struct {
+	mu   sync.Mutex
+	list []*transport.Stream
+	idx  int
+}
+
+func (sb *streamBond) add(s *transport.Stream) {
+	sb.mu.Lock()
+	sb.list = append(sb.list, s)
+	sb.mu.Unlock()
+}
+
+func (sb *streamBond) remove(s *transport.Stream) {
+	sb.mu.Lock()
+	for i, st := range sb.list {
+		if st == s {
+			sb.list = append(sb.list[:i], sb.list[i+1:]...)
+			break
+		}
+	}
+	sb.mu.Unlock()
+}
+
+// next returns the next stream in round-robin order, or nil if empty.
+func (sb *streamBond) next() *transport.Stream {
+	sb.mu.Lock()
+	n := len(sb.list)
+	if n == 0 {
+		sb.mu.Unlock()
+		return nil
+	}
+	s := sb.list[sb.idx%n]
+	sb.idx++
+	sb.mu.Unlock()
+	return s
+}
+
+// count returns the number of bonded streams.
+func (sb *streamBond) count() int {
+	sb.mu.Lock()
+	n := len(sb.list)
+	sb.mu.Unlock()
+	return n
+}
+
 // clientSession holds per-client runtime state.
 type clientSession struct {
 	id           uint64
@@ -73,7 +123,7 @@ type clientSession struct {
 	noiseSession *crypto.Session
 	mux          *transport.Mux
 	assignedIP   net.IP
-	dataStream   atomic.Pointer[transport.Stream] // lock-free on the hot TUN→client path
+	bond         streamBond // round-robin across parallel download connections
 	bytesIn      atomic.Uint64
 	bytesOut     atomic.Uint64
 	connectedAt  time.Time
@@ -276,6 +326,9 @@ func (s *Server) DisconnectSession(id uint64) bool {
 }
 
 // handleConn handles a newly accepted TCP connection.
+// Supports both primary connections (new session + IP assignment) and
+// secondary connections (attach additional download stream to existing session
+// for multi-connection bonding).
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
@@ -305,7 +358,35 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	// Create mux (server = not client)
 	mux := transport.NewMux(nc, false)
 
-	// Register session
+	// Accept first stream to peek at connection type.
+	firstStream, err := mux.AcceptStream(ctx)
+	if err != nil {
+		mux.Close()
+		return
+	}
+
+	var typeBuf [1]byte
+	if _, err := io.ReadFull(firstStream, typeBuf[:]); err != nil {
+		firstStream.Close()
+		mux.Close()
+		return
+	}
+
+	switch typeBuf[0] {
+	case ctlHello:
+		s.runPrimaryConn(ctx, session, firstStream, mux)
+	case ctlSecondary:
+		s.runSecondaryConn(ctx, session.RemoteStatic, firstStream, mux)
+	default:
+		s.logger.Warn("unknown ctl type", "type", typeBuf[0])
+		firstStream.Close()
+		mux.Close()
+	}
+}
+
+// runPrimaryConn handles a primary VPN connection: creates a session,
+// assigns an IP, and runs the data stream loop.
+func (s *Server) runPrimaryConn(ctx context.Context, session *crypto.Session, ctlStream *transport.Stream, mux *transport.Mux) {
 	connCtx, cancel := context.WithCancel(ctx)
 	cs := &clientSession{
 		id:           s.nextSessionID(),
@@ -333,8 +414,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			s.ipIndex.Delete(packed)
 			s.pool.release(cs.assignedIP)
 		}
-		s.logger.Info("session closed", "id", cs.id)
-		// Fire push notification for disconnect (non-blocking, after cleanup).
+		s.logger.Info("session closed", "id", cs.id, "bonds", cs.bond.count())
 		if s.notifSvc != nil && assignedIP != "" {
 			s.notifSvc.NotifySessionDisconnected(cs.id, assignedIP)
 		}
@@ -342,41 +422,78 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 	s.logger.Info("new session", "id", cs.id, "key", hex.EncodeToString(session.RemoteStatic[:]))
 
-	// Accept stream loop
+	// Handle IP assignment via the control stream (ctlHello already consumed).
+	if err := s.handleControlStream(ctx, cs, ctlStream); err != nil {
+		s.logger.Warn("control stream error", "id", cs.id, "err", err)
+		return
+	}
+
+	// Accept data streams.
 	for {
 		stream, err := mux.AcceptStream(connCtx)
 		if err != nil {
 			return
 		}
-		go s.handleStream(connCtx, cs, stream)
+		go s.handleDataStream(connCtx, cs, stream)
 	}
 }
 
-// handleStream dispatches a stream to the appropriate handler.
-func (s *Server) handleStream(ctx context.Context, cs *clientSession, stream *transport.Stream) {
-	if cs.assignedIP == nil {
-		if err := s.handleControlStream(ctx, cs, stream); err != nil {
-			s.logger.Warn("control stream error", "id", cs.id, "err", err)
-		}
-	} else {
-		s.handleDataStream(ctx, cs, stream)
+// runSecondaryConn handles a secondary (bonded) connection. It attaches
+// a new data stream to an existing primary session, giving it an additional
+// TCP connection with its own congestion window.
+func (s *Server) runSecondaryConn(ctx context.Context, clientKey [32]byte, ctlStream *transport.Stream, mux *transport.Mux) {
+	defer mux.Close()
+
+	// Read 4-byte assigned IP from the secondary handshake.
+	var ipBuf [4]byte
+	if _, err := io.ReadFull(ctlStream, ipBuf[:]); err != nil {
+		ctlStream.Close()
+		return
 	}
+
+	// Find existing session by IP.
+	packed := binary.BigEndian.Uint32(ipBuf[:])
+	val, ok := s.ipIndex.Load(packed)
+	if !ok {
+		ctlStream.Write([]byte{ctlError}) //nolint:errcheck
+		ctlStream.Close()
+		s.logger.Warn("secondary: no session for IP", "ip", net.IP(ipBuf[:]).String())
+		return
+	}
+	cs := val.(*clientSession)
+
+	// Verify the Noise key matches the primary session's key.
+	if cs.remoteKey != clientKey {
+		ctlStream.Write([]byte{ctlError}) //nolint:errcheck
+		ctlStream.Close()
+		s.logger.Warn("secondary: key mismatch")
+		return
+	}
+
+	// Acknowledge the secondary attachment.
+	if _, err := ctlStream.Write([]byte{ctlAssign}); err != nil {
+		ctlStream.Close()
+		return
+	}
+	ctlStream.Close()
+
+	s.logger.Info("secondary attached", "id", cs.id, "bonds", cs.bond.count()+1)
+
+	// Accept the data stream from this secondary connection.
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	dataStream, err := mux.AcceptStream(connCtx)
+	if err != nil {
+		return
+	}
+	s.handleDataStream(connCtx, cs, dataStream)
 }
 
 // handleControlStream processes the control stream for IP assignment.
+// The ctlHello type byte has already been consumed by handleConn.
 func (s *Server) handleControlStream(ctx context.Context, cs *clientSession, stream *transport.Stream) error {
 	defer stream.Close()
-
-	// Read control byte
-	buf := make([]byte, 1)
-	if _, err := io.ReadFull(stream, buf); err != nil {
-		return fmt.Errorf("read control byte: %w", err)
-	}
-	if buf[0] != ctlHello {
-		// Send error and return
-		stream.Write([]byte{ctlError}) //nolint:errcheck
-		return fmt.Errorf("expected ctlHello (0x%02x), got 0x%02x", ctlHello, buf[0])
-	}
 
 	// Allocate IP
 	ip, err := s.pool.allocate()
@@ -416,10 +533,10 @@ func (s *Server) handleControlStream(ctx context.Context, cs *clientSession, str
 
 // handleDataStream relays data between the stream and the TUN device.
 func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream *transport.Stream) {
-	cs.dataStream.Store(stream)
+	cs.bond.add(stream)
 
 	defer func() {
-		cs.dataStream.CompareAndSwap(stream, nil)
+		cs.bond.remove(stream)
 		stream.Close()
 	}()
 
@@ -497,13 +614,14 @@ func (s *Server) routeFromTun(ctx context.Context) {
 		}
 		target := val.(*clientSession)
 
-		ds := target.dataStream.Load()
+		// Round-robin across bonded streams (multiple TCP connections).
+		// Each connection has its own congestion window, so N connections
+		// yield ~N× throughput on lossy links.
+		ds := target.bond.next()
 		if ds == nil {
 			continue
 		}
 
-		// ds.Write → mux.writeFrame already copies payload into a frame buffer,
-		// so we can pass buf[:n] directly without an extra allocation.
 		if _, err := ds.Write(buf[:n]); err == nil {
 			target.bytesOut.Add(uint64(n))
 		}
