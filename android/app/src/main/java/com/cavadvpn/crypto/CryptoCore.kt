@@ -5,11 +5,8 @@ import org.bouncycastle.crypto.generators.X25519KeyPairGenerator
 import org.bouncycastle.crypto.params.X25519KeyGenerationParameters
 import org.bouncycastle.crypto.params.X25519PrivateKeyParameters
 import org.bouncycastle.crypto.params.X25519PublicKeyParameters
-import org.bouncycastle.crypto.engines.ChaCha7539Engine
-import org.bouncycastle.crypto.modes.ChaChaPolyCipherMode
 import org.bouncycastle.crypto.params.AEADParameters
 import org.bouncycastle.crypto.params.KeyParameter
-import org.bouncycastle.jcajce.provider.asymmetric.ec.BCECPrivateKey
 import java.security.SecureRandom
 
 /** Size in bytes of an X25519 key and ChaCha20-Poly1305 key. */
