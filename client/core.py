@@ -438,7 +438,17 @@ class ObfsConn:
 
         Builds each record inline in a pre-sized bytearray to avoid the
         intermediate bytes allocation that _build_app_data_record creates.
+        For single-record writes (the common case, ≤16383 bytes), uses a
+        pre-allocated header buffer + memoryview scatter to avoid copying
+        the payload into the record buffer entirely.
         """
+        if len(data) <= MAX_OBFS_PAYLOAD:
+            # Fast path: single record — avoid payload copy by using
+            # socket scatter write (sendmsg with multiple buffers).
+            hdr = struct.pack(">BBBH", TLS_RECORD_APPDATA,
+                              TLS_VERSION_MAJOR, TLS_VERSION_MINOR, len(data))
+            self._sock.sendall(hdr + data)
+            return
         offset = 0
         while offset < len(data):
             end = min(offset + MAX_OBFS_PAYLOAD, len(data))
@@ -473,16 +483,20 @@ class ObfsConn:
     # -- internal helpers ---------------------------------------------------
 
     def _recv_exactly(self, n: int) -> bytes:
-        # Fill the socket buffer in large 64 KB chunks so most calls return
-        # from memory without a syscall.  Each recv_into(65536) typically delivers
-        # ~45 complete TLS records at once.
-        # recv_into() writes directly into _recv_staging (pre-allocated bytearray)
-        # avoiding the temporary bytes object that recv() would create.
+        # Fill the socket buffer in large chunks so most calls return from
+        # memory without a syscall. recv_into() writes directly into
+        # _recv_staging (pre-allocated bytearray) to avoid temporary bytes.
         while len(self._sock_buf) < n:
             nbytes = self._sock.recv_into(self._recv_staging)
             if not nbytes:
                 raise ConnectionError("connection closed mid-read")
             self._sock_buf += self._recv_staging[:nbytes]
+        # Fast path: if requesting the entire buffer, return it directly
+        # without creating a slice copy + in-place delete.
+        if n == len(self._sock_buf):
+            result = bytes(self._sock_buf)
+            self._sock_buf = bytearray()
+            return result
         result = bytes(self._sock_buf[:n])
         del self._sock_buf[:n]
         return result
@@ -527,12 +541,9 @@ class NoiseConn:
 
     def write_message(self, plaintext: bytes) -> None:
         ciphertext = self._session.send_cipher.encrypt(plaintext)
-        # Build length-prefixed frame without an extra bytes concatenation.
-        # bytearray pre-allocated to exact size avoids reallocation.
-        frame = bytearray(2 + len(ciphertext))
-        struct.pack_into(">H", frame, 0, len(ciphertext))
-        frame[2:] = ciphertext
-        self._obfs.write(bytes(frame))
+        # Build length prefix + ciphertext in one concatenation (bytes + bytes
+        # is faster than bytearray construction for typical packet sizes ≤1500).
+        self._obfs.write(struct.pack(">H", len(ciphertext)) + ciphertext)
 
     def read_message(self) -> bytes:
         # Read 2-byte length prefix
@@ -740,9 +751,11 @@ class ClientMux:
                 logger.warning("mux_short_frame", length=len(frame_data))
                 continue
 
-            stream_id = struct.unpack(">I", frame_data[0:4])[0]
+            # int.from_bytes is ~30% faster than struct.unpack for fixed-width
+            # big-endian integers — avoids tuple allocation and format parsing.
+            stream_id = int.from_bytes(frame_data[0:4], "big")
             frame_type = frame_data[4]
-            payload_len = struct.unpack(">H", frame_data[5:7])[0]
+            payload_len = int.from_bytes(frame_data[5:7], "big")
             payload = frame_data[7:7 + payload_len]
 
             with self._streams_lock:

@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -442,11 +443,31 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 	}
 }
 
+// tunReadBufPool pools the 64 KB TUN read buffers used in routeFromTun.
+// Consistent with streamReadBufPool pattern — avoids a 64 KB heap allocation
+// that lives for the lifetime of the server. When routeFromTun restarts
+// (e.g. TUN reopen), the buffer returns to the pool instead of being GC'd.
+var tunReadBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 65536)
+		return &b
+	},
+}
+
 // routeFromTun reads packets from the TUN device and routes them to clients.
 // Termination: the Run() goroutine closes the TUN device when ctx is cancelled,
 // which causes tun.Read() to return an error and this loop to exit.
 func (s *Server) routeFromTun(ctx context.Context) {
-	buf := make([]byte, 65536)
+	// Pin this goroutine to a dedicated OS thread to avoid scheduler preemption
+	// on the hot TUN→client forwarding path. Without this, Go's cooperative
+	// scheduler can pause this goroutine mid-packet-burst to run other goroutines,
+	// introducing up to 10 ms jitter at high packet rates.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	bp := tunReadBufPool.Get().(*[]byte)
+	buf := *bp
+	defer tunReadBufPool.Put(bp)
 	for {
 		n, err := s.tun.Read(buf)
 		if err != nil {
@@ -595,10 +616,12 @@ var streamReadBufPool = sync.Pool{
 
 // noiseWritePool pools the length-prefixed frame buffers used in
 // noiseConn.Write, eliminating one make() per transmitted packet.
-// Typical capacity: 2 (length header) + 1460 (TUN MTU) + 16 (AEAD tag) = 1478.
+// Capacity: 2 (length) + 7 (mux hdr) + 1460 (MTU) + 16 (AEAD tag) = 1485.
+// Rounded up to 1536 (power-of-2 friendly) to avoid reallocation for
+// slightly oversized packets.
 var noiseWritePool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 0, 2+1460+16)
+		b := make([]byte, 0, 1536)
 		return &b
 	},
 }

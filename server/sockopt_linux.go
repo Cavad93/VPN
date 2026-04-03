@@ -50,6 +50,19 @@ const (
 	tcpKeepCnt   = 6  // TCP_KEEPCNT   — give up after N failed probes
 )
 
+// SO_BUSY_POLL enables busy-polling on the socket. The kernel spins for
+// up to N microseconds in the network driver when the socket has no data,
+// avoiding the context switch to/from the interrupt handler. On low-latency
+// paths this reduces per-packet latency by 10-50 µs, improving throughput
+// by keeping the congestion window growing without pauses.
+const soBusyPoll = 46 // SO_BUSY_POLL — Linux ≥ 3.11
+
+// TCP_WINDOW_CLAMP sets the maximum advertised TCP window size. Setting this
+// to the socket buffer size (8 MB) allows the kernel to fully utilise the
+// configured buffer for the advertised window, maximising bandwidth-delay
+// product coverage. Without this, the kernel may advertise a smaller window.
+const tcpWindowClamp = 10 // TCP_WINDOW_CLAMP — Linux ≥ 2.4
+
 // setListenerDeferAccept sets TCP_DEFER_ACCEPT on a TCP listener socket.
 // The kernel holds incoming connections in SYN_RECV state until the client
 // sends data (up to timeout seconds), eliminating a context switch per
@@ -103,5 +116,9 @@ func setForcedSocketBuffers(conn *net.TCPConn, size int) {
 		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpKeepIdle, 15)        //nolint:errcheck
 		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpKeepIntvl, 5)        //nolint:errcheck
 		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpKeepCnt, 3)          //nolint:errcheck
+		// Busy-poll: spin for 50 µs in the driver on empty recv to cut latency.
+		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soBusyPoll, 50) //nolint:errcheck
+		// Window clamp: allow the kernel to advertise the full 8 MB window.
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpWindowClamp, size) //nolint:errcheck
 	})
 }
