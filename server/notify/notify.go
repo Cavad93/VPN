@@ -232,6 +232,9 @@ type NotificationService struct {
 	logger      *slog.Logger
 	queue       chan pendingNotif
 	wg          sync.WaitGroup
+	sendMu      sync.Mutex // protects stopped + queue send against Stop race
+	stopped     bool
+	stopOnce    sync.Once
 }
 
 // NewNotificationService creates a new service and starts the background
@@ -248,9 +251,14 @@ func NewNotificationService(logger *slog.Logger) *NotificationService {
 }
 
 // Stop drains the notification queue and stops the background worker.
-// Blocks until all in-flight deliveries complete.
+// Blocks until all in-flight deliveries complete. Safe to call multiple times.
 func (s *NotificationService) Stop() {
-	close(s.queue)
+	s.stopOnce.Do(func() {
+		s.sendMu.Lock()
+		s.stopped = true
+		close(s.queue)
+		s.sendMu.Unlock()
+	})
 	s.wg.Wait()
 }
 
@@ -320,12 +328,19 @@ func subscriberWantsEvent(sub *Subscriber, event string) bool {
 
 // Notify queues a notification for the given event (non-blocking).
 // If the queue is full the notification is dropped and a warning is logged.
+// Safe to call after Stop() — silently ignored.
 func (s *NotificationService) Notify(event string, notif Notification) {
+	s.sendMu.Lock()
+	if s.stopped {
+		s.sendMu.Unlock()
+		return
+	}
 	select {
 	case s.queue <- pendingNotif{event: event, notif: notif}:
 	default:
 		s.logger.Warn("notification queue full, dropping event", "event", event)
 	}
+	s.sendMu.Unlock()
 }
 
 // NotifySessionConnected sends a connection alert.
