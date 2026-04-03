@@ -24,6 +24,7 @@ import (
 
 	"github.com/cavad93/vpn/server/api"
 	"github.com/cavad93/vpn/server/crypto"
+	"github.com/cavad93/vpn/server/notify"
 	"github.com/cavad93/vpn/server/transport"
 )
 
@@ -112,6 +113,9 @@ type Server struct {
 	pool        *ipPool
 	nextIDMu    sync.Mutex
 	nextID      uint64
+	// notifSvc is optional; when set, push notifications are fired on
+	// session connect / disconnect events.
+	notifSvc *notify.NotificationService
 }
 
 // NewServer creates a new Server. allowedKeys may be nil/empty to allow any key.
@@ -309,12 +313,18 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		s.mu.Lock()
 		delete(s.sessions, cs.id)
 		s.mu.Unlock()
+		assignedIP := ""
 		if cs.assignedIP != nil {
+			assignedIP = cs.assignedIP.String()
 			packed := binary.BigEndian.Uint32(cs.assignedIP.To4())
 			s.ipIndex.Delete(packed)
 			s.pool.release(cs.assignedIP)
 		}
 		s.logger.Info("session closed", "id", cs.id)
+		// Fire push notification for disconnect (non-blocking, after cleanup).
+		if s.notifSvc != nil && assignedIP != "" {
+			s.notifSvc.NotifySessionDisconnected(cs.id, assignedIP)
+		}
 	}()
 
 	s.logger.Info("new session", "id", cs.id, "key", hex.EncodeToString(session.RemoteStatic[:]))
@@ -382,6 +392,12 @@ func (s *Server) handleControlStream(ctx context.Context, cs *clientSession, str
 	}
 
 	s.logger.Info("assigned IP", "id", cs.id, "ip", ip.String())
+
+	// Fire push notification for new connection (non-blocking).
+	if s.notifSvc != nil {
+		s.notifSvc.NotifySessionConnected(cs.id, ip.String())
+	}
+
 	return nil
 }
 
@@ -397,7 +413,12 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 	// stream.Read() blocks until data arrives or the mux/conn is closed.
 	// Context cancellation closes the mux (see handleConn defer), which
 	// unblocks Read() with an error — no per-iteration select needed.
-	buf := make([]byte, 65536)
+	//
+	// Borrow a 64 KB buffer from the pool to avoid one heap allocation per
+	// session (streamReadBufPool, PERF IMPROVEMENT 2).
+	bp := streamReadBufPool.Get().(*[]byte)
+	buf := *bp
+	defer streamReadBufPool.Put(bp)
 	for {
 		n, err := stream.Read(buf)
 		if err != nil {
@@ -552,6 +573,18 @@ func writeHandshakeMsg(conn net.Conn, msg []byte) error {
 // maxNoiseFrame is the largest ciphertext we will ever read in one frame:
 // 65535 payload + 16-byte ChaCha20-Poly1305 AEAD tag.
 const maxNoiseFrame = 65535 + 16
+
+// streamReadBufPool pools the 64 KB read buffers used in handleDataStream.
+// Each VPN session requires one buffer for its lifetime (~65536 bytes).
+// Pooling eliminates the GC pressure of allocating and freeing these large
+// slices when sessions connect/disconnect frequently (e.g. mobile clients).
+// PERF IMPROVEMENT 2: pool 64 KB stream read buffers to reduce GC churn.
+var streamReadBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 65536)
+		return &b
+	},
+}
 
 // noiseWritePool pools the length-prefixed frame buffers used in
 // noiseConn.Write, eliminating one make() per transmitted packet.
@@ -896,9 +929,22 @@ func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *sl
 	if cfg.ListenAddr == "" {
 		return
 	}
+	// Create the push notification service and attach it to the server so that
+	// session connect/disconnect events trigger push alerts.
+	notifSvc := notify.NewNotificationService(logger)
+	srv.notifSvc = notifSvc
+
 	apiSrv := api.NewAPIServer(cfg, srv, logger)
 	// Enable QR code generation using the server's public key and listen address.
 	apiSrv.SetQRServer(srv)
+	// Enable push notification subscription management via the REST API.
+	apiSrv.SetNotificationService(notifSvc)
+
+	go func() {
+		<-ctx.Done()
+		notifSvc.Stop()
+	}()
+
 	go func() {
 		if err := apiSrv.Run(ctx); err != nil {
 			logger.Error("api server error", "err", err)

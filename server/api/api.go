@@ -75,13 +75,14 @@ func DefaultConfig() Config {
 
 // APIServer is the HTTP management API server.
 type APIServer struct {
-	cfg     Config
-	srv     ServerIface
-	qrSrv   QRServerIface
-	invites *InviteStore
-	logger  *slog.Logger
-	mux     *http.ServeMux
-	logBuf  *LogBuffer
+	cfg      Config
+	srv      ServerIface
+	qrSrv    QRServerIface
+	invites  *InviteStore
+	notifSvc NotificationService
+	logger   *slog.Logger
+	mux      *http.ServeMux
+	logBuf   *LogBuffer
 }
 
 // NewAPIServer creates a new APIServer and registers all routes.

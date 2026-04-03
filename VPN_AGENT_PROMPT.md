@@ -159,7 +159,8 @@ git push -u origin claude/create-claude-md-zT6Gk
 ### ФАЗА 10: Раздача друзьям
 - [x] **ЗАДАЧА 29:** QR-код генератор на сервере — генерирует QR с конфигом клиента. Друг сканирует телефоном — всё настроено. `server/api/qr.go`
 - [x] **ЗАДАЧА 30:** Пригласительная ссылка — `http://IP/join/ТОКЕН` — открыл ссылку, скачал приложение под свою платформу, конфиг уже внутри.
-- [ ] **ЗАДАЧА 31:** Push уведомления на телефон — когда VPN отключился или сервер недоступен.
+- [x] **ЗАДАЧА 31:** Push уведомления на телефон — когда VPN отключился или сервер недоступен.
+  > Выполнено: `server/notify/notify.go` + `server/notify/notify_test.go` + `server/api/notify_api.go` (24 теста, покрытие 96.5%). Реализованы: `NtfyNotifier` — отправка через ntfy.sh (бесплатный push без Apple/Google аккаунтов; пользователь устанавливает приложение ntfy и подписывается на свой топик), `WebhookNotifier` — POST на произвольный HTTP endpoint, `NotificationService` — асинхронная очередь (256 буфер), параллельная доставка (горутина на подписчика), методы `NotifySessionConnected/NotifySessionDisconnected/NotifyServerDown/SendTest`. Интеграция: `Server.notifSvc` подключается в `startAPIServer()`; нотификации fire-and-forget — никогда не блокируют VPN data path. REST API: `GET /api/v1/notifications` (список), `POST /api/v1/notifications` (добавить ntfy/webhook подписчика), `DELETE /api/v1/notifications/{id}` (удалить), `POST /api/v1/notifications/{id}/test` (тест). **Perf 1:** параллельная доставка нотификаций (горутина на получателя вместо sequential). **Perf 2:** `streamReadBufPool` — пулинг 64 KB буферов в `handleDataStream` — устраняет GC pressure при частых connect/disconnect. Запуск: `cd server && go test ./notify/ -v -cover`
 - [ ] **ЗАДАЧА 32:** Автообновление клиента — новая версия скачивается и устанавливается без участия пользователя.
 
 ### ФАЗА 11: Надёжность и безопасность

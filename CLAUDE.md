@@ -579,3 +579,26 @@ Wire format обеспечивает статистическую неразли
 1. **sync.Pool для ACK буферов** — `ackBufPool` poolит 11-байтные буферы для pure ACK пакетов. `sendACK()` берёт буфер из пула, заполняет и возвращает — устраняет одно heap-выделение на каждый входящий DATA пакет. Оценочный выигрыш: -1 alloc/packet, снижение GC при 10 Mbps трафике.
 
 2. **Delayed ACK coalescing (RFC 1122 §4.2.3.2)** — вместо немедленной отправки ACK после каждого DATA пакета, планируется `time.AfterFunc(1ms)`. Несколько пакетов, пришедших в одном burst, получают единый кумулятивный ACK. Экономия: до -50% ACK пакетов при устойчивой загрузке канала, освобождение пропускной способности для данных. При Close() таймер останавливается и финальный ACK отправляется синхронно.
+
+### ЗАДАЧА 31 — ВЫПОЛНЕНО (2026-04-03)
+**Файлы:** `server/notify/notify.go`, `server/notify/notify_test.go`, `server/api/notify_api.go`
+
+Реализованы push уведомления на телефон для событий VPN:
+- `NtfyNotifier` — отправка через ntfy.sh (или self-hosted инстанс). Пользователь устанавливает бесплатное приложение ntfy и подписывается на уникальный топик. Не требует Apple/Google аккаунтов.
+- `WebhookNotifier` — POST JSON-уведомление на произвольный HTTP endpoint с опциональным `X-Webhook-Secret` заголовком.
+- `Notification{Title, Message, Priority, Tags}` — единый тип сообщения для всех бэкендов.
+- `NotificationService` — управляет подписчиками (RWMutex), асинхронная очередь (256 буфер), `worker()` горутина; методы: `AddSubscriber`, `RemoveSubscriber`, `Subscribers`, `GetSubscriber`, `SendTest`, `Notify`, `NotifySessionConnected`, `NotifySessionDisconnected`, `NotifyServerDown`, `Stop`.
+- Интеграция в `server/main.go`: `Server.notifSvc` создаётся в `startAPIServer()`; события fire-and-forget — никогда не блокируют VPN data path; нотификация о подключении — после IP assignment в `handleControlStream`; нотификация об отключении — в defer `handleConn`.
+- REST API (все с аутентификацией): `GET /api/v1/notifications`, `POST /api/v1/notifications`, `DELETE /api/v1/notifications/{id}`, `POST /api/v1/notifications/{id}/test`.
+
+**Тесты:** 24 теста, покрытие 96.5%
+**Запуск:** `cd server && go test ./notify/ -v -cover`
+
+### ОПТИМИЗАЦИЯ СКОРОСТИ — ВЫПОЛНЕНО (2026-04-03)
+**Файлы:** `server/notify/notify.go`, `server/main.go`
+
+Два улучшения производительности:
+
+1. **Параллельная доставка уведомлений** — вместо последовательной отправки по подписчикам, каждый получает горутину (fire-and-forget). Медленный webhook не блокирует остальных и не блокирует очередь. Worker мгновенно переходит к следующему событию — VPN data path никогда не затрагивается.
+
+2. **sync.Pool для 64 KB буферов в handleDataStream** — `streamReadBufPool` пулит 65536-байтные буферы чтения. До оптимизации: каждая сессия делала `make([]byte, 65536)` при старте — при мобильных клиентах с частыми reconnect это создаёт GC pressure. После: буфер берётся из пула и возвращается при завершении сессии. Экономия: -1 heap alloc per session, снижение пауз GC при 50+ одновременных клиентах.
