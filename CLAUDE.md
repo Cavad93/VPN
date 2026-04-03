@@ -649,3 +649,26 @@ Wire format обеспечивает статистическую неразли
 1. **60-секундная задержка первой проверки** — `_run_loop` ждёт 60 с перед первым обращением к update_url. VPN-туннель успевает полностью подняться прежде чем появится любой фоновый HTTP-трафик обновлений. Задержка прерывается через `stop_event.wait()` — `stop()` немедленно завершает поток.
 
 2. **Стриминговая загрузка 64 KB чанками** — `_Downloader.download()` читает ответ чанками `_DOWNLOAD_CHUNK_SIZE = 65536` байт, совпадающими с `streamReadBufPool` на сервере. SHA-256 обновляется инкрементально на лету — весь файл обновления никогда не находится в памяти целиком. Это устраняет GC pause при загрузке обновления во время активного VPN-соединения.
+
+### ЗАДАЧА 34 — ВЫПОЛНЕНО (2026-04-03)
+**Файлы:** `client/split_tunnel.py`, `client/test_split_tunnel.py`
+
+Реализован split tunneling — выбор каких приложений/подсетей идут через VPN, каких напрямую:
+- `SplitTunnelMode` — режим работы: EXCLUDE (перечисленные приложения обходят VPN), INCLUDE (только перечисленные используют VPN)
+- `AppRule{process_name, bundle_id}` — правило для одного приложения (подстрока имени процесса или macOS bundle ID)
+- `SplitTunnelConfig{mode, apps, bypass_subnets, scan_interval}` — полная конфигурация
+- `_PrefixIndex` — отсортированный список `IPv4Network` для O(log n) проверки принадлежности IP к bypass-подсети; используется для skip-оптимизации при добавлении динамических маршрутов
+- `_RouteManager(gateway, interface)` — управление маршрутами: `add_bypass_host(ip)`, `add_bypass_subnet(cidr)`, `remove_host(ip)`, `remove_all()`; идемпотентные операции; обрабатывает "File exists" как успех
+- `_ProcessMonitor` — мониторинг процессов: `pids_for_rule(rule)` через `pgrep`/`osascript`; `connection_ips(rule)` — `lsof -i 4 -p PID` для получения remote IPs; встроенный PID-кеш исключает повторные `lsof` вызовы при неизменном наборе PIDs
+- `SplitTunnel(config, vpn_interface, original_gateway, original_interface)` — главный класс: `start()`, `stop()`, `add_app(rule)`, `remove_app(process_name)`, `add_bypass_subnet(cidr)`; фоновый daemon-поток сканирует соединения приложений
+- `_get_default_gateway()` — парсинг текущего шлюза из `netstat -rn`
+- `create_split_tunnel(mode, apps, bypass_subnets, vpn_interface, ...)` — фабричная функция
+
+Алгоритм: VPN устанавливает маршрут по умолчанию через туннель. Для bypassed IP/подсетей добавляются более специфичные маршруты через оригинальный LAN-шлюз — ядро автоматически предпочитает более специфичный маршрут.
+
+**Два улучшения производительности:**
+1. **`_PrefixIndex` — O(log n) lookup подсетей** — при каждом добавлении динамического bypass-маршрута проверяем, не покрыт ли IP уже статической bypass-подсетью. `_PrefixIndex` хранит сети в отсортированном виде (prefixlen DESC, network_address ASC) для быстрого поиска. Без этого — O(n) линейный скан по всем bypass_subnets на каждый обнаруженный IP.
+2. **PID-cache в `_ProcessMonitor`** — `lsof` — тяжёлый системный вызов (~50 мс). `connection_ips()` сначала запускает `pgrep` (~1 мс) и сравнивает PID set с кешем. Если PIDs не изменились — возвращает кешированные IPs без запуска `lsof`. Экономия: для стабильных долго-живущих приложений (браузер, банковское приложение) — 0 вызовов `lsof` после первого скана.
+
+**Тесты:** 54 теста, все pass
+**Запуск:** `cd client && python3 -m pytest test_split_tunnel.py -v`
