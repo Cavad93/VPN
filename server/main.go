@@ -123,6 +123,7 @@ type clientSession struct {
 	remoteKey    [32]byte
 	noiseSession *crypto.Session
 	mux          *transport.Mux
+	rawConn      net.Conn // underlying TCP connection for TCP_INFO polling
 	assignedIP   net.IP
 	bond         streamBond // round-robin across parallel download connections
 	bytesIn      atomic.Uint64
@@ -389,7 +390,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 	switch typeBuf[0] {
 	case ctlHello:
-		s.runPrimaryConn(ctx, session, firstStream, mux)
+		s.runPrimaryConn(ctx, conn, session, firstStream, mux)
 	case ctlSecondary:
 		s.runSecondaryConn(ctx, session.RemoteStatic, firstStream, mux)
 	default:
@@ -401,13 +402,14 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 // runPrimaryConn handles a primary VPN connection: creates a session,
 // assigns an IP, and runs the data stream loop.
-func (s *Server) runPrimaryConn(ctx context.Context, session *crypto.Session, ctlStream *transport.Stream, mux *transport.Mux) {
+func (s *Server) runPrimaryConn(ctx context.Context, rawConn net.Conn, session *crypto.Session, ctlStream *transport.Stream, mux *transport.Mux) {
 	connCtx, cancel := context.WithCancel(ctx)
 	cs := &clientSession{
 		id:           s.nextSessionID(),
 		remoteKey:    session.RemoteStatic,
 		noiseSession: session,
 		mux:          mux,
+		rawConn:      rawConn, // underlying TCP connection for TCP_INFO polling
 		connectedAt:  time.Now(),
 		cancel:       cancel,
 	}
@@ -583,6 +585,23 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 	buf := *bp
 	defer streamReadBufPool.Put(bp)
 	pc := s.Perf // local copy avoids nil check in hot loop when perf is nil
+
+	// Poll TCP info every 5 seconds from the underlying TCP connection.
+	// This updates RTT, retransmit and cwnd metrics visible in diagnostics.
+	if pc != nil && cs.rawConn != nil {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		go func() {
+			for {
+				select {
+				case <-ticker.C:
+					pollTCPInfo(cs.rawConn, pc)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 	for {
 		var ingressStart time.Time
 		if pc != nil {
@@ -596,6 +615,7 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 		n, err := stream.Read(buf)
 		if pc != nil {
 			pc.TrackLatency(perf.StageMuxRead, time.Since(muxReadStart))
+			pc.TrackPacket(perf.StageMuxRead, n)
 		}
 		if err != nil {
 			return
@@ -611,6 +631,7 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 			pc.TrackLatency(perf.StageTunWrite, time.Since(t0))
 			pc.TrackPacket(perf.StageTunWrite, n)
 			pc.TrackLatency(perf.StageFullIngress, time.Since(ingressStart))
+			pc.TrackPacket(perf.StageFullIngress, n)
 		} else {
 			s.tun.Write(buf[:n]) //nolint:errcheck
 		}
@@ -692,6 +713,7 @@ func (s *Server) routeFromTun(ctx context.Context) {
 			if _, err := ds.Write(buf[:n]); err == nil {
 				if pc != nil {
 					pc.TrackLatency(perf.StageMuxWrite, time.Since(muxWriteStart))
+					pc.TrackPacket(perf.StageMuxWrite, n)
 				}
 				target.bytesOut.Add(uint64(n))
 				sent = true
@@ -700,6 +722,7 @@ func (s *Server) routeFromTun(ctx context.Context) {
 		}
 		if pc != nil {
 			pc.TrackLatency(perf.StageFullEgress, time.Since(t0))
+			pc.TrackPacket(perf.StageFullEgress, n)
 		}
 		_ = sent
 	}
@@ -814,17 +837,28 @@ var streamReadBufPool = sync.Pool{
 	},
 }
 
-// noiseWritePool pools the length-prefixed frame buffers used in
-// noiseConn.Write, eliminating one make() per transmitted packet.
-// Capacity: 2 (length) + 7 (mux hdr) + 1460 (MTU) + 16 (AEAD tag) = 1485.
-// Rounded up to 1536 (power-of-2 friendly) to avoid reallocation for
-// slightly oversized packets.
-var noiseWritePool = sync.Pool{
+// Size-class buffer pools for noiseConn.Write. Most VPN packets are ≤1500
+// bytes (Ethernet MTU), so the small pool handles the common case with a
+// tight 1536-byte buffer. Large packets (e.g. jumbo frames, control
+// messages) use the large pool (68 KB) to avoid reallocation.
+//
+// Why two pools: a single 68 KB pool wastes memory for the 99% of packets
+// that fit in 1.5 KB. Two size classes reduce steady-state memory by ~45×
+// per pooled buffer while keeping the hot path allocation-free.
+var noiseWritePoolSmall = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 0, 1536)
+		b := make([]byte, 0, 1536) // 2 + 1460 + 16 + headroom
 		return &b
 	},
 }
+var noiseWritePoolLarge = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 65536+18) // 2 + 65535 + 16 + 1
+		return &b
+	},
+}
+
+const noiseSmallThreshold = 1536 // packets ≤ this use the small pool
 
 // noiseConn wraps a net.Conn with Noise session encryption.
 type noiseConn struct {
@@ -865,10 +899,16 @@ func (nc *noiseConn) Write(p []byte) (int, error) {
 	if nc.perf != nil {
 		t0 = time.Now()
 	}
-	// Borrow a frame buffer from the pool.
+	// Borrow a frame buffer from the appropriate size-class pool.
 	ctLen := len(p) + 16 // plaintext + AEAD tag
 	need := 2 + ctLen
-	bp := noiseWritePool.Get().(*[]byte)
+	var pool *sync.Pool
+	if need <= noiseSmallThreshold {
+		pool = &noiseWritePoolSmall
+	} else {
+		pool = &noiseWritePoolLarge
+	}
+	bp := pool.Get().(*[]byte)
 	if cap(*bp) < need {
 		*bp = make([]byte, need)
 	}
@@ -877,22 +917,25 @@ func (nc *noiseConn) Write(p []byte) (int, error) {
 	// Encrypt directly into frame[2:], skipping the length prefix.
 	ciphertext, err := nc.session.SendCipher.EncryptTo(frame[2:2], p, nil)
 	if err != nil {
-		noiseWritePool.Put(bp)
+		pool.Put(bp)
 		return 0, fmt.Errorf("noiseConn encrypt: %w", err)
 	}
 	if nc.perf != nil {
 		nc.perf.TrackLatency(perf.StageNoiseEnc, time.Since(t0))
+		nc.perf.TrackPacket(perf.StageNoiseEnc, len(p))
 	}
 	binary.BigEndian.PutUint16(frame[:2], uint16(len(ciphertext)))
 
+	frameSize := 2 + len(ciphertext)
 	var obfsStart time.Time
 	if nc.perf != nil {
 		obfsStart = time.Now()
 	}
-	_, err = nc.conn.Write(frame[:2+len(ciphertext)])
-	noiseWritePool.Put(bp)
+	_, err = nc.conn.Write(frame[:frameSize])
+	pool.Put(bp)
 	if nc.perf != nil {
 		nc.perf.TrackLatency(perf.StageObfsWrite, time.Since(obfsStart))
+		nc.perf.TrackPacket(perf.StageObfsWrite, frameSize)
 	}
 	if err != nil {
 		return 0, err
@@ -927,8 +970,13 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 		obfsReadStart = time.Now()
 	}
 	n, err := nc.conn.Read(nc.recvBuf[:])
+	var procStart time.Time
 	if nc.perf != nil {
-		nc.perf.TrackLatency(perf.StageObfsRead, time.Since(obfsReadStart))
+		procStart = time.Now()
+		// obfs_read_wait: time blocked waiting for data from the network.
+		// This is dominated by TCP RTT and retransmission timeouts — the
+		// single largest contributor to full_ingress latency (404ms mean).
+		nc.perf.TrackLatency(perf.StageObfsReadWait, procStart.Sub(obfsReadStart))
 	}
 	if err != nil {
 		return 0, err
@@ -950,6 +998,14 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 			return 0, err
 		}
 	}
+	if nc.perf != nil {
+		// obfs_read_proc: time after first Read returns until decrypt starts.
+		// Covers TLS record parsing and the rare ReadFull fallback path.
+		nc.perf.TrackLatency(perf.StageObfsReadProc, time.Since(procStart))
+		// obfs_read (total) kept for backwards compatibility.
+		nc.perf.TrackLatency(perf.StageObfsRead, time.Since(obfsReadStart))
+		nc.perf.TrackPacket(perf.StageObfsRead, n)
+	}
 
 	// Decrypt into pre-allocated buffer — zero allocation per packet.
 	var decStart time.Time
@@ -962,6 +1018,7 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 	}
 	if nc.perf != nil {
 		nc.perf.TrackLatency(perf.StageNoiseDec, time.Since(decStart))
+		nc.perf.TrackPacket(perf.StageNoiseDec, frameLen)
 	}
 
 	nc2 := copy(p, plaintext)

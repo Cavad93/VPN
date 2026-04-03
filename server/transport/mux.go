@@ -126,6 +126,12 @@ func (m *Mux) AcceptStream(ctx context.Context) (*Stream, error) {
 // Stream.Close holds closeOnce while acquiring streamsMu. Snapshot the stream
 // list first, clear the map, then close streams without holding streamsMu to
 // prevent an ABBA deadlock with concurrent Stream.Close calls.
+// UnderlyingConn returns the net.Conn wrapped by this Mux.
+// Used by the perf subsystem to poll OS-level TCP metrics (TCP_INFO).
+func (m *Mux) UnderlyingConn() net.Conn {
+	return m.conn
+}
+
 func (m *Mux) Close() error {
 	var err error
 	m.closeOnce.Do(func() {

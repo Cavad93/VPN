@@ -18,22 +18,25 @@ import (
 type Stage string
 
 const (
-	StageObfsWrite   Stage = "obfs_write"
-	StageObfsRead    Stage = "obfs_read"
-	StageNoiseEnc    Stage = "noise_encrypt"
-	StageNoiseDec    Stage = "noise_decrypt"
-	StageMuxWrite    Stage = "mux_write"
-	StageMuxRead     Stage = "mux_read"
-	StageTunWrite    Stage = "tun_write"
-	StageTunRead     Stage = "tun_read"
-	StageHandshake   Stage = "handshake"
-	StageFullIngress Stage = "full_ingress" // socket → TUN
-	StageFullEgress  Stage = "full_egress"  // TUN → socket
+	StageObfsWrite    Stage = "obfs_write"
+	StageObfsRead     Stage = "obfs_read"
+	StageObfsReadWait Stage = "obfs_read_wait" // time spent blocked waiting for data from network
+	StageObfsReadProc Stage = "obfs_read_proc" // time spent processing/defragmenting TLS records
+	StageNoiseEnc     Stage = "noise_encrypt"
+	StageNoiseDec     Stage = "noise_decrypt"
+	StageMuxWrite     Stage = "mux_write"
+	StageMuxRead      Stage = "mux_read"
+	StageTunWrite     Stage = "tun_write"
+	StageTunRead      Stage = "tun_read"
+	StageHandshake    Stage = "handshake"
+	StageFullIngress  Stage = "full_ingress" // socket → TUN
+	StageFullEgress   Stage = "full_egress"  // TUN → socket
 )
 
 // allStages enumerates every Stage for iteration.
 var allStages = []Stage{
 	StageObfsWrite, StageObfsRead,
+	StageObfsReadWait, StageObfsReadProc,
 	StageNoiseEnc, StageNoiseDec,
 	StageMuxWrite, StageMuxRead,
 	StageTunWrite, StageTunRead,
@@ -42,9 +45,12 @@ var allStages = []Stage{
 }
 
 // histogram is a lock-free approximate latency histogram.
-// It uses fixed log2-based buckets: <1µs, <2µs, <4µs, … <~1s (20 buckets).
-// Each bucket counter is an atomic uint64.
-const histBuckets = 20
+// It uses fixed log2-based buckets: <1µs, <2µs, <4µs, … <~537s (30 buckets).
+// 30 buckets cover up to 2^29 µs ≈ 537 seconds, enough for blocking I/O
+// stages like full_ingress where TCP retransmission timeouts (~30s) and
+// tun_read (up to 14s observed) can push latencies far beyond the old
+// 20-bucket ceiling of ~512ms.
+const histBuckets = 30
 
 type histogram struct {
 	buckets [histBuckets]atomic.Uint64
@@ -148,6 +154,38 @@ type stageMetrics struct {
 	packets atomic.Uint64
 }
 
+// TCPInfo holds OS-level TCP metrics polled from VPN client sockets.
+// Fields are updated atomically by pollTCPInfo (platform-specific).
+type TCPInfo struct {
+	RTTUs          atomic.Uint64 // smoothed RTT in microseconds
+	RTTVarUs       atomic.Uint64 // RTT variance in microseconds
+	RetransmitSegs atomic.Uint64 // total retransmitted segments (cumulative)
+	LostSegs       atomic.Uint64 // segments considered lost
+	CwndSegs       atomic.Uint64 // current congestion window in segments
+	SndMSS         atomic.Uint64 // sender maximum segment size
+}
+
+// TCPInfoSnapshot is a JSON-friendly copy of TCPInfo.
+type TCPInfoSnapshot struct {
+	RTTUs          uint64 `json:"rtt_us"`
+	RTTVarUs       uint64 `json:"rtt_var_us"`
+	RetransmitSegs uint64 `json:"retransmit_segs"`
+	LostSegs       uint64 `json:"lost_segs"`
+	CwndSegs       uint64 `json:"cwnd_segs"`
+	SndMSS         uint64 `json:"snd_mss"`
+}
+
+func (ti *TCPInfo) snapshot() TCPInfoSnapshot {
+	return TCPInfoSnapshot{
+		RTTUs:          ti.RTTUs.Load(),
+		RTTVarUs:       ti.RTTVarUs.Load(),
+		RetransmitSegs: ti.RetransmitSegs.Load(),
+		LostSegs:       ti.LostSegs.Load(),
+		CwndSegs:       ti.CwndSegs.Load(),
+		SndMSS:         ti.SndMSS.Load(),
+	}
+}
+
 // Collector is the central metrics aggregator. Create one per Server via
 // NewCollector() and pass it to components that need instrumentation.
 // All methods are safe for concurrent use.
@@ -155,11 +193,14 @@ type Collector struct {
 	stages map[Stage]*stageMetrics
 
 	// Global counters.
-	ActiveSessions  atomic.Int64
-	TotalSessions   atomic.Uint64
-	RetransmitCount atomic.Uint64
+	ActiveSessions   atomic.Int64
+	TotalSessions    atomic.Uint64
+	RetransmitCount  atomic.Uint64
 	CongestionWindow atomic.Int64
 	SSThresh         atomic.Int64
+
+	// TCP is the latest OS-level TCP info from a representative client connection.
+	TCP TCPInfo
 }
 
 // NewCollector creates a ready-to-use Collector.
@@ -225,6 +266,7 @@ type Snapshot struct {
 	RetransmitCount  uint64                   `json:"retransmit_count"`
 	CongestionWindow int64                    `json:"congestion_window"`
 	SSThresh         int64                    `json:"ssthresh"`
+	TCPInfo          TCPInfoSnapshot          `json:"tcp_info"`
 }
 
 // Snapshot returns a point-in-time copy of all metrics.
@@ -237,6 +279,7 @@ func (c *Collector) Snapshot() Snapshot {
 		RetransmitCount:  c.RetransmitCount.Load(),
 		CongestionWindow: c.CongestionWindow.Load(),
 		SSThresh:         c.SSThresh.Load(),
+		TCPInfo:          c.TCP.snapshot(),
 	}
 	for _, stage := range allStages {
 		m := c.stages[stage]

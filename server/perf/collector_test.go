@@ -236,6 +236,63 @@ func BenchmarkTrackPacket(b *testing.B) {
 	}
 }
 
+func TestExpandedHistogramBuckets(t *testing.T) {
+	// Verify that latencies up to 30s are properly captured in the expanded
+	// 30-bucket histogram (previously 20 buckets capped at ~512ms).
+	c := NewCollector()
+	c.TrackLatency(StageFullIngress, 100*time.Millisecond)
+	c.TrackLatency(StageFullIngress, 1*time.Second)
+	c.TrackLatency(StageFullIngress, 10*time.Second)
+	c.TrackLatency(StageFullIngress, 30*time.Second)
+
+	snap := c.Snapshot()
+	st := snap.Stages[string(StageFullIngress)]
+	if st.Latency.Count != 4 {
+		t.Fatalf("expected count=4, got %d", st.Latency.Count)
+	}
+	// Max should reflect the 30s sample.
+	if st.Latency.MaxUs < 29_000_000 {
+		t.Errorf("max_us=%f should be >= 29_000_000 (30s)", st.Latency.MaxUs)
+	}
+	// P99 should be in the 30s range, not clamped at 512ms.
+	if st.Latency.P99Us < 1_000_000 {
+		t.Errorf("p99=%f too low — bucket overflow? should be >= 1_000_000 (1s)", st.Latency.P99Us)
+	}
+}
+
+func TestNewStages(t *testing.T) {
+	c := NewCollector()
+	// Verify new stages exist and accept data.
+	c.TrackLatency(StageObfsReadWait, 50*time.Millisecond)
+	c.TrackLatency(StageObfsReadProc, 100*time.Microsecond)
+
+	snap := c.Snapshot()
+	if snap.Stages[string(StageObfsReadWait)].Latency.Count != 1 {
+		t.Error("obfs_read_wait not tracked")
+	}
+	if snap.Stages[string(StageObfsReadProc)].Latency.Count != 1 {
+		t.Error("obfs_read_proc not tracked")
+	}
+}
+
+func TestTCPInfoSnapshot(t *testing.T) {
+	c := NewCollector()
+	c.TCP.RTTUs.Store(93000)
+	c.TCP.RetransmitSegs.Store(42)
+	c.TCP.CwndSegs.Store(10)
+
+	snap := c.Snapshot()
+	if snap.TCPInfo.RTTUs != 93000 {
+		t.Errorf("expected rtt_us=93000, got %d", snap.TCPInfo.RTTUs)
+	}
+	if snap.TCPInfo.RetransmitSegs != 42 {
+		t.Errorf("expected retransmit_segs=42, got %d", snap.TCPInfo.RetransmitSegs)
+	}
+	if snap.TCPInfo.CwndSegs != 10 {
+		t.Errorf("expected cwnd_segs=10, got %d", snap.TCPInfo.CwndSegs)
+	}
+}
+
 func BenchmarkSnapshot(b *testing.B) {
 	c := NewCollector()
 	for i := 0; i < 10000; i++ {
