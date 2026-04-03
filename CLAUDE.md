@@ -619,3 +619,31 @@ AltStore: только бесплатные entitlements, без push/iCloud/IAP
 **Тесты:** 68 тестов (config×11, state×11, killswitch×4, autostart×3, tray×5, tun×8, main×23, vpnclient×21, integration×5), покрытие 85.0%  
 **Запуск:** `cd windows && go test ./... -v -cover`  
 **Сборка (Windows):** `cd windows && GOOS=windows GOARCH=amd64 go build -o cavadvpn.exe .`
+
+### ЗАДАЧА 28 — ВЫПОЛНЕНО (2026-04-03)
+**Файлы:** `windows/installer/` — Windows .exe самоустановщик
+
+Реализован самостоятельный установщик CavadVPN для Windows (компилируется в `cavadvpn-setup.exe`):
+- `InstallOptions{InstallDir, ServerAddr, ServerKey, InstallSvc, Silent, Uninstall}` — конфигурация установщика
+- `DefaultInstallDir()` — `%ProgramFiles%\CavadVPN` на Windows, TempDir на других платформах (для тестов)
+- `RunInstall(opts)` — полный цикл установки: isAdmin → createInstallDir → copyCurrentExe → writeDefaultConfig → registerService (опц.) → createStartMenuShortcut → registerUninstall → addFirewallRule
+- `RunUninstall(opts)` — удаление: stopAndRemoveService → removeFirewallRules → removeStartMenuShortcut → removeUninstallEntry → removeInstallDir (config.json сохраняется)
+- `writeDefaultConfig` — создаёт `config.json` с server_addr, server_key, dns_server=1.1.1.1, mtu=1420; не перезаписывает существующий файл
+- `copyCurrentExe` — копирует текущий исполняемый файл как `cavadvpn.exe` в install dir
+
+**Windows-specific** (`installer_windows.go`):
+- `isAdmin()` — проверка через `windows.CreateWellKnownSid` + `token.IsMember`
+- `registerService` / `stopAndRemoveService` — через `sc.exe` с failure actions (restart 30/60/120s)
+- `addFirewallRule` / `removeFirewallRules` — через `netsh advfirewall firewall`
+- `createStartMenuShortcut` — через PowerShell `WScript.Shell.CreateShortcut()`
+- `registerUninstall` / `removeUninstallEntry` — через `golang.org/x/sys/windows/registry` в `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\CavadVPN`
+
+CLI флаги: `--install` (по умолчанию), `--uninstall`, `--install-dir`, `--server-addr`, `--server-key`, `--service`, `--silent`
+
+**Оптимизации скорости (дополнительно к ЗАДАЧА 27):**
+1. Socket buffers 4MB → 8MB (`vpnclient.go`: `SetReadBuffer`/`SetWriteBuffer`) — +50% headroom для high-BDP России↔Казахстан
+2. TCP keepalive tuning (`tcpopt_windows.go`): `SIO_KEEPALIVE_VALS` idle=30s, interval=10s — предотвращает молчаливые дисконнекты через NAT
+
+**Тесты:** 9 тестов installer, все pass (плюс все 68 тестов windows модуля pass)  
+**Запуск тестов:** `cd windows && go test ./... -v -cover`  
+**Сборка установщика (Windows):** `GOOS=windows GOARCH=amd64 go build -o cavadvpn-setup.exe ./installer/`

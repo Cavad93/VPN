@@ -88,8 +88,10 @@ func (vc *VPNClient) Connect(ctx context.Context) (*AssignedRoute, error) {
 	// Speed optimization 1: TCP_NODELAY and large socket buffers
 	if tc, ok := rawConn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
-		_ = tc.SetReadBuffer(4 * 1024 * 1024)
-		_ = tc.SetWriteBuffer(4 * 1024 * 1024)
+		_ = tc.SetReadBuffer(8 * 1024 * 1024)
+		_ = tc.SetWriteBuffer(8 * 1024 * 1024)
+		// Speed optimization 3: TCP keepalive tuning to prevent NAT timeouts.
+		_ = setTCPKeepalive(tc)
 	}
 
 	// 2. TLS obfuscation
