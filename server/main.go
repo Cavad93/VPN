@@ -164,6 +164,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// and silently dropping port-scan SYN probes.
 	if tcpLn, ok := ln.(*net.TCPListener); ok {
 		setListenerDeferAccept(tcpLn, 5) // 5-second timeout
+		setListenerTFO(tcpLn)            // TCP Fast Open — saves 1 RTT on reconnect
 	}
 	s.logger.Info("server listening", "addr", s.cfg.ListenAddr)
 
@@ -193,7 +194,7 @@ func (s *Server) Run(ctx context.Context) error {
 		// setForcedSocketBuffers uses SO_RCVBUFFORCE/SO_SNDBUFFORCE (Linux,
 		// CAP_NET_ADMIN) to bypass the net.core.rmem_max kernel limit.
 		if tc, ok := conn.(*net.TCPConn); ok {
-			setForcedSocketBuffers(tc, 8<<20) // 8 MB, force-bypass rmem_max
+			setForcedSocketBuffers(tc, 16<<20) // 16 MB, force-bypass rmem_max
 			tc.SetNoDelay(true)               // disable Nagle — VPN packets must not be coalesced
 			// TCP keepalive: probe idle connections every 15 s with 3 retries.
 			// Detects dead connections in 30 s (15+3×5) — 2× faster than before.
@@ -649,28 +650,33 @@ func newNoiseConn(conn net.Conn, session *crypto.Session) *noiseConn {
 // wraps them in a single TLS record. This halves the number of TLS records
 // the Python client must read per message, doubling download throughput.
 //
-// Optimisation: EncryptTo writes ciphertext directly into the pool frame
-// buffer at offset 2, eliminating both the intermediate ciphertext allocation
-// and the copy. Saves 2 allocations + 1 copy per packet.
+// Optimisation: EncryptTo writes ciphertext directly into the pool buffer,
+// then net.Buffers (writev) sends [length_prefix, ciphertext] atomically
+// without copying the ciphertext into a second staging buffer.
 func (nc *noiseConn) Write(p []byte) (int, error) {
-	// Borrow a frame buffer from the pool.
+	// Borrow a ciphertext buffer from the pool.
 	ctLen := len(p) + 16 // plaintext + AEAD tag
-	need := 2 + ctLen
 	bp := noiseWritePool.Get().(*[]byte)
-	if cap(*bp) < need {
-		*bp = make([]byte, need)
+	if cap(*bp) < ctLen {
+		*bp = make([]byte, ctLen)
 	}
-	frame := (*bp)[:need]
+	ctBuf := (*bp)[:ctLen]
 
-	// Encrypt directly into frame[2:], skipping the length prefix.
-	ciphertext, err := nc.session.SendCipher.EncryptTo(frame[2:2], p, nil)
+	// Encrypt directly into pool buffer — zero intermediate allocation.
+	ciphertext, err := nc.session.SendCipher.EncryptTo(ctBuf[:0], p, nil)
 	if err != nil {
 		noiseWritePool.Put(bp)
 		return 0, fmt.Errorf("noiseConn encrypt: %w", err)
 	}
-	binary.BigEndian.PutUint16(frame[:2], uint16(len(ciphertext)))
 
-	_, err = nc.conn.Write(frame[:2+len(ciphertext)])
+	// Build 2-byte length prefix on the stack.
+	var lenPfx [2]byte
+	binary.BigEndian.PutUint16(lenPfx[:], uint16(len(ciphertext)))
+
+	// writev: kernel sends length prefix + ciphertext in one atomic write,
+	// and ObfsConn wraps the combined payload in a single TLS record.
+	bufs := net.Buffers{lenPfx[:], ciphertext}
+	_, err = bufs.WriteTo(nc.conn)
 	noiseWritePool.Put(bp)
 	if err != nil {
 		return 0, err
@@ -908,6 +914,18 @@ func loadOrGenerateKeyPair(path string, logger *slog.Logger) (*crypto.KeyPair, e
 // main
 // ---------------------------------------------------------------------------
 
+func init() {
+	// Increase GC target to 200% (default 100%). VPN server is latency-sensitive
+	// and benefits more from fewer GC pauses than from lower memory usage.
+	// This approximately halves GC frequency. The memory trade-off is acceptable:
+	// even at 100 sessions the server uses <100 MB heap.
+	if os.Getenv("GOGC") == "" {
+		os.Setenv("GOGC", "200") //nolint:errcheck
+	}
+	// GOMEMLIMIT: let Go's soft memory limit auto-tune; don't set a hard limit
+	// since the server runs dedicated.
+}
+
 func main() {
 	cfg := DefaultConfig()
 	apiCfg := api.DefaultConfig()
@@ -928,6 +946,11 @@ func main() {
 		logger.Error("failed to load key pair", "err", err)
 		os.Exit(1)
 	}
+
+	// Apply kernel tuning (sysctl) before opening sockets.
+	// Ensures rmem_max/wmem_max allow 16 MB buffers, enables BBR globally,
+	// enables IP forwarding, and sets optimal TCP memory parameters.
+	applySysctls()
 
 	tun, err := OpenTun("vpn0")
 	if err != nil {

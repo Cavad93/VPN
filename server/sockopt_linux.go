@@ -4,6 +4,8 @@ package main
 
 import (
 	"net"
+	"os"
+	"strings"
 	"syscall"
 )
 
@@ -58,10 +60,64 @@ const (
 const soBusyPoll = 46 // SO_BUSY_POLL — Linux ≥ 3.11
 
 // TCP_WINDOW_CLAMP sets the maximum advertised TCP window size. Setting this
-// to the socket buffer size (8 MB) allows the kernel to fully utilise the
+// to the socket buffer size allows the kernel to fully utilise the
 // configured buffer for the advertised window, maximising bandwidth-delay
 // product coverage. Without this, the kernel may advertise a smaller window.
 const tcpWindowClamp = 10 // TCP_WINDOW_CLAMP — Linux ≥ 2.4
+
+// TCP_FASTOPEN enables TFO on the listener socket.
+// TFO allows the client to send data in the SYN packet, saving one full RTT
+// (80-120 ms Russia↔Kazakhstan) on reconnections.
+const tcpFastOpen = 23 // TCP_FASTOPEN — Linux ≥ 3.7
+
+// applySysctls writes kernel tuning parameters via /proc/sys.
+// Requires root/CAP_SYS_ADMIN. Failures are silently ignored — the VPN
+// still works but may be limited by default kernel buffer caps.
+//
+// Key settings:
+//   - rmem_max/wmem_max=16 MB: allows SO_RCVBUF/SO_SNDBUF up to 16 MB
+//   - tcp_rmem/tcp_wmem: autotuning range up to 16 MB
+//   - default_qdisc=fq: required for BBR to work correctly
+//   - tcp_congestion_control=bbr: global BBR (per-socket fallback in setForcedSocketBuffers)
+//   - ip_forward=1: required for TUN packet routing
+//   - tcp_fastopen=3: enable TFO for both client and server sockets
+//   - tcp_mtu_probing=1: discover path MTU to avoid fragmentation
+//   - tcp_slow_start_after_idle=0: don't reset cwnd after idle periods
+func applySysctls() {
+	sysctls := map[string]string{
+		"net.core.rmem_max":                  "16777216",
+		"net.core.wmem_max":                  "16777216",
+		"net.core.rmem_default":              "1048576",
+		"net.core.wmem_default":              "1048576",
+		"net.ipv4.tcp_rmem":                  "4096 1048576 16777216",
+		"net.ipv4.tcp_wmem":                  "4096 1048576 16777216",
+		"net.core.default_qdisc":             "fq",
+		"net.ipv4.tcp_congestion_control":    "bbr",
+		"net.ipv4.ip_forward":                "1",
+		"net.ipv4.tcp_fastopen":              "3",
+		"net.ipv4.tcp_mtu_probing":           "1",
+		"net.ipv4.tcp_slow_start_after_idle": "0",
+		"net.core.netdev_max_backlog":        "5000",
+	}
+	for k, v := range sysctls {
+		path := "/proc/sys/" + strings.ReplaceAll(k, ".", "/")
+		os.WriteFile(path, []byte(v), 0644) //nolint:errcheck — best-effort
+	}
+}
+
+// setListenerTFO enables TCP Fast Open on a TCP listener socket.
+// TFO allows clients to send data in the SYN packet, saving 1 RTT
+// (80-120 ms Russia↔Kazakhstan) on reconnections after the first.
+// The queue length (128) sets the max pending TFO connections.
+func setListenerTFO(ln *net.TCPListener) {
+	raw, err := ln.SyscallConn()
+	if err != nil {
+		return
+	}
+	raw.Control(func(fd uintptr) { //nolint:errcheck
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpFastOpen, 128) //nolint:errcheck
+	})
+}
 
 // setListenerDeferAccept sets TCP_DEFER_ACCEPT on a TCP listener socket.
 // The kernel holds incoming connections in SYN_RECV state until the client
@@ -118,7 +174,7 @@ func setForcedSocketBuffers(conn *net.TCPConn, size int) {
 		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpKeepCnt, 3)          //nolint:errcheck
 		// Busy-poll: spin for 50 µs in the driver on empty recv to cut latency.
 		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soBusyPoll, 50) //nolint:errcheck
-		// Window clamp: allow the kernel to advertise the full 8 MB window.
+		// Window clamp: allow the kernel to advertise the full 16 MB window.
 		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpWindowClamp, size) //nolint:errcheck
 	})
 }

@@ -119,7 +119,12 @@ func (c *ObfsConn) ServerHandshake() error {
 }
 
 // Write sends p as one or more TLS application_data records.
-// Implements io.Writer.  Uses pooled buffers to avoid heap allocations.
+// Implements io.Writer.
+//
+// Optimisation: uses net.Buffers (writev syscall) to send the 5-byte TLS
+// header and the payload as separate iovecs in a single atomic write,
+// eliminating the payload copy into a staging buffer. For common VPN packets
+// (≤1460 bytes), this saves ~1460 bytes of memcpy per outgoing packet.
 func (c *ObfsConn) Write(p []byte) (int, error) {
 	total := 0
 	for len(p) > 0 {
@@ -127,21 +132,17 @@ func (c *ObfsConn) Write(p []byte) (int, error) {
 		if len(chunk) > maxObfsPayload {
 			chunk = p[:maxObfsPayload]
 		}
-		need := ObfsHeaderSize + len(chunk)
-		bp := obfsRecordPool.Get().(*[]byte)
-		if cap(*bp) < need {
-			*bp = make([]byte, need)
-		}
-		rec := (*bp)[:need]
-		rec[0] = tlsRecordAppData
-		rec[1] = tlsVersionMajor
-		rec[2] = tlsVersionMinor
-		binary.BigEndian.PutUint16(rec[3:5], uint16(len(chunk)))
-		copy(rec[5:], chunk)
+		// Build header on the stack — 5 bytes, no heap allocation.
+		var hdr [ObfsHeaderSize]byte
+		hdr[0] = tlsRecordAppData
+		hdr[1] = tlsVersionMajor
+		hdr[2] = tlsVersionMinor
+		binary.BigEndian.PutUint16(hdr[3:5], uint16(len(chunk)))
 
-		_, err := c.conn.Write(rec)
-		obfsRecordPool.Put(bp)
-		if err != nil {
+		// writev: kernel sends header + payload atomically without copying
+		// the payload into an intermediate buffer.
+		bufs := net.Buffers{hdr[:], chunk}
+		if _, err := bufs.WriteTo(c.conn); err != nil {
 			return total, err
 		}
 		total += len(chunk)

@@ -4,6 +4,12 @@ package main
 
 import "net"
 
+// applySysctls is a no-op on non-Linux platforms.
+func applySysctls() {}
+
+// setListenerTFO is a no-op on non-Linux platforms.
+func setListenerTFO(_ *net.TCPListener) {}
+
 // setListenerDeferAccept is a no-op on non-Linux platforms.
 func setListenerDeferAccept(_ *net.TCPListener, _ int) {}
 
