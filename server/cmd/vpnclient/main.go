@@ -188,19 +188,23 @@ func (vs *vpnSession) connect() (
 	}
 
 	tc := rawConn.(*net.TCPConn)
-	// Disable Nagle — VPN packets must not be coalesced.
 	_ = tc.SetNoDelay(true)
-	// 16 MB socket buffers — matched to server-side sysctl/netsh tuning.
-	// BDP at 128 Mbps × 93 ms RTT = 1.5 MB; 16 MB provides 10× headroom
-	// for bursts and ensures the TCP window can grow to full link speed.
 	_ = tc.SetReadBuffer(16 * 1024 * 1024)
 	_ = tc.SetWriteBuffer(16 * 1024 * 1024)
-	// TCP keepalive: prevents ISP NAT/firewall from dropping "idle" connections.
-	// This is the PRIMARY fix for the 29-minute disconnect issue.
-	// Russian/Kazakh ISPs expire TCP NAT entries after 60–120 s of no TCP-level
-	// keepalive probes. 15 s is well within.
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(15 * time.Second)
+	// Per-socket TCP tuning via raw fd — TCP_NOTSENT_LOWAT reduces bufferbloat
+	// in the kernel's send queue. Without it, the kernel buffers up to the full
+	// SO_SNDBUF (16 MB) before pushing data onto the wire, adding hundreds of ms
+	// of latency that confuses inner TCP's RTT estimates.
+	// With TCP_NOTSENT_LOWAT=131072 (128 KB), the kernel pushes data sooner,
+	// giving inner TCP connections more accurate RTT measurements.
+	if raw, err := tc.SyscallConn(); err == nil {
+		raw.Control(func(fd uintptr) { //nolint:errcheck
+			// TCP_NOTSENT_LOWAT = 0x201 on macOS
+			syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, 0x201, 131072) //nolint:errcheck
+		})
+	}
 
 	cleanupConn := func() { rawConn.Close() }
 
@@ -324,18 +328,39 @@ var log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: sl
 //     without it, the server's congestion window can only grow once per
 //     100 ms + 93 ms = 193 ms round-trip, capping download at ~5 Mbps.
 func applyMacOSTuning() {
-	sysctls := map[string]string{
-		"kern.ipc.maxsockbuf":          "16777216",
-		"net.inet.tcp.sendspace":       "1048576",
-		"net.inet.tcp.recvspace":       "1048576",
-		"net.inet.tcp.delayed_ack":     "0",
-		"net.inet.tcp.mssdflt":         "1440",
-		"net.inet.tcp.win_scale_factor": "8",
-		"net.inet.tcp.fastopen":        "3",
+	// Order matters: maxsockbuf must be set before sendspace/recvspace.
+	type kv struct{ k, v string }
+	sysctls := []kv{
+		// Allow 16 MB socket buffers (must be first — limits sendspace/recvspace).
+		{"kern.ipc.maxsockbuf", "16777216"},
+		// Default TCP buffer per socket: 1 MB (macOS default is 128 KB).
+		{"net.inet.tcp.sendspace", "1048576"},
+		{"net.inet.tcp.recvspace", "1048576"},
+		// CRITICAL: disable delayed ACK. macOS defaults to 100 ms delayed ACK.
+		// With 80 ms RTT, this means the server's congestion window can only
+		// grow once per 180 ms, capping download to ~5 Mbps.
+		// Setting to 0 = ACK every segment immediately.
+		{"net.inet.tcp.delayed_ack", "0"},
+		// TCP Fast Open (both client and server).
+		{"net.inet.tcp.fastopen", "3"},
+		// Default MSS to 1440 (match VPN MTU - 20 byte IP - 20 byte TCP).
+		{"net.inet.tcp.mssdflt", "1440"},
+		// Enable window scaling with factor 8 (window up to 16 MB).
+		{"net.inet.tcp.win_scale_factor", "8"},
+		// Auto-receive buffer tuning.
+		{"net.inet.tcp.doautorcvbuf", "1"},
+		{"net.inet.tcp.autorcvbufmax", "16777216"},
+		// Auto-send buffer tuning.
+		{"net.inet.tcp.doautosndbuf", "1"},
+		{"net.inet.tcp.autosndbufmax", "16777216"},
 	}
-	for k, v := range sysctls {
-		if out, err := exec.Command("sysctl", "-w", k+"="+v).CombinedOutput(); err != nil {
-			log.Debug("sysctl failed (non-fatal)", "key", k, "err", string(out))
+	for _, s := range sysctls {
+		out, err := exec.Command("sysctl", "-w", s.k+"="+s.v).CombinedOutput()
+		if err != nil {
+			// Log as WARN so the user sees it — delayed_ack failure is critical.
+			log.Warn("sysctl failed", "key", s.k, "value", s.v, "err", strings.TrimSpace(string(out)))
+		} else {
+			log.Info("sysctl applied", "key", s.k, "value", s.v)
 		}
 	}
 }

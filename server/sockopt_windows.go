@@ -37,10 +37,22 @@ func applySysctls() {
 	// Best-effort — errors are ignored. If any command fails, the VPN
 	// still works, just with default (slower) TCP settings.
 	cmds := [][]string{
+		// Largest TCP receive window (up to 16 MB). Default "normal" caps ~256 KB.
 		{"netsh", "int", "tcp", "set", "global", "autotuninglevel=experimental"},
+		// CTCP: better than CUBIC on high-latency links (93 ms RTT).
 		{"netsh", "int", "tcp", "set", "global", "congestionprovider=ctcp"},
+		// ECN: reduce loss-based retransmissions.
 		{"netsh", "int", "tcp", "set", "global", "ecncapability=enabled"},
+		// Receive Side Scaling: use multiple CPU cores for TCP.
 		{"netsh", "int", "tcp", "set", "global", "rss=enabled"},
+		// TCP timestamps: more accurate RTT measurement for congestion control.
+		{"netsh", "int", "tcp", "set", "global", "timestamps=enabled"},
+		// Initial congestion window = 40 MSS ≈ 58 KB.
+		// Default is 10 MSS (14.5 KB). With 80 ms RTT, a 14 KB IW means the
+		// first burst is only 14KB/0.08s = 175 KB/s. With 40 MSS, the first
+		// burst is 58KB/0.08s = 725 KB/s, and the window ramps up ~3× faster
+		// from there. CRITICAL for download speed.
+		{"netsh", "int", "tcp", "set", "global", "initialcongestionwindow=40"},
 		// Enable IP forwarding on all interfaces — required for TUN routing.
 		{"netsh", "int", "ipv4", "set", "global", "forwarding=enabled"},
 	}
