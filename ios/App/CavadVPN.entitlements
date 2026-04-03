@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  CavadVPN.entitlements — iOS app entitlements
+
+  AltStore compatibility notes:
+  - Only free/personal-team entitlements are used here.
+  - Network Extension (packet-tunnel-provider) requires a PAID developer account,
+    but AltStore users can sideload via their free Apple ID for 7-day certificates.
+    No additional entitlements beyond what is listed below are needed.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Allows this app to create and manage VPN configurations -->
+    <key>com.apple.developer.networking.networkextension</key>
+    <array>
+        <string>packet-tunnel-provider</string>
+    </array>
+
+    <!-- App Groups: shared container between the host app and tunnel extension -->
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.com.cavadvpn</string>
+    </array>
+
+    <!-- Keychain access group (for storing keys) -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)com.cavadvpn.ios</string>
+    </array>
+</dict>
+</plist>

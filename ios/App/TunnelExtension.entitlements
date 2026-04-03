@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TunnelExtension.entitlements — Network Extension (PacketTunnelProvider) entitlements.
+  Bundle ID: com.cavadvpn.ios.tunnel
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.networking.networkextension</key>
+    <array>
+        <string>packet-tunnel-provider</string>
+    </array>
+
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.com.cavadvpn</string>
+    </array>
+
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)com.cavadvpn.ios</string>
+    </array>
+</dict>
+</plist>

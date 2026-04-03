@@ -573,5 +573,30 @@ Wire format обеспечивает статистическую неразли
 8. **atomic.Pointer[Stream]** — lock-free доступ к dataStream на hot path TUN→client
 9. **TCP BBR congestion control** — per-socket BBR вместо CUBIC, 2-5× throughput на high-latency линках
 10. **Zero-alloc AEAD decrypt** — pre-allocated decrypt buffer в noiseConn, устраняет heap alloc на каждый принятый пакет
+11. **Zero-copy readBuf tail (mux.go)** — `consumeData` сохраняет остаток пакета как sub-slice вместо make+copy; экономит 1 alloc на каждый частичный read IP-пакета
+12. **TCP SO_KEEPALIVE tuning (sockopt_linux.go)** — KEEPIDLE=30s, KEEPINTVL=10s, KEEPCNT=3 на каждом VPN соединении; предотвращает NAT-таймаут (Россия↔Казахстан), устраняет молчаливые дисконнекты без реконнекта
 
 **Подробный лог:** `lodin.md`
+
+### ЗАДАЧА 26 — ВЫПОЛНЕНО (2026-04-03)
+**Файлы:** `ios/App/` — SwiftUI iOS UI
+
+Реализован iOS UI стек (SwiftUI, iOS 16+, AltStore совместимый):
+- `VpnConnectionState.swift` — sealed enum: disconnected/connecting/connected(stats)/disconnecting/error; `label`, `isConnected`, `isTransitioning`, `canConnect`, `canDisconnect`, `symbolName`
+- `VpnStats.swift` — struct: bytesIn/Out, connectedSinceMs, assignedIP; `formatBytes()`, `uptimeFormatted`, `downloadLabel`, `uploadLabel`
+- `QRConfig.swift` — парсер QR конфига: JSON `{"host":…}` и URI `cavadvpn://config?…`; валидация host/port/hex keys; `ParsedConfig`; `toQRJson`/`toQRUri`
+- `ConfigStore.swift` — UserDefaults обёртка: `save/load/clear/apply(ParsedConfig)`; `StoredConfig`; namespace `com.cavadvpn.*`
+- `ConnectionViewModel.swift` — `@MainActor ObservableObject`: `connect()` → NEVPNManager.startVPNTunnel, `disconnect()`, NEVPNStatusDidChange observer, `applyQRConfig`, `saveConfig`, `updateStats`
+- `ContentView.swift` — главный экран: анимированная статус-иконка (SF Symbols), большая Connect/Disconnect кнопка, карточки трафика (↓ bytes, ↑ bytes, аптайм, IP), toolbar кнопки QR и Settings
+- `SettingsView.swift` — форма настроек: host, port, private key hex, server public key hex, DNS, MTU; кнопка «Generate New Private Key» (SecRandomCopyBytes + RFC 7748 clamp)
+- `QRScanView.swift` — AVFoundation камера + viewfinder overlay + AVCaptureMetadataOutput; разрешение CAMERA автоматически; закрывается после первого успешного сканирования
+- `CavadVPNApp.swift` — `@main struct` точка входа
+- `Info.plist` — CFBundleIdentifier `com.cavadvpn.ios`, NSCameraUsageDescription, URL scheme `cavadvpn://`
+- `CavadVPN.entitlements` — Network Extension packet-tunnel-provider, App Group `group.com.cavadvpn`, Keychain
+- `TunnelExtension.entitlements` — те же entitlements для tunnel extension bundle ID `com.cavadvpn.ios.tunnel`
+
+AltStore: только бесплатные entitlements, без push/iCloud/IAP. Переподпись через AltStore каждые 7 дней по Wi-Fi пока Mac включён.
+
+**Тесты:** 67 Python тестов (QRConfigJSON×14, QRConfigURI×8, VpnStats×16, ConfigStore×11, VpnConnectionState×15), все pass  
+**Запуск тестов:** `cd ios/test-runner && python3 -m pytest test_ui.py -v`  
+**Сборка (только macOS/Xcode):** открыть `ios/` в Xcode, настроить Team, Archive → Distribute (Ad Hoc для AltStore)

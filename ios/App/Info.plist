@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>CavadVPN</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>com.cavadvpn.ios</string>
+
+    <key>CFBundleName</key>
+    <string>CavadVPN</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>arm64</string>
+    </array>
+
+    <!-- Minimum iOS version -->
+    <key>MinimumOSVersion</key>
+    <string>16.0</string>
+
+    <!-- Supported orientations -->
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+
+    <!-- Camera permission (required for QR scanner) -->
+    <key>NSCameraUsageDescription</key>
+    <string>CavadVPN needs camera access to scan QR configuration codes.</string>
+
+    <!-- Network Extension (for VPN tunnel) -->
+    <key>NEVPNEnabled</key>
+    <true/>
+
+    <!-- URL scheme so other apps / Safari can deep-link with cavadvpn:// -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.cavadvpn.ios</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>cavadvpn</string>
+            </array>
+        </dict>
+    </array>
+
+    <!-- AltStore compatibility flags -->
+    <!-- No push notifications, no iCloud, no in-app purchase — all free entitlements -->
+    <key>UIApplicationSupportsIndirectInputEvents</key>
+    <true/>
+
+    <key>UILaunchScreen</key>
+    <dict/>
+</dict>
+</plist>

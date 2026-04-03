@@ -33,6 +33,17 @@ const tcpQuickAck = 12 // TCP_QUICKACK — Linux ≥ 2.4.4
 // throughput on high-latency links (Russia↔Kazakhstan ≈ 80-120 ms).
 const tcpCongestion = 13 // TCP_CONGESTION — Linux ≥ 2.6.13
 
+// TCP keepalive constants.
+// These are applied to every accepted VPN client connection to prevent NAT
+// gateways (e.g. Russian ISP NAT, Kazakhstan transit NAT) from silently
+// dropping idle VPN sessions. Without keepalives, NAT tables typically expire
+// TCP entries after 60–120 s of inactivity, causing mysterious disconnects.
+const (
+	tcpKeepIdle  = 4  // TCP_KEEPIDLE  — start probes after N seconds of idle
+	tcpKeepIntvl = 5  // TCP_KEEPINTVL — send a probe every N seconds
+	tcpKeepCnt   = 6  // TCP_KEEPCNT   — give up after N failed probes
+)
+
 // setForcedSocketBuffers attempts to set SO_RCVBUFFORCE / SO_SNDBUFFORCE on
 // conn.  Falls back to SO_RCVBUF / SO_SNDBUF if the process lacks
 // CAP_NET_ADMIN (e.g. unprivileged container) or if the call is unavailable.
@@ -59,5 +70,17 @@ func setForcedSocketBuffers(conn *net.TCPConn, size int) {
 		// Falls back silently to the system default (usually CUBIC) if BBR
 		// is not available.
 		syscall.SetsockoptString(int(fd), syscall.IPPROTO_TCP, tcpCongestion, "bbr") //nolint:errcheck
+
+		// TCP keepalive tuning — prevents NAT timeout drops on idle VPN
+		// sessions (Russia↔Kazakhstan latency path).
+		// SO_KEEPALIVE enables the OS keepalive probes.
+		// TCP_KEEPIDLE=30s: wait 30 s of idle before first probe.
+		// TCP_KEEPINTVL=10s: repeat probes every 10 s.
+		// TCP_KEEPCNT=3: declare connection dead after 3 missed probes (30 s total).
+		// Total disconnect detection: 30 + 3×10 = 60 s — well inside NAT timeouts.
+		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1) //nolint:errcheck
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpKeepIdle, 30)        //nolint:errcheck
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpKeepIntvl, 10)       //nolint:errcheck
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpKeepCnt, 3)          //nolint:errcheck
 	})
 }

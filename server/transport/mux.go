@@ -333,12 +333,14 @@ func (s *Stream) Read(p []byte) (int, error) {
 }
 
 // consumeData copies data into p and saves the overflow for the next Read.
+// The tail is stored as a zero-copy sub-slice of data to avoid a make+copy
+// allocation on every partial read (saves ~1 alloc per VPN packet at typical
+// 65535-byte Read buffers vs 1460-byte IP packets).
 func (s *Stream) consumeData(p, data []byte) int {
 	n := copy(p, data)
 	if n < len(data) {
-		tail := make([]byte, len(data)-n)
-		copy(tail, data[n:])
-		s.readBuf = tail
+		// data is a fresh allocation from readLoop — safe to hold a reference.
+		s.readBuf = data[n:]
 	}
 	return n
 }
