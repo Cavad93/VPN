@@ -1,5 +1,6 @@
 package com.cavadvpn.transport
 
+import java.io.BufferedInputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.security.SecureRandom
@@ -33,9 +34,12 @@ private const val MAX_OBFS_PAYLOAD = 16383  // 2^14 - 1
  *   bytes 5..N  — payload
  */
 class ObfsConn(
-    private val inputStream: InputStream,
+    inputStream: InputStream,
     private val outputStream: OutputStream
 ) {
+    // 64 KB kernel-side buffer: one socket read typically delivers ~45 TLS records,
+    // eliminating per-record syscalls on the hot receive path.
+    private val inputStream = BufferedInputStream(inputStream, 65536)
     private var readBuf = ByteArray(0)
     private var readBufPos = 0
 
@@ -55,13 +59,21 @@ class ObfsConn(
 
     /**
      * Sends [data] as one or more TLS application_data records (max 16383 bytes each).
+     * Writes the 5-byte header and payload in a single allocation to avoid an extra copy.
      */
     fun write(data: ByteArray) {
         var offset = 0
         while (offset < data.size) {
-            val end = minOf(offset + MAX_OBFS_PAYLOAD, data.size)
-            outputStream.write(buildAppDataRecord(data, offset, end - offset))
-            offset = end
+            val length = minOf(MAX_OBFS_PAYLOAD, data.size - offset)
+            val rec = ByteArray(OBFS_HEADER_SIZE + length)
+            rec[0] = TLS_APP_DATA
+            rec[1] = TLS_VERSION_MAJOR
+            rec[2] = TLS_VERSION_MINOR
+            rec[3] = (length shr 8).toByte()
+            rec[4] =  length.toByte()
+            System.arraycopy(data, offset, rec, OBFS_HEADER_SIZE, length)
+            outputStream.write(rec)
+            offset += length
         }
         outputStream.flush()
     }
@@ -141,30 +153,33 @@ class ObfsConn(
         val rng = SecureRandom()
         val random    = ByteArray(32).also { rng.nextBytes(it) }
         val sessionId = ByteArray(32).also { rng.nextBytes(it) }
-
-        val body = mutableListOf<Byte>()
-        body += 0x03.toByte(); body += 0x03.toByte()     // legacy_version = TLS 1.2
-        body += random.toList()                          // random (32 bytes)
-        body += 0x20.toByte()                            // session_id length = 32
-        body += sessionId.toList()                       // session_id (32 bytes)
-        // cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256
-        body += listOf(0x00, 0x06, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03).map { it.toByte() }
-        body += listOf(0x01, 0x00).map { it.toByte() }  // compression_methods: length=1, null
-
-        return wrapHandshakeRecord(TLS_HELLO_CLIENT.toInt() and 0xFF, body.toByteArray())
+        // Build body directly as ByteArray — avoids boxing every byte into a Byte object.
+        // Layout: version(2) + random(32) + sessionIdLen(1) + sessionId(32) + cipherSuites(8) + compression(2)
+        val body = ByteArray(2 + 32 + 1 + 32 + 8 + 2)
+        var i = 0
+        body[i++] = 0x03; body[i++] = 0x03            // legacy_version = TLS 1.2
+        System.arraycopy(random, 0, body, i, 32); i += 32
+        body[i++] = 0x20                               // session_id length = 32
+        System.arraycopy(sessionId, 0, body, i, 32); i += 32
+        // cipher suites: length(2) + TLS_AES_128_GCM_SHA256 + TLS_AES_256_GCM_SHA384 + TLS_CHACHA20_POLY1305_SHA256
+        body[i++] = 0x00; body[i++] = 0x06
+        body[i++] = 0x13; body[i++] = 0x01
+        body[i++] = 0x13; body[i++] = 0x02
+        body[i++] = 0x13; body[i++] = 0x03
+        body[i++] = 0x01; body[i]   = 0x00            // compression_methods: length=1, null
+        return wrapHandshakeRecord(TLS_HELLO_CLIENT.toInt() and 0xFF, body)
     }
 
     private fun buildServerHello(): ByteArray {
         val random = ByteArray(32).also { SecureRandom().nextBytes(it) }
-
-        val body = mutableListOf<Byte>()
-        body += 0x03.toByte(); body += 0x03.toByte()     // legacy_version
-        body += random.toList()                          // random (32 bytes)
-        body += 0x00.toByte()                            // session_id_echo length = 0
-        body += listOf(0x13, 0x01).map { it.toByte() }  // cipher_suite
-        body += 0x00.toByte()                            // compression_method: null
-
-        return wrapHandshakeRecord(TLS_HELLO_SERVER.toInt() and 0xFF, body.toByteArray())
+        val body = ByteArray(2 + 32 + 1 + 2 + 1)
+        var i = 0
+        body[i++] = 0x03; body[i++] = 0x03            // legacy_version
+        System.arraycopy(random, 0, body, i, 32); i += 32
+        body[i++] = 0x00                               // session_id_echo length = 0
+        body[i++] = 0x13; body[i++] = 0x01            // cipher_suite
+        body[i]   = 0x00                               // compression_method: null
+        return wrapHandshakeRecord(TLS_HELLO_SERVER.toInt() and 0xFF, body)
     }
 
     private fun wrapHandshakeRecord(msgType: Int, body: ByteArray): ByteArray {
@@ -188,14 +203,4 @@ class ObfsConn(
         return rec
     }
 
-    private fun buildAppDataRecord(data: ByteArray, offset: Int, length: Int): ByteArray {
-        val rec = ByteArray(OBFS_HEADER_SIZE + length)
-        rec[0] = TLS_APP_DATA
-        rec[1] = TLS_VERSION_MAJOR
-        rec[2] = TLS_VERSION_MINOR
-        rec[3] = (length shr 8).toByte()
-        rec[4] =  length.toByte()
-        System.arraycopy(data, offset, rec, OBFS_HEADER_SIZE, length)
-        return rec
-    }
 }

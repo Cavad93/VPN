@@ -52,9 +52,15 @@ class VpnClient(private val config: VpnConfig) {
     fun connect(): RouteInfo {
         val kp = loadOrGenerateKeyPair()
 
-        // 1. TCP connect
+        // 1. TCP connect with socket tuning.
         val sock = Socket()
         sock.connect(InetSocketAddress(config.serverHost, config.serverPort), config.connectTimeoutMs)
+        // TCP_NODELAY: VPN forwards inner TCP ACKs as small frames; Nagle would
+        // buffer them for up to one RTT (~80-120 ms), killing download throughput.
+        sock.tcpNoDelay = true
+        // 4 MB send/receive buffers: BDP for 30 Mbps × 100 ms ≈ 375 KB.
+        sock.sendBufferSize    = 4 * 1024 * 1024
+        sock.receiveBufferSize = 4 * 1024 * 1024
         sock.soTimeout = config.readTimeoutMs
         socket = sock
 

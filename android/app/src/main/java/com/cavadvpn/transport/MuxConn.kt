@@ -3,11 +3,11 @@ package com.cavadvpn.transport
 import com.cavadvpn.crypto.NoiseCipherState
 import com.cavadvpn.crypto.NoiseSession
 import java.io.EOFException
-import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.BlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+
 
 // Mux frame types
 private const val FRAME_SYN  : Byte = 0x01
@@ -25,13 +25,16 @@ private const val MAX_MUX_PAYLOAD = 0xFFFF
  */
 class NoiseConn(private val obfs: ObfsConn, private val session: NoiseSession) {
 
-    /** Encrypts [plaintext] and writes it with a 2-byte BE length prefix. */
+    /** Encrypts [plaintext] and writes it with a 2-byte BE length prefix.
+     *  Length prefix and ciphertext are combined into one allocation so that
+     *  ObfsConn sends them as a single TLS record (avoids extra array copy). */
     fun writeMessage(plaintext: ByteArray) {
         val ct = session.sendCipher.encrypt(plaintext)
-        val lengthPrefix = ByteArray(2)
-        lengthPrefix[0] = (ct.size shr 8).toByte()
-        lengthPrefix[1] =  ct.size.toByte()
-        obfs.write(lengthPrefix + ct)
+        val frame = ByteArray(2 + ct.size)
+        frame[0] = (ct.size shr 8).toByte()
+        frame[1] =  ct.size.toByte()
+        System.arraycopy(ct, 0, frame, 2, ct.size)
+        obfs.write(frame)
     }
 
     /** Reads one length-prefixed ciphertext frame and decrypts it. */
@@ -54,7 +57,7 @@ class MuxStream(
     val streamId: Int,
     private val mux: ClientMux
 ) {
-    private val queue: BlockingQueue<ByteArray> = ArrayBlockingQueue(256)
+    private val queue: BlockingQueue<ByteArray> = ArrayBlockingQueue(4096)
     private val closed     = AtomicBoolean(false)
     private val remoteFin  = AtomicBoolean(false)
     private var readBuf    = ByteArray(0)
@@ -77,7 +80,7 @@ class MuxStream(
      * Reads the next available data chunk. Returns an empty array on remote FIN / close.
      * Blocks up to [timeoutMs] milliseconds.
      */
-    fun read(timeoutMs: Long = 30_000L): ByteArray {
+    fun read(timeoutMs: Long = 5_000L): ByteArray {
         if (readBufPos < readBuf.size) {
             val chunk = readBuf.copyOfRange(readBufPos, readBuf.size)
             readBufPos = readBuf.size
@@ -93,7 +96,7 @@ class MuxStream(
     /**
      * Reads exactly [n] bytes, blocking and buffering across multiple chunks.
      */
-    fun readExactly(n: Int, timeoutMs: Long = 30_000L): ByteArray {
+    fun readExactly(n: Int, timeoutMs: Long = 5_000L): ByteArray {
         val buf = ByteArray(n)
         var filled = 0
         while (filled < n) {
@@ -190,10 +193,13 @@ class ClientMux(private val conn: NoiseConn) {
 
     internal fun writeFrame(streamId: Int, type: Byte, payload: ByteArray, offset: Int, length: Int) {
         val frame = ByteArray(MUX_HEADER_SIZE + length)
-        val buf = ByteBuffer.wrap(frame)
-        buf.putInt(streamId)
-        buf.put(type)
-        buf.putShort(length.toShort())
+        frame[0] = (streamId ushr 24).toByte()
+        frame[1] = (streamId ushr 16).toByte()
+        frame[2] = (streamId ushr  8).toByte()
+        frame[3] =  streamId.toByte()
+        frame[4] = type
+        frame[5] = (length shr 8).toByte()
+        frame[6] =  length.toByte()
         if (length > 0) System.arraycopy(payload, offset, frame, MUX_HEADER_SIZE, length)
         synchronized(writeLock) { conn.writeMessage(frame) }
     }
