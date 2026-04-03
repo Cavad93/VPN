@@ -158,6 +158,12 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("server: listen %s: %w", s.cfg.ListenAddr, err)
 	}
+	// TCP_DEFER_ACCEPT: kernel holds connections in SYN_RECV until the client
+	// sends data (the TLS ClientHello), reducing context switches per accept
+	// and silently dropping port-scan SYN probes.
+	if tcpLn, ok := ln.(*net.TCPListener); ok {
+		setListenerDeferAccept(tcpLn, 5) // 5-second timeout
+	}
 	s.logger.Info("server listening", "addr", s.cfg.ListenAddr)
 
 	go s.routeFromTun(ctx)
@@ -188,11 +194,12 @@ func (s *Server) Run(ctx context.Context) error {
 		if tc, ok := conn.(*net.TCPConn); ok {
 			setForcedSocketBuffers(tc, 8<<20) // 8 MB, force-bypass rmem_max
 			tc.SetNoDelay(true)               // disable Nagle — VPN packets must not be coalesced
-			// TCP keepalive: probe idle connections every 30 s with 3 retries.
+			// TCP keepalive: probe idle connections every 15 s with 3 retries.
+			// Detects dead connections in 30 s (15+3×5) — 2× faster than before.
 			// Prevents ISP NAT/firewall from silently dropping "idle" VPN connections
 			// after a few minutes (common with Rostelecom / MTS stateful firewalls).
 			tc.SetKeepAlive(true)
-			tc.SetKeepAlivePeriod(30 * time.Second)
+			tc.SetKeepAlivePeriod(15 * time.Second)
 		}
 		go s.handleConn(ctx, conn)
 	}
@@ -618,23 +625,29 @@ func newNoiseConn(conn net.Conn, session *crypto.Session) *noiseConn {
 // Length prefix and ciphertext are combined into one slice so that ObfsConn
 // wraps them in a single TLS record. This halves the number of TLS records
 // the Python client must read per message, doubling download throughput.
+//
+// Optimisation: EncryptTo writes ciphertext directly into the pool frame
+// buffer at offset 2, eliminating both the intermediate ciphertext allocation
+// and the copy. Saves 2 allocations + 1 copy per packet.
 func (nc *noiseConn) Write(p []byte) (int, error) {
-	ciphertext, err := nc.session.SendCipher.Encrypt(p, nil)
-	if err != nil {
-		return 0, fmt.Errorf("noiseConn encrypt: %w", err)
-	}
-
-	// Borrow a frame buffer from the pool (avoids one make() per packet).
-	need := 2 + len(ciphertext)
+	// Borrow a frame buffer from the pool.
+	ctLen := len(p) + 16 // plaintext + AEAD tag
+	need := 2 + ctLen
 	bp := noiseWritePool.Get().(*[]byte)
 	if cap(*bp) < need {
 		*bp = make([]byte, need)
 	}
 	frame := (*bp)[:need]
-	binary.BigEndian.PutUint16(frame[:2], uint16(len(ciphertext)))
-	copy(frame[2:], ciphertext)
 
-	_, err = nc.conn.Write(frame)
+	// Encrypt directly into frame[2:], skipping the length prefix.
+	ciphertext, err := nc.session.SendCipher.EncryptTo(frame[2:2], p, nil)
+	if err != nil {
+		noiseWritePool.Put(bp)
+		return 0, fmt.Errorf("noiseConn encrypt: %w", err)
+	}
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(ciphertext)))
+
+	_, err = nc.conn.Write(frame[:2+len(ciphertext)])
 	noiseWritePool.Put(bp)
 	if err != nil {
 		return 0, err

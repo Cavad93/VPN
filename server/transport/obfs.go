@@ -73,10 +73,10 @@ type ObfsConn struct {
 }
 
 // NewObfsConn wraps conn.  No I/O is performed until Handshake is called.
-// A 32 KB bufio.Reader is used internally to batch small reads (TLS record
+// A 64 KB bufio.Reader is used internally to batch small reads (TLS record
 // headers) into fewer syscalls, improving throughput by ~15-20%.
 func NewObfsConn(conn net.Conn) *ObfsConn {
-	return &ObfsConn{conn: conn, bufr: bufio.NewReaderSize(conn, 32768)}
+	return &ObfsConn{conn: conn, bufr: bufio.NewReaderSize(conn, 65536)}
 }
 
 // WithSNI attaches an SNISelector to the connection.  When set, ClientHandshake
@@ -163,10 +163,9 @@ func (c *ObfsConn) Read(p []byte) (int, error) {
 	}
 	n := copy(p, payload)
 	if n < len(payload) {
-		// Save the remainder for the next Read call.
-		tail := make([]byte, len(payload)-n)
-		copy(tail, payload[n:])
-		c.readBuf = tail
+		// Save the remainder for the next Read call as a zero-copy sub-slice.
+		// Safe because readRecord allocates a fresh buffer for each TLS record.
+		c.readBuf = payload[n:]
 	}
 	return n, nil
 }

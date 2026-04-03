@@ -142,6 +142,19 @@ func (cs *noiseCipherState) decryptWithAD(ad, ciphertext []byte) ([]byte, error)
 	return plaintext, nil
 }
 
+// encryptWithADTo шифрует plaintext в предоставленный буфер dst[:0],
+// позволяя повторно использовать выделенную память.
+func (cs *noiseCipherState) encryptWithADTo(dst, ad, plaintext []byte) ([]byte, error) {
+	if !cs.hasKey {
+		result := append(dst[:0], plaintext...)
+		return result, nil
+	}
+	var nonce [NonceSize]byte
+	binary.LittleEndian.PutUint64(nonce[4:], cs.n)
+	cs.n++
+	return cs.aead.Seal(dst[:0], nonce[:], plaintext, ad), nil
+}
+
 // decryptWithADTo расшифровывает в предоставленный буфер dst[:0],
 // позволяя повторно использовать выделенную память.
 func (cs *noiseCipherState) decryptWithADTo(dst, ad, ciphertext []byte) ([]byte, error) {
@@ -266,6 +279,14 @@ func (sc *SessionCipher) Encrypt(plaintext, ad []byte) ([]byte, error) {
 // Decrypt расшифровывает ciphertext с проверкой аутентификации.
 func (sc *SessionCipher) Decrypt(ciphertext, ad []byte) ([]byte, error) {
 	return sc.cs.decryptWithAD(ad, ciphertext)
+}
+
+// EncryptTo шифрует plaintext в предоставленный буфер dst,
+// избегая выделения памяти на каждый пакет. dst должен иметь достаточный
+// cap для ciphertext (len(plaintext) + 16 байт AEAD overhead).
+// Возвращает слайс ciphertext из dst.
+func (sc *SessionCipher) EncryptTo(dst, plaintext, ad []byte) ([]byte, error) {
+	return sc.cs.encryptWithADTo(dst, ad, plaintext)
 }
 
 // DecryptTo расшифровывает ciphertext в предоставленный буфер dst,

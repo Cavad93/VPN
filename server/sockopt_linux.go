@@ -33,6 +33,12 @@ const tcpQuickAck = 12 // TCP_QUICKACK — Linux ≥ 2.4.4
 // throughput on high-latency links (Russia↔Kazakhstan ≈ 80-120 ms).
 const tcpCongestion = 13 // TCP_CONGESTION — Linux ≥ 2.6.13
 
+// TCP_DEFER_ACCEPT delays the accept() wake-up until the client sends actual
+// data (the TLS ClientHello). This eliminates one context switch for the
+// server goroutine on each new connection, and rejects pure SYN-only probes
+// (port scanners, health checks) without waking the accept loop.
+const tcpDeferAccept = 9 // TCP_DEFER_ACCEPT — Linux ≥ 2.4
+
 // TCP keepalive constants.
 // These are applied to every accepted VPN client connection to prevent NAT
 // gateways (e.g. Russian ISP NAT, Kazakhstan transit NAT) from silently
@@ -43,6 +49,20 @@ const (
 	tcpKeepIntvl = 5  // TCP_KEEPINTVL — send a probe every N seconds
 	tcpKeepCnt   = 6  // TCP_KEEPCNT   — give up after N failed probes
 )
+
+// setListenerDeferAccept sets TCP_DEFER_ACCEPT on a TCP listener socket.
+// The kernel holds incoming connections in SYN_RECV state until the client
+// sends data (up to timeout seconds), eliminating a context switch per
+// connection and silently dropping SYN-only probes.
+func setListenerDeferAccept(ln *net.TCPListener, timeout int) {
+	raw, err := ln.SyscallConn()
+	if err != nil {
+		return
+	}
+	raw.Control(func(fd uintptr) { //nolint:errcheck
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpDeferAccept, timeout) //nolint:errcheck
+	})
+}
 
 // setForcedSocketBuffers attempts to set SO_RCVBUFFORCE / SO_SNDBUFFORCE on
 // conn.  Falls back to SO_RCVBUF / SO_SNDBUF if the process lacks
@@ -74,13 +94,14 @@ func setForcedSocketBuffers(conn *net.TCPConn, size int) {
 		// TCP keepalive tuning — prevents NAT timeout drops on idle VPN
 		// sessions (Russia↔Kazakhstan latency path).
 		// SO_KEEPALIVE enables the OS keepalive probes.
-		// TCP_KEEPIDLE=30s: wait 30 s of idle before first probe.
-		// TCP_KEEPINTVL=10s: repeat probes every 10 s.
-		// TCP_KEEPCNT=3: declare connection dead after 3 missed probes (30 s total).
-		// Total disconnect detection: 30 + 3×10 = 60 s — well inside NAT timeouts.
+		// TCP_KEEPIDLE=15s: wait 15 s of idle before first probe.
+		// TCP_KEEPINTVL=5s: repeat probes every 5 s.
+		// TCP_KEEPCNT=3: declare connection dead after 3 missed probes.
+		// Total disconnect detection: 15 + 3×5 = 30 s — well inside NAT timeouts
+		// and detects dead connections 2× faster than before (was 60 s).
 		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1) //nolint:errcheck
-		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpKeepIdle, 30)        //nolint:errcheck
-		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpKeepIntvl, 10)       //nolint:errcheck
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpKeepIdle, 15)        //nolint:errcheck
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpKeepIntvl, 5)        //nolint:errcheck
 		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpKeepCnt, 3)          //nolint:errcheck
 	})
 }

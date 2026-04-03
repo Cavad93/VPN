@@ -408,9 +408,9 @@ class ObfsConn:
     Call client_handshake() before read/write.
     """
 
-    # Large socket-level read buffer: one recv(131072) fills ~90 TLS records,
+    # Large socket-level read buffer: one recv(262144) fills ~180 TLS records,
     # so most _recv_exactly() calls return instantly from memory with zero syscalls.
-    _SOCK_RECV_SIZE = 131072
+    _SOCK_RECV_SIZE = 262144
 
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
@@ -434,12 +434,23 @@ class ObfsConn:
         logger.debug("obfs_server_handshake_done")
 
     def write(self, data: bytes) -> None:
-        """Send data as one or more TLS application_data records."""
+        """Send data as one or more TLS application_data records.
+
+        Builds each record inline in a pre-sized bytearray to avoid the
+        intermediate bytes allocation that _build_app_data_record creates.
+        """
         offset = 0
         while offset < len(data):
-            chunk = data[offset : offset + MAX_OBFS_PAYLOAD]
-            self._sock.sendall(_build_app_data_record(chunk))
-            offset += len(chunk)
+            end = min(offset + MAX_OBFS_PAYLOAD, len(data))
+            chunk_len = end - offset
+            rec = bytearray(5 + chunk_len)
+            rec[0] = TLS_RECORD_APPDATA
+            rec[1] = TLS_VERSION_MAJOR
+            rec[2] = TLS_VERSION_MINOR
+            struct.pack_into(">H", rec, 3, chunk_len)
+            rec[5:] = data[offset:end]
+            self._sock.sendall(rec)
+            offset = end
 
     def read(self, n: int) -> bytes:
         """Read exactly n bytes, buffering across TLS records as needed."""
@@ -840,6 +851,23 @@ class VPNClient:
         _BUF_SIZE = 8 * 1024 * 1024
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _BUF_SIZE)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _BUF_SIZE)
+        # TCP keepalive: prevent ISP NAT/firewall from dropping idle connections.
+        # NAT tables typically expire TCP entries after 60–120 s; 15 s idle
+        # ensures probes fire well before any timeout.
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        try:
+            # macOS: TCP_KEEPALIVE sets idle time before first probe
+            import platform
+            if platform.system() == "Darwin":
+                TCP_KEEPALIVE = 0x10  # macOS TCP_KEEPALIVE
+                self._sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPALIVE, 15)
+            else:
+                # Linux: TCP_KEEPIDLE
+                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except (AttributeError, OSError):
+            pass  # best-effort; SO_KEEPALIVE alone uses OS defaults
         # After handshake switch to fully blocking reads so the mux read loop
         # never receives spurious socket.timeout exceptions that close the conn.
         self._sock.settimeout(None)

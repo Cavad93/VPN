@@ -4,6 +4,9 @@ package main
 
 import "net"
 
+// setListenerDeferAccept is a no-op on non-Linux platforms.
+func setListenerDeferAccept(_ *net.TCPListener, _ int) {}
+
 // setForcedSocketBuffers is a no-op on non-Linux platforms.
 // On Windows, socket buffer sizing is handled by the TCP stack automatically.
 func setForcedSocketBuffers(conn *net.TCPConn, size int) {

@@ -72,7 +72,7 @@ func NewMux(conn net.Conn, isClient bool) *Mux {
 	m := &Mux{
 		conn:     conn,
 		streams:  make(map[uint32]*Stream),
-		acceptCh: make(chan *Stream, 16),
+		acceptCh: make(chan *Stream, 64),
 		ctx:      ctx,
 		cancel:   cancel,
 	}
