@@ -22,24 +22,23 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: |
+          xcodegen generate
+          echo "Generated CavadVPN.xcodeproj:"
+          ls -la CavadVPN.xcodeproj/
+
       - name: Resolve Swift packages
         working-directory: ios
         run: |
           xcodebuild -resolvePackageDependencies \
             -scheme CavadVPN \
             -project CavadVPN.xcodeproj \
-            2>&1 | tail -5 || true
-          # If no .xcodeproj, resolve via SPM
-          swift package resolve 2>/dev/null || true
-
-      - name: Generate Xcode project
-        working-directory: ios
-        run: |
-          # Create .xcodeproj if it doesn't exist
-          if [ ! -d "CavadVPN.xcodeproj" ]; then
-            echo "Generating Xcode project from Package.swift..."
-            swift package generate-xcodeproj 2>/dev/null || true
-          fi
+            2>&1 | tail -20
 
       - name: Build archive (unsigned)
         working-directory: ios
@@ -47,6 +46,7 @@ jobs:
           # Build for iOS device (arm64), unsigned for SideStore sideloading
           xcodebuild archive \
             -scheme CavadVPN \
+            -project CavadVPN.xcodeproj \
             -sdk iphoneos \
             -configuration Release \
             -archivePath build/CavadVPN.xcarchive \
@@ -58,7 +58,7 @@ jobs:
             PROVISIONING_PROFILE="" \
             -skipPackagePluginValidation \
             -destination "generic/platform=iOS" \
-            2>&1 | tail -20
+            2>&1 | tail -30
 
       - name: Create IPA from archive
         working-directory: ios

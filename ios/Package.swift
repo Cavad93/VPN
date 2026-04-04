@@ -4,6 +4,11 @@ import PackageDescription
 let package = Package(
     name: "CavadVPN",
     platforms: [.iOS(.v16), .macOS(.v13)],
+    products: [
+        .library(name: "CavadVPNCrypto", targets: ["CavadVPNCrypto"]),
+        .library(name: "CavadVPNTransport", targets: ["CavadVPNTransport"]),
+        .library(name: "CavadVPNClient", targets: ["CavadVPNClient"]),
+    ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
     ],

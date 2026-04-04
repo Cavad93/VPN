@@ -1,0 +1,81 @@
+name: CavadVPN
+
+options:
+  bundleIdPrefix: com.cavadvpn
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+
+packages:
+  swift-crypto:
+    url: https://github.com/apple/swift-crypto.git
+    from: "3.0.0"
+
+localPackages:
+  - "."
+
+targets:
+
+  # ── Main iOS App ──────────────────────────────────────────
+  CavadVPN:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes:
+          - TunnelExtension.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cavadvpn.ios
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/CavadVPN.entitlements
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+        ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: "YES"
+    dependencies:
+      - package: CavadVPN
+        product: CavadVPNClient
+      - package: CavadVPN
+        product: CavadVPNCrypto
+      - package: CavadVPN
+        product: CavadVPNTransport
+      - target: CavadVPNTunnel
+        embed: true
+      - sdk: NetworkExtension.framework
+
+  # ── Network Extension (Packet Tunnel) ────────────────────
+  CavadVPNTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NetworkExtension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cavadvpn.ios.tunnel
+        PRODUCT_NAME: CavadVPNTunnel
+        INFOPLIST_FILE: NetworkExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/TunnelExtension.entitlements
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"
+        SKIP_INSTALL: "YES"
+    dependencies:
+      - package: CavadVPN
+        product: CavadVPNClient
+      - package: CavadVPN
+        product: CavadVPNCrypto
+      - package: CavadVPN
+        product: CavadVPNTransport
+      - sdk: NetworkExtension.framework
+
+schemes:
+  CavadVPN:
+    build:
+      targets:
+        CavadVPN: all
+        CavadVPNTunnel: all
+    archive:
+      config: Release
