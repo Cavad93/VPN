@@ -354,13 +354,7 @@ public final class TelemetryCollector {
         let raw = ProcessInfo.processInfo.hostName + ProcessInfo.processInfo.operatingSystemVersionString
         #endif
         guard let data = raw.data(using: .utf8) else { return "unknown" }
-        let hash = data.withUnsafeBytes { buf -> String in
-            var hasher = CC_SHA256_CTX()
-            CC_SHA256_Init(&hasher)
-            // Fallback: just use simple hash.
-            return ""
-        }
-        // Use simple hash instead of CommonCrypto.
+        // Simple djb2 hash — stable device identifier, not cryptographic.
         var h: UInt64 = 5381
         for byte in data {
             h = ((h << 5) &+ h) &+ UInt64(byte)

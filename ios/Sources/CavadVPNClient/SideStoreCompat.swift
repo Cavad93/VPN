@@ -46,7 +46,7 @@ public struct SideStoreCompat {
 
     /// Apple IP subnets that SideStore needs to reach directly.
     /// Covers: Apple ID auth, app signing (ppq), push, and iTunes services.
-    public static let appleSubnets: [(network: String, mask: String)] = [
+    public static let appleSubnets: [(destination: String, mask: String)] = [
         // Apple ID / auth / signing (17.0.0.0/8 covers most Apple infra)
         ("17.0.0.0",   "255.0.0.0"),
         // Apple CloudKit / iCloud (additional range)

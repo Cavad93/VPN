@@ -25,7 +25,11 @@ let package = Package(
         ),
         .target(
             name: "CavadVPNClient",
-            dependencies: ["CavadVPNCrypto", "CavadVPNTransport"]
+            dependencies: [
+                "CavadVPNCrypto",
+                "CavadVPNTransport",
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
         ),
         .testTarget(
             name: "CavadVPNCryptoTests",

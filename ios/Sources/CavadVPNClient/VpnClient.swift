@@ -5,6 +5,7 @@ import Foundation
 #if canImport(Darwin)
 import Darwin
 #endif
+import Crypto
 import CavadVPNCrypto
 import CavadVPNTransport
 
