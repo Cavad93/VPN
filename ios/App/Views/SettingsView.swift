@@ -72,7 +72,7 @@ struct SettingsView: View {
                     Button("Generate New Private Key") {
                         generateKey()
                     }
-                    .foregroundStyle(.accentColor)
+                    .foregroundStyle(Color.accentColor)
                 }
 
                 formSection("Network") {
