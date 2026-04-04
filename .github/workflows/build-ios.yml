@@ -1,0 +1,146 @@
+name: Build iOS IPA (SideStore)
+
+on:
+  push:
+    branches: [ "main", "claude/*" ]
+    paths:
+      - 'ios/**'
+      - '.github/workflows/build-ios.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14    # Apple Silicon runner (M1)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 15
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Resolve Swift packages
+        working-directory: ios
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -scheme CavadVPN \
+            -project CavadVPN.xcodeproj \
+            2>&1 | tail -5 || true
+          # If no .xcodeproj, resolve via SPM
+          swift package resolve 2>/dev/null || true
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: |
+          # Create .xcodeproj if it doesn't exist
+          if [ ! -d "CavadVPN.xcodeproj" ]; then
+            echo "Generating Xcode project from Package.swift..."
+            swift package generate-xcodeproj 2>/dev/null || true
+          fi
+
+      - name: Build archive (unsigned)
+        working-directory: ios
+        run: |
+          # Build for iOS device (arm64), unsigned for SideStore sideloading
+          xcodebuild archive \
+            -scheme CavadVPN \
+            -sdk iphoneos \
+            -configuration Release \
+            -archivePath build/CavadVPN.xcarchive \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE="" \
+            -skipPackagePluginValidation \
+            -destination "generic/platform=iOS" \
+            2>&1 | tail -20
+
+      - name: Create IPA from archive
+        working-directory: ios
+        run: |
+          # Extract .app from archive
+          APP_DIR="build/CavadVPN.xcarchive/Products/Applications"
+          if [ ! -d "$APP_DIR" ]; then
+            echo "Archive Products not found, trying alternative paths..."
+            APP_DIR=$(find build -name "*.app" -type d | head -1 | xargs dirname)
+          fi
+
+          if [ -z "$APP_DIR" ] || [ ! -d "$APP_DIR" ]; then
+            echo "ERROR: No .app found in archive"
+            find build -name "*.app" -type d 2>/dev/null
+            exit 1
+          fi
+
+          # Create Payload directory structure for IPA
+          mkdir -p build/Payload
+          cp -r "$APP_DIR"/*.app build/Payload/
+
+          # Add SideStore metadata (AltStore source compatibility)
+          cat > build/Payload/AltStore.plist << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+              "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>ALTDeviceID</key>
+              <string></string>
+          </dict>
+          </plist>
+          PLIST
+
+          # Create IPA (just a renamed zip)
+          cd build
+          zip -r CavadVPN.ipa Payload/
+          echo "IPA created: $(ls -lh CavadVPN.ipa)"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CavadVPN-iOS
+          path: ios/build/CavadVPN.ipa
+          retention-days: 90
+
+      - name: Create SideStore source JSON
+        working-directory: ios
+        run: |
+          VERSION=$(grep -A1 CFBundleShortVersionString App/Info.plist | grep string | sed 's/.*<string>\(.*\)<\/string>/\1/')
+          BUILD=$(grep -A1 CFBundleVersion App/Info.plist | grep string | sed 's/.*<string>\(.*\)<\/string>/\1/')
+          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          cat > build/sidestore-source.json << EOF
+          {
+            "name": "CavadVPN",
+            "identifier": "com.cavadvpn.source",
+            "sourceURL": "",
+            "apps": [
+              {
+                "name": "CavadVPN",
+                "bundleIdentifier": "com.cavadvpn.ios",
+                "developerName": "CavadVPN",
+                "subtitle": "Secure VPN with Noise protocol",
+                "version": "${VERSION}",
+                "versionDate": "${DATE}",
+                "versionDescription": "CavadVPN v${VERSION} build ${BUILD}",
+                "downloadURL": "",
+                "localizedDescription": "CavadVPN - secure VPN client with Noise_XX handshake, ChaCha20-Poly1305 encryption, TLS obfuscation, and SideStore auto-refresh support.",
+                "iconURL": "",
+                "size": 0,
+                "screenshotURLs": []
+              }
+            ],
+            "news": []
+          }
+          EOF
+          echo "SideStore source JSON created"
+
+      - name: Upload SideStore source
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-Source
+          path: ios/build/sidestore-source.json
+          retention-days: 90
