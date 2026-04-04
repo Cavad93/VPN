@@ -20,27 +20,20 @@ struct SettingsView: View {
     @State private var generatedKey = ""
 
     /// Workaround: Xcode 16.1 + iOS SDK 18 — Section has both View-based
-    /// and TableRowBuilder-based overloads. Generic constraint `Content: View`
-    /// excludes the Table overload (FB15338009).
-    @ViewBuilder
+    /// and TableRowBuilder-based overloads. Explicit return type
+    /// Section<Text, Content, EmptyView> forces View-based overload because
+    /// Table-based requires Parent == TableHeaderRowContent<V,Text> (FB15338009).
     private func formSection<Content: View>(
         _ title: String,
         @ViewBuilder content: () -> Content
-    ) -> some View {
-        Section {
-            content()
-        } header: {
-            Text(title)
-        }
+    ) -> Section<Text, Content, EmptyView> {
+        Section(content: content, header: { Text(title) })
     }
 
-    @ViewBuilder
     private func formSection<Content: View>(
         @ViewBuilder content: () -> Content
-    ) -> some View {
-        Section {
-            content()
-        }
+    ) -> Section<EmptyView, Content, EmptyView> {
+        Section(content: content)
     }
 
     var body: some View {
