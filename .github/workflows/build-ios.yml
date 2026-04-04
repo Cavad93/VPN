@@ -43,14 +43,14 @@ jobs:
       - name: Build for iOS device (unsigned)
         working-directory: ios
         run: |
-          BUILD_DIR="$(pwd)/build/Build/Products"
+          set -euo pipefail
 
           xcodebuild build \
             -scheme CavadVPN \
             -project CavadVPN.xcodeproj \
             -sdk iphoneos \
             -configuration Release \
-            -derivedDataPath build \
+            -derivedDataPath "$PWD/build" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="-" \
@@ -59,26 +59,32 @@ jobs:
             PROVISIONING_PROFILE="" \
             -skipPackagePluginValidation \
             -destination "generic/platform=iOS" \
-            2>&1 | tail -50
+            | tee /tmp/xcodebuild.log | tail -80
 
-          echo "Build products:"
-          find build -name "*.app" -type d 2>/dev/null || echo "No .app found"
+          echo ""
+          echo "=== Build directory contents ==="
+          find "$PWD/build" -name "*.app" -type d 2>/dev/null || true
+          ls -R "$PWD/build/Build/Products/" 2>/dev/null || true
+
+      - name: Show build log on failure
+        if: failure()
+        run: |
+          echo "=== FULL BUILD LOG (last 200 lines) ==="
+          tail -200 /tmp/xcodebuild.log 2>/dev/null || echo "No build log found"
+          echo ""
+          echo "=== Errors only ==="
+          grep -i "error:" /tmp/xcodebuild.log 2>/dev/null || echo "No errors found in log"
 
       - name: Create IPA from build
         working-directory: ios
         run: |
           # Find the .app bundle
-          APP_PATH=$(find build/Build/Products -name "CavadVPN.app" -type d | head -1)
-
-          # Fallback: search entire build dir
-          if [ -z "$APP_PATH" ]; then
-            APP_PATH=$(find build -name "CavadVPN.app" -type d | head -1)
-          fi
+          APP_PATH=$(find "$PWD/build" -name "CavadVPN.app" -type d | head -1)
 
           if [ -z "$APP_PATH" ]; then
             echo "ERROR: CavadVPN.app not found"
             echo "Build directory contents:"
-            find build -type d -maxdepth 5
+            find "$PWD/build" -type d -maxdepth 5 2>/dev/null || echo "build dir does not exist"
             exit 1
           fi
 
