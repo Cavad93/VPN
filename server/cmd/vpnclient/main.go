@@ -232,10 +232,12 @@ func (vs *vpnSession) connect() (
 		})
 	}
 
-	cleanupConn := func() { rawConn.Close() }
+	// Write coalescing: batch small Noise messages into fewer TCP segments.
+	bufConn := transport.NewBufConn(rawConn)
+	cleanupConn := func() { bufConn.Close() }
 
 	// 2. TLS obfuscation handshake.
-	obfs := transport.NewObfsConn(rawConn)
+	obfs := transport.NewObfsConn(bufConn)
 	if err := obfs.ClientHandshake(); err != nil {
 		cleanupConn()
 		return nil, nil, "", "", nil, fmt.Errorf("obfs handshake: %w", err)
@@ -362,10 +364,11 @@ func (vs *vpnSession) connectSecondary(assignedIP string) (*secondaryConn, error
 			syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, 0x201, 16384) //nolint:errcheck
 		})
 	}
-	cleanupConn := func() { rawConn.Close() }
+	bufConn2 := transport.NewBufConn(rawConn)
+	cleanupConn := func() { bufConn2.Close() }
 
 	// 2. TLS obfuscation.
-	obfs := transport.NewObfsConn(rawConn)
+	obfs := transport.NewObfsConn(bufConn2)
 	if err := obfs.ClientHandshake(); err != nil {
 		cleanupConn()
 		return nil, fmt.Errorf("secondary obfs: %w", err)
