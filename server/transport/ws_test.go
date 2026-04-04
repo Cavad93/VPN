@@ -329,6 +329,72 @@ func TestWSLargePayload(t *testing.T) {
 	ws.Close()
 }
 
+// TestWSBufferedRead verifies that a single WebSocket frame can be consumed
+// via multiple Read calls (critical for VLESS header parsing with io.ReadFull).
+func TestWSBufferedRead(t *testing.T) {
+	client, server := testPipe()
+
+	done := make(chan *WSConn, 1)
+	go func() {
+		ws, err := WSUpgrade(server, "")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		done <- ws
+	}()
+
+	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
+	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
+	client.Write([]byte(req))
+	respBuf := make([]byte, 4096)
+	client.Read(respBuf)
+
+	ws := <-done
+
+	// Simulate VLESS: client sends a 30-byte header in one WS frame,
+	// server reads it in multiple small io.ReadFull calls.
+	payload := make([]byte, 30)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	// Start server reads concurrently (net.Pipe is synchronous)
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	resCh := make(chan readResult, 1)
+	go func() {
+		// Read 10 bytes, then 10 bytes, then 10 bytes — like io.ReadFull would
+		var all []byte
+		for i := 0; i < 3; i++ {
+			buf := make([]byte, 10)
+			n, err := io.ReadFull(ws, buf)
+			if err != nil {
+				resCh <- readResult{nil, err}
+				return
+			}
+			all = append(all, buf[:n]...)
+		}
+		resCh <- readResult{all, nil}
+	}()
+
+	// Client sends one masked frame with all 30 bytes
+	sendMaskedFrame(t, client, wsOpBinary, payload)
+
+	res := <-resCh
+	if res.err != nil {
+		t.Fatalf("read error: %v", res.err)
+	}
+	if !bytes.Equal(res.data, payload) {
+		t.Errorf("got %v, want %v", res.data, payload)
+	}
+
+	client.Close()
+	ws.Close()
+}
+
 // --- Helpers for tests ---
 
 // sendMaskedFrame sends a WebSocket frame with masking (client→server).

@@ -37,12 +37,15 @@ const wsGUID = "258EAFA5-E914-47DA-95CA-5AB5DC085B11"
 
 // WSConn wraps a net.Conn with WebSocket binary message framing.
 // After Upgrade(), reads and writes are transparently framed.
+// Read implements io.Reader: a single WebSocket frame's payload may be
+// consumed across multiple Read calls (buffered internally).
 type WSConn struct {
 	conn      net.Conn
 	br        *bufio.Reader
 	path      string // requested URL path (e.g. "/tunnel")
 	closed    bool
 	earlyData []byte // V2Ray 0-RTT data from Sec-WebSocket-Protocol
+	readBuf   []byte // leftover from partially consumed frame
 }
 
 // Upgrade performs the server-side WebSocket upgrade handshake.
@@ -131,11 +134,12 @@ func (ws *WSConn) Path() string { return ws.path }
 // HasEarlyData returns true if 0-RTT data was received during upgrade.
 func (ws *WSConn) HasEarlyData() bool { return len(ws.earlyData) > 0 }
 
-// Read reads the next WebSocket binary message payload.
+// Read reads WebSocket data into p, implementing io.Reader.
+// A single WebSocket frame's payload may be consumed across multiple Read calls.
 // If early data (0-RTT) was received during upgrade, it is returned first.
-// Handles continuation frames, ping/pong, and close frames transparently.
+// Handles ping/pong and close frames transparently.
 func (ws *WSConn) Read(p []byte) (int, error) {
-	// Return early data first (V2Ray 0-RTT from Sec-WebSocket-Protocol)
+	// 1. Return early data first (V2Ray 0-RTT from Sec-WebSocket-Protocol)
 	if len(ws.earlyData) > 0 {
 		n := copy(p, ws.earlyData)
 		ws.earlyData = ws.earlyData[n:]
@@ -145,8 +149,19 @@ func (ws *WSConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
+	// 2. Return leftover data from a previous frame
+	if len(ws.readBuf) > 0 {
+		n := copy(p, ws.readBuf)
+		ws.readBuf = ws.readBuf[n:]
+		if len(ws.readBuf) == 0 {
+			ws.readBuf = nil
+		}
+		return n, nil
+	}
+
+	// 3. Read the next frame
 	for {
-		fin, opcode, payload, err := ws.readFrame()
+		_, opcode, payload, err := ws.readFrame()
 		if err != nil {
 			return 0, err
 		}
@@ -154,7 +169,6 @@ func (ws *WSConn) Read(p []byte) (int, error) {
 		switch opcode {
 		case wsOpClose:
 			ws.closed = true
-			// Send close frame back
 			ws.writeFrame(wsOpClose, nil)
 			return 0, io.EOF
 		case wsOpPing:
@@ -164,9 +178,9 @@ func (ws *WSConn) Read(p []byte) (int, error) {
 			continue
 		case wsOpBinary, wsOpText, wsOpContinuation:
 			n := copy(p, payload)
-			if !fin {
-				// For simplicity, we require single-frame messages for VLESS.
-				// V2Ray clients always send single-frame binary messages.
+			// Buffer any leftover bytes for subsequent Read calls
+			if n < len(payload) {
+				ws.readBuf = payload[n:]
 			}
 			return n, nil
 		default:
