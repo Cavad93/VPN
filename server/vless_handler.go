@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"bufio"
 	"io"
 	"log/slog"
 	"math/big"
@@ -58,7 +59,7 @@ func (s *Server) RunVLESS(ctx context.Context, cfg VLESSConfig) error {
 		return fmt.Errorf("vless: listen %s: %w", cfg.ListenAddr, err)
 	}
 
-	s.logger.Info("VLESS+WS+TLS listening", "addr", cfg.ListenAddr, "path", cfg.WSPath)
+	s.logger.Info("VLESS+TLS listening (auto-detect: raw TCP or WebSocket)", "addr", cfg.ListenAddr, "path", cfg.WSPath)
 
 	go func() {
 		<-ctx.Done()
@@ -83,10 +84,11 @@ func (s *Server) RunVLESS(ctx context.Context, cfg VLESSConfig) error {
 // vlessActiveConns tracks active VLESS proxy connections for stats.
 var vlessActiveConns atomic.Int64
 
-// handleVLESSConn handles a single VLESS+WS connection as a TCP proxy.
+// handleVLESSConn handles a single VLESS connection as a TCP proxy.
+// Auto-detects protocol: if first byte is 0x00 (VLESS version), uses raw TCP.
+// If first bytes look like HTTP (GET/POST), does WebSocket upgrade first.
 // V2Ray clients use VLESS as a proxy protocol: each TCP connection from the
-// phone (e.g. to google.com:443) becomes a separate VLESS request with the
-// destination address. We dial the destination and relay data bidirectionally.
+// phone becomes a separate VLESS request with destination address.
 func (s *Server) handleVLESSConn(ctx context.Context, conn net.Conn, cfg VLESSConfig) {
 	defer conn.Close()
 	remote := conn.RemoteAddr().String()
@@ -97,30 +99,51 @@ func (s *Server) handleVLESSConn(ctx context.Context, conn net.Conn, cfg VLESSCo
 			s.logger.Warn("vless TLS handshake failed", "err", err, "remote", remote)
 			return
 		}
-		state := tlsConn.ConnectionState()
-		s.logger.Info("vless TLS ok", "proto", state.NegotiatedProtocol, "remote", remote)
 	}
 
-	// Set a deadline for the WS upgrade + VLESS header phase
+	// Set a deadline for the handshake phase
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
 
-	// 1. WebSocket upgrade
-	ws, err := transport.WSUpgrade(conn, cfg.WSPath)
+	// Peek first byte to auto-detect protocol
+	br := bufio.NewReaderSize(conn, 4096)
+	first, err := br.Peek(1)
 	if err != nil {
-		s.logger.Warn("vless ws upgrade failed", "err", err, "remote", remote)
+		s.logger.Debug("vless peek failed", "err", err, "remote", remote)
 		return
 	}
-	defer ws.Close()
 
-	s.logger.Info("vless ws upgraded", "remote", remote)
+	// Choose reader: raw VLESS over TLS or VLESS over WebSocket
+	var reader io.Reader
+	var writer io.Writer
+	var closer func()
 
-	// 2. Parse VLESS request (contains destination addr:port)
-	req, err := transport.VLESSParseRequest(ws)
+	if first[0] == 0x00 {
+		// Raw VLESS: first byte is version 0
+		s.logger.Info("vless raw TCP", "remote", remote)
+		reader = br
+		writer = conn
+		closer = func() {}
+	} else {
+		// WebSocket upgrade (first byte is 'G' for GET)
+		ws, err := transport.WSUpgradeFromReader(conn, br, cfg.WSPath)
+		if err != nil {
+			s.logger.Warn("vless ws upgrade failed", "err", err, "remote", remote)
+			return
+		}
+		s.logger.Info("vless ws upgraded", "remote", remote)
+		reader = ws
+		writer = ws
+		closer = func() { ws.Close() }
+	}
+	defer closer()
+
+	// Parse VLESS request
+	req, err := transport.VLESSParseRequest(reader)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			s.logger.Info("vless client closed after upgrade (cert rejected?)", "remote", remote)
+			s.logger.Info("vless client closed (no VLESS data)", "remote", remote)
 		} else {
-			s.logger.Warn("vless parse request failed", "err", err, "remote", remote)
+			s.logger.Warn("vless parse failed", "err", err, "remote", remote)
 		}
 		return
 	}
@@ -128,19 +151,19 @@ func (s *Server) handleVLESSConn(ctx context.Context, conn net.Conn, cfg VLESSCo
 	// Clear handshake deadline
 	conn.SetDeadline(time.Time{})
 
-	// 3. Authenticate UUID
+	// Authenticate UUID
 	if req.UUID != cfg.UUID {
 		s.logger.Warn("vless auth failed", "uuid", transport.FormatUUID(req.UUID))
 		return
 	}
 
-	// 4. Only support TCP proxy (V2Ray command 1)
+	// Only support TCP proxy
 	if req.Command != transport.VLESSCmdTCP {
 		s.logger.Warn("vless unsupported command", "cmd", req.Command)
 		return
 	}
 
-	// 5. Dial the destination that V2Ray client wants to reach
+	// Dial destination
 	dest := net.JoinHostPort(req.Addr, fmt.Sprintf("%d", req.Port))
 	target, err := net.DialTimeout("tcp", dest, 10*time.Second)
 	if err != nil {
@@ -149,8 +172,8 @@ func (s *Server) handleVLESSConn(ctx context.Context, conn net.Conn, cfg VLESSCo
 	}
 	defer target.Close()
 
-	// 6. Send VLESS response (version + 0 addons) — tells client we're ready
-	if err := transport.VLESSWriteResponse(ws); err != nil {
+	// Send VLESS response
+	if err := transport.VLESSWriteResponse(writer); err != nil {
 		s.logger.Warn("vless write response failed", "err", err)
 		return
 	}
@@ -158,39 +181,35 @@ func (s *Server) handleVLESSConn(ctx context.Context, conn net.Conn, cfg VLESSCo
 	vlessActiveConns.Add(1)
 	defer vlessActiveConns.Add(-1)
 
-	s.logger.Debug("vless relay", "dest", dest, "remote", conn.RemoteAddr())
+	s.logger.Info("vless relay", "dest", dest, "remote", remote)
 
-	// 7. Forward initial payload (if any arrived with the VLESS header)
+	// Forward initial payload
 	if len(req.Payload) > 0 {
-		if _, err := target.Write(req.Payload); err != nil {
-			return
-		}
+		target.Write(req.Payload) //nolint:errcheck
 	}
 
-	// 8. Bidirectional relay: WS ↔ destination
+	// Bidirectional relay
 	done := make(chan struct{}, 1)
-
-	// destination → V2Ray client
 	go func() {
-		io.Copy(ws, target) //nolint:errcheck
+		io.Copy(writer, target) //nolint:errcheck
 		done <- struct{}{}
 	}()
+	io.Copy(target, reader) //nolint:errcheck
 
-	// V2Ray client → destination
-	io.Copy(target, ws) //nolint:errcheck
-
-	// Wait for the other direction or context cancel
 	select {
 	case <-done:
 	case <-ctx.Done():
 	}
 }
 
-// generateVLESSLink builds a vless:// URI for V2Ray clients.
-func generateVLESSLink(uuid [16]byte, host string, port int, wsPath string) string {
+// generateVLESSLinks builds vless:// URIs for both TCP and WS modes.
+func generateVLESSLinks(uuid [16]byte, host string, port int, wsPath string) (tcpLink, wsLink string) {
 	uuidStr := transport.FormatUUID(uuid)
-	return fmt.Sprintf("vless://%s@%s:%d?type=ws&security=tls&allowInsecure=1&path=%s#CavadVPN",
+	tcpLink = fmt.Sprintf("vless://%s@%s:%d?security=tls&allowInsecure=1&fp=chrome#CavadVPN",
+		uuidStr, host, port)
+	wsLink = fmt.Sprintf("vless://%s@%s:%d?type=ws&security=tls&allowInsecure=1&path=%s#CavadVPN",
 		uuidStr, host, port, wsPath)
+	return
 }
 
 // vlessUUIDFile is the file where the VLESS UUID is persisted.

@@ -55,8 +55,13 @@ type WSConn struct {
 // Validates that the request targets the expected path. If path is empty,
 // any path is accepted.
 func WSUpgrade(conn net.Conn, expectedPath string) (*WSConn, error) {
-	br := bufio.NewReaderSize(conn, 4096)
+	return WSUpgradeFromReader(conn, bufio.NewReaderSize(conn, 4096), expectedPath)
+}
 
+// WSUpgradeFromReader performs server-side WebSocket upgrade using an existing
+// buffered reader. Use this when the caller already peeked at the stream to
+// detect the protocol (e.g. raw VLESS vs WebSocket).
+func WSUpgradeFromReader(conn net.Conn, br *bufio.Reader, expectedPath string) (*WSConn, error) {
 	// Read HTTP request
 	req, err := http.ReadRequest(br)
 	if err != nil {

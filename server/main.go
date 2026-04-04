@@ -1327,26 +1327,31 @@ func main() {
 			TLSCert:    vlessCert,
 			TLSKey:     vlessKey,
 		}
-		// Print the VLESS link for easy import into V2Ray clients.
+		// Print VLESS links for easy import into V2Ray clients.
 		host, port := splitVLESSHostPort(vlessAddr)
-		link := generateVLESSLink(uuid, host, port, vlessPath)
+		tcpLink, wsLink := generateVLESSLinks(uuid, host, port, vlessPath)
 
-		// Register VLESS link in the REST API.
+		// Register VLESS link in the REST API (use TCP link as primary).
 		if apiSrv != nil {
 			apiSrv.SetVLESSInfo(api.VLESSInfo{
-				Link: link,
+				Link: tcpLink,
 				UUID: transport.FormatUUID(uuid),
 				Host: host,
 				Port: port,
 				Path: vlessPath,
 			})
 		}
-		logger.Info("VLESS link (copy to V2Ray client)", "link", link)
+		logger.Info("VLESS TCP link", "link", tcpLink)
+		logger.Info("VLESS WS link", "link", wsLink)
 		fmt.Println()
 		fmt.Println("═══════════════════════════════════════════════")
-		fmt.Println("  VLESS link for V2Ray client (iPhone/Android):")
+		fmt.Println("  VLESS links for V2Ray client (iPhone/Android):")
 		fmt.Println()
-		fmt.Println(" ", link)
+		fmt.Println("  TCP (recommended):")
+		fmt.Println(" ", tcpLink)
+		fmt.Println()
+		fmt.Println("  WebSocket:")
+		fmt.Println(" ", wsLink)
 		fmt.Println()
 		fmt.Println("═══════════════════════════════════════════════")
 		fmt.Println()
