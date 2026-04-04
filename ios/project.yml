@@ -6,6 +6,7 @@ options:
     iOS: "16.0"
   createIntermediateGroups: true
   generateEmptyDirectories: false
+  xcodeVersion: "1500"
 
 packages:
   swift-crypto:
