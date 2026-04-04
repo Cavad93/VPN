@@ -85,8 +85,10 @@ type APIServer struct {
 	logger        *slog.Logger
 	mux           *http.ServeMux
 	logBuf        *LogBuffer
-	updateStore   *updateStore
-	perfCollector *perf.Collector
+	updateStore       *updateStore
+	perfCollector     *perf.Collector
+	telemetryStore    *TelemetryStore
+	telemetryAnalyzer *TelemetryAnalyzer
 }
 
 // NewAPIServer creates a new APIServer and registers all routes.
