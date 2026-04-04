@@ -192,6 +192,7 @@ type vpnSession struct {
 	serverKeyHex string
 	origGW       string // original default gateway, computed once
 	tun          *tunDevice
+	transport    string // "tcp" or "udp"
 }
 
 // connect performs the full connection sequence: TCP → obfs → Noise → mux → IP
@@ -325,6 +326,125 @@ func (vs *vpnSession) connect() (
 	gateway = fmt.Sprintf("%d.%d.%d.%d", resp[6], resp[7], resp[8], resp[9])
 	prefixLen := int(resp[5])
 	log.Info("ip assigned", "ip", assignedIP, "prefix_len", prefixLen, "gateway", gateway)
+
+	// 6. Data stream for IP packet forwarding.
+	dataStream, err = mux.OpenStream()
+	if err != nil {
+		cleanupMux()
+		return nil, nil, "", "", nil, fmt.Errorf("open data stream: %w", err)
+	}
+
+	return dataStream, mux, assignedIP, gateway, cleanupMux, nil
+}
+
+// connectUDP performs the full connection sequence over UDP+BBR:
+// UDP → UDPNetConn → ObfsConn → Noise → Mux → IP assignment → data stream.
+// BBR congestion control runs in user-space on both sides, bypassing the OS
+// TCP stack — critical for Windows Server 2019 which lacks kernel BBR.
+func (vs *vpnSession) connectUDP() (
+	dataStream *transport.Stream,
+	mux *transport.Mux,
+	assignedIP string,
+	gateway string,
+	cleanup func(),
+	err error,
+) {
+	// 1. UDP dial with BBR congestion control.
+	udpConn, err := transport.DialUDP(vs.serverAddr)
+	if err != nil {
+		return nil, nil, "", "", nil, fmt.Errorf("udp dial: %w", err)
+	}
+	cleanupConn := func() { udpConn.Close() }
+
+	// 2. TLS obfuscation handshake over UDP.
+	obfs := transport.NewObfsConn(udpConn)
+	if err := obfs.ClientHandshake(); err != nil {
+		cleanupConn()
+		return nil, nil, "", "", nil, fmt.Errorf("obfs handshake: %w", err)
+	}
+
+	// 3. Noise_XX initiator handshake.
+	hs, err := crypto.NewHandshake(crypto.Initiator, vs.kp)
+	if err != nil {
+		cleanupConn()
+		return nil, nil, "", "", nil, fmt.Errorf("noise init: %w", err)
+	}
+	msg1, err := hs.WriteMessage1()
+	if err != nil {
+		cleanupConn()
+		return nil, nil, "", "", nil, fmt.Errorf("noise msg1: %w", err)
+	}
+	if err := writeHandshakeMsg(obfs, msg1); err != nil {
+		cleanupConn()
+		return nil, nil, "", "", nil, fmt.Errorf("noise send msg1: %w", err)
+	}
+	msg2, err := readHandshakeMsg(obfs)
+	if err != nil {
+		cleanupConn()
+		return nil, nil, "", "", nil, fmt.Errorf("noise recv msg2: %w", err)
+	}
+	if err := hs.ReadMessage2(msg2); err != nil {
+		cleanupConn()
+		return nil, nil, "", "", nil, fmt.Errorf("noise process msg2: %w", err)
+	}
+	msg3, session, err := hs.WriteMessage3()
+	if err != nil {
+		cleanupConn()
+		return nil, nil, "", "", nil, fmt.Errorf("noise msg3: %w", err)
+	}
+	if err := writeHandshakeMsg(obfs, msg3); err != nil {
+		cleanupConn()
+		return nil, nil, "", "", nil, fmt.Errorf("noise send msg3: %w", err)
+	}
+	log.Info("noise handshake done (UDP+BBR)", "server_key", hex.EncodeToString(session.RemoteStatic[:]))
+
+	if vs.serverKeyHex != "" {
+		if hex.EncodeToString(session.RemoteStatic[:]) != strings.ToLower(vs.serverKeyHex) {
+			cleanupConn()
+			return nil, nil, "", "", nil, fmt.Errorf("server public key mismatch — possible MITM!")
+		}
+		log.Info("server key verified")
+	}
+
+	// 4. Noise conn + mux.
+	nc := &noiseConn{conn: obfs, session: session}
+	mux = transport.NewMux(nc, true)
+
+	cleanupMux := func() {
+		mux.Close()
+		cleanupConn()
+	}
+
+	// 5. Control stream: send ctlHello, receive IP assignment.
+	ctlStream, err := mux.OpenStream()
+	if err != nil {
+		cleanupMux()
+		return nil, nil, "", "", nil, fmt.Errorf("open control stream: %w", err)
+	}
+	if _, err := ctlStream.Write([]byte{ctlHello}); err != nil {
+		ctlStream.Close()
+		cleanupMux()
+		return nil, nil, "", "", nil, fmt.Errorf("send ctlHello: %w", err)
+	}
+	resp := make([]byte, 1+ctlAssignPayload)
+	if _, err := io.ReadFull(ctlStream, resp); err != nil {
+		ctlStream.Close()
+		cleanupMux()
+		return nil, nil, "", "", nil, fmt.Errorf("read ctlAssign: %w", err)
+	}
+	ctlStream.Close()
+	if resp[0] == ctlError {
+		cleanupMux()
+		return nil, nil, "", "", nil, fmt.Errorf("server refused connection (ctlError)")
+	}
+	if resp[0] != ctlAssign {
+		cleanupMux()
+		return nil, nil, "", "", nil, fmt.Errorf("unexpected control byte 0x%02x", resp[0])
+	}
+	assignedIP = fmt.Sprintf("%d.%d.%d.%d", resp[1], resp[2], resp[3], resp[4])
+	gateway = fmt.Sprintf("%d.%d.%d.%d", resp[6], resp[7], resp[8], resp[9])
+	prefixLen := int(resp[5])
+	log.Info("ip assigned (UDP+BBR)", "ip", assignedIP, "prefix_len", prefixLen, "gateway", gateway)
 
 	// 6. Data stream for IP packet forwarding.
 	dataStream, err = mux.OpenStream()
@@ -526,7 +646,12 @@ func run() error {
 	keyFile    := flag.String("key", "client_privkey.hex", "path to hex-encoded private key file")
 	serverKeyHex := flag.String("server-key", "", "expected server public key hex (optional, for verification)")
 	bonds := flag.Int("bonds", numBondConns, "number of parallel TCP connections (more = faster on lossy high-RTT paths)")
+	transportFlag := flag.String("transport", "tcp", "transport protocol: tcp or udp (udp uses BBR congestion control)")
 	flag.Parse()
+
+	if *transportFlag != "tcp" && *transportFlag != "udp" {
+		return fmt.Errorf("invalid -transport %q: must be tcp or udp", *transportFlag)
+	}
 
 	if *serverAddr == "" {
 		flag.Usage()
@@ -564,6 +689,7 @@ func run() error {
 		serverKeyHex: *serverKeyHex,
 		origGW:       origGW,
 		tun:          tun,
+		transport:    *transportFlag,
 	}
 
 	// Top-level context: Ctrl+C or SIGTERM cancels everything.
@@ -592,7 +718,18 @@ func run() error {
 			}
 		}
 
-		dataStream, mux, assignedIP, gateway, cleanup, err := vs.connect()
+		var (
+			dataStream *transport.Stream
+			mux        *transport.Mux
+			assignedIP string
+			gateway    string
+			cleanup    func()
+		)
+		if vs.transport == "udp" {
+			dataStream, mux, assignedIP, gateway, cleanup, err = vs.connectUDP()
+		} else {
+			dataStream, mux, assignedIP, gateway, cleanup, err = vs.connect()
+		}
 		if err != nil {
 			log.Warn("connection failed", "err", err, "attempt", attempt+1)
 			attempt++
@@ -626,55 +763,52 @@ func run() error {
 			log.Info("routes removed")
 		}
 
-		// Open secondary connections CONCURRENTLY for download bonding.
-		// Sequential dialing at 919ms RTT would take (bonds-1)×919ms ≈ 28s for
-		// 64 connections. Concurrent dialing completes in ~1 RTT regardless of
-		// bond count, limited only by server-side accept parallelism.
-		//
-		// Each secondary goroutine retries up to secondaryMaxRetries times on
-		// failure (network blip, server backlog full, etc.) before giving up.
-		// Retries use jittered 500–1500ms delays to avoid thundering-herd on
-		// the server accept queue.
-		n := *bonds - 1 // number of secondaries (primary counts as 1)
-		var (
-			secMu       sync.Mutex
-			secondaries []*secondaryConn
-			secWg       sync.WaitGroup
-		)
-		for i := 1; i <= n; i++ {
-			i := i
-			secWg.Add(1)
-			go func() {
-				defer secWg.Done()
-				var sc *secondaryConn
-				var lastErr error
-				for attempt := 0; attempt < secondaryMaxRetries; attempt++ {
-					if attempt > 0 {
-						// Jittered backoff: 500ms + up to 1s of random delay.
-						jitter := time.Duration(500+attempt*250) * time.Millisecond
-						select {
-						case <-ctx.Done():
-							return
-						case <-time.After(jitter):
+		// Open secondary connections CONCURRENTLY for download bonding (TCP only).
+		// UDP+BBR doesn't need bonding — a single BBR-controlled UDP flow
+		// achieves the same throughput without the overhead of N parallel connections.
+		var secondaries []*secondaryConn
+		if vs.transport == "tcp" {
+			n := *bonds - 1 // number of secondaries (primary counts as 1)
+			var (
+				secMu sync.Mutex
+				secWg sync.WaitGroup
+			)
+			for i := 1; i <= n; i++ {
+				i := i
+				secWg.Add(1)
+				go func() {
+					defer secWg.Done()
+					var sc *secondaryConn
+					var lastErr error
+					for attempt := 0; attempt < secondaryMaxRetries; attempt++ {
+						if attempt > 0 {
+							jitter := time.Duration(500+attempt*250) * time.Millisecond
+							select {
+							case <-ctx.Done():
+								return
+							case <-time.After(jitter):
+							}
 						}
+						sc, lastErr = vs.connectSecondary(assignedIP)
+						if lastErr == nil {
+							break
+						}
+						log.Warn("secondary connect failed", "n", i, "attempt", attempt+1, "err", lastErr)
 					}
-					sc, lastErr = vs.connectSecondary(assignedIP)
-					if lastErr == nil {
-						break
+					if lastErr != nil {
+						return
 					}
-					log.Warn("secondary connect failed", "n", i, "attempt", attempt+1, "err", lastErr)
-				}
-				if lastErr != nil {
-					return // all retries exhausted; silently drop this bond slot
-				}
-				secMu.Lock()
-				secondaries = append(secondaries, sc)
-				log.Info("secondary connected", "bond", i+1, "total_bonds", len(secondaries)+1)
-				secMu.Unlock()
-			}()
+					secMu.Lock()
+					secondaries = append(secondaries, sc)
+					log.Info("secondary connected", "bond", i+1, "total_bonds", len(secondaries)+1)
+					secMu.Unlock()
+				}()
+			}
+			secWg.Wait()
+			log.Info("bonding active", "bonds", len(secondaries)+1, "target", *bonds)
+		} else {
+			log.Info("UDP+BBR mode — single connection, no bonding needed")
 		}
-		secWg.Wait()
-		log.Info("bonding active", "bonds", len(secondaries)+1, "target", *bonds)
 
 		// Run bidirectional forwarding until disconnection.
 		log.Info("VPN running — press Ctrl+C to disconnect")
