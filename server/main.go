@@ -981,6 +981,13 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 	// Timer ordering: obfs_read (outer) starts FIRST, then obfs_read_wait
 	// (inner) starts SECOND. This prevents the timer inversion bug where
 	// the subtimer could exceed its container.
+	//
+	// Read deadline: cap the maximum blocking time at 30 seconds. Without
+	// this, ObfsConn.Read (io.ReadFull) can stall for 166+ seconds when the
+	// remote peer silently disappears (e.g. mobile network switch, NAT
+	// timeout). The 30s cap ensures timely detection of dead connections
+	// and prevents TCP congestion window collapse from stale ACK state.
+	nc.conn.SetReadDeadline(time.Now().Add(30 * time.Second)) //nolint:errcheck
 	var obfsReadStart, afterRead time.Time
 	if nc.perf != nil {
 		obfsReadStart = time.Now()
@@ -1298,6 +1305,9 @@ func main() {
 	// Ensures rmem_max/wmem_max allow 16 MB buffers, enables BBR globally,
 	// enables IP forwarding, and sets optimal TCP memory parameters.
 	applySysctls()
+	// Verify BBR is actually loaded — a missing tcp_bbr module silently
+	// falls back to CUBIC, causing 10× worse throughput on lossy links.
+	verifyBBR(logger)
 
 	tun, err := OpenTun("vpn0")
 	if err != nil {

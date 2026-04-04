@@ -121,6 +121,53 @@ func applySysctls() {
 	}
 }
 
+// verifyBBR checks whether the BBR congestion control module is available
+// and the global congestion algorithm is correctly set to BBR. Logs warnings
+// for any issues. This is called at startup to surface misconfigurations
+// early — a missing tcp_bbr module silently falls back to CUBIC, causing
+// 10× worse throughput on lossy links (0.7% loss Russia↔Kazakhstan).
+func verifyBBR(logger interface{ Warn(string, ...any); Info(string, ...any) }) {
+	// Check if the tcp_bbr kernel module is loaded.
+	data, err := os.ReadFile("/proc/sys/net/ipv4/tcp_available_congestion_control")
+	if err != nil {
+		logger.Warn("cannot read available congestion control algorithms", "err", err)
+		return
+	}
+	available := strings.TrimSpace(string(data))
+	if !strings.Contains(available, "bbr") {
+		logger.Warn("BBR congestion control NOT available — throughput will be degraded",
+			"available", available,
+			"hint", "run: modprobe tcp_bbr")
+	} else {
+		logger.Info("BBR congestion control available", "algorithms", available)
+	}
+
+	// Verify the active global algorithm.
+	data, err = os.ReadFile("/proc/sys/net/ipv4/tcp_congestion_control")
+	if err != nil {
+		logger.Warn("cannot read active congestion control", "err", err)
+		return
+	}
+	active := strings.TrimSpace(string(data))
+	if active != "bbr" {
+		logger.Warn("global congestion control is NOT bbr — per-socket fallback will be used",
+			"active", active)
+	} else {
+		logger.Info("global congestion control confirmed", "algorithm", active)
+	}
+
+	// Verify qdisc is fq (required for BBR pacing).
+	data, err = os.ReadFile("/proc/sys/net/core/default_qdisc")
+	if err == nil {
+		qdisc := strings.TrimSpace(string(data))
+		if qdisc != "fq" {
+			logger.Warn("default qdisc is not 'fq' — BBR pacing may not work correctly",
+				"qdisc", qdisc,
+				"hint", "run: sysctl net.core.default_qdisc=fq")
+		}
+	}
+}
+
 // setListenerTFO enables TCP Fast Open on a TCP listener socket.
 // TFO allows clients to send data in the SYN packet, saving 1 RTT
 // (80-120 ms Russia↔Kazakhstan) on reconnections after the first.

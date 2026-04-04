@@ -77,6 +77,9 @@ func applySysctls() {
 	}
 }
 
+// verifyBBR is a no-op on Windows (Windows uses CTCP, not BBR).
+func verifyBBR(_ interface{ Warn(string, ...any); Info(string, ...any) }) {}
+
 // setListenerTFO is a no-op on Windows.
 // Windows 10+ has TFO support but it's enabled globally via netsh,
 // not per-socket like on Linux.
