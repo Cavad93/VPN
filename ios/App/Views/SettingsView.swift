@@ -21,112 +21,84 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationStack {
-            formContent
-                .navigationTitle("Settings")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel") { dismiss() }
+            List {
+                Section("Server") {
+                    LabeledContent("Host") {
+                        TextField("IP or hostname", text: $host)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .multilineTextAlignment(.trailing)
+                            .keyboardType(.URL)
                     }
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Save") { save() }
-                            .disabled(host.trimmingCharacters(in: .whitespaces).isEmpty)
+                    LabeledContent("Port") {
+                        TextField("443", text: $portStr)
+                            .keyboardType(.numberPad)
+                            .multilineTextAlignment(.trailing)
                     }
                 }
-                .alert("Generated Key", isPresented: $showKeyAlert) {
-                    Button("Copy") { UIPasteboard.general.string = generatedKey }
-                    Button("OK") {}
-                } message: {
-                    Text(generatedKey)
-                        .font(.system(.caption, design: .monospaced))
+
+                Section("Encryption Keys") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Private Key (hex)").font(.caption).foregroundStyle(.secondary)
+                        TextField("64 hex characters", text: $privateKey)
+                            .font(.caption.monospaced())
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Server Public Key (hex, optional)").font(.caption).foregroundStyle(.secondary)
+                        TextField("64 hex characters", text: $serverKey)
+                            .font(.caption.monospaced())
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
+                    Button("Generate New Private Key") {
+                        generateKey()
+                    }
+                    .foregroundStyle(.accentColor)
                 }
-                .onAppear { populateFields() }
-        }
-    }
 
-    // MARK: - Form sections (extracted to avoid WMO Section/Table ambiguity)
+                Section("Network") {
+                    LabeledContent("DNS Server") {
+                        TextField("1.1.1.1", text: $dnsServer)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .multilineTextAlignment(.trailing)
+                            .keyboardType(.decimalPad)
+                    }
+                    LabeledContent("MTU") {
+                        TextField("1420", text: $mtuStr)
+                            .keyboardType(.numberPad)
+                            .multilineTextAlignment(.trailing)
+                    }
+                }
 
-    private var formContent: some View {
-        Form {
-            serverSection
-            keysSection
-            networkSection
-            clearSection
-        }
-    }
-
-    @ViewBuilder
-    private var serverSection: some View {
-        Section {
-            LabeledContent("Host") {
-                TextField("IP or hostname", text: $host)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .multilineTextAlignment(.trailing)
-                    .keyboardType(.URL)
+                Section {
+                    Button("Clear Configuration", role: .destructive) {
+                        clearAndDismiss()
+                    }
+                }
             }
-            LabeledContent("Port") {
-                TextField("443", text: $portStr)
-                    .keyboardType(.numberPad)
-                    .multilineTextAlignment(.trailing)
+            .listStyle(.insetGrouped)
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { save() }
+                        .disabled(host.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
             }
-        } header: {
-            Text("Server")
-        }
-    }
-
-    @ViewBuilder
-    private var keysSection: some View {
-        Section {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Private Key (hex)").font(.caption).foregroundStyle(.secondary)
-                TextField("64 hex characters", text: $privateKey)
-                    .font(.caption.monospaced())
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
+            .alert("Generated Key", isPresented: $showKeyAlert) {
+                Button("Copy") { UIPasteboard.general.string = generatedKey }
+                Button("OK") {}
+            } message: {
+                Text(generatedKey)
+                    .font(.system(.caption, design: .monospaced))
             }
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Server Public Key (hex, optional)").font(.caption).foregroundStyle(.secondary)
-                TextField("64 hex characters", text: $serverKey)
-                    .font(.caption.monospaced())
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-            }
-            Button("Generate New Private Key") {
-                generateKey()
-            }
-            .foregroundStyle(.accentColor)
-        } header: {
-            Text("Encryption Keys")
-        }
-    }
-
-    @ViewBuilder
-    private var networkSection: some View {
-        Section {
-            LabeledContent("DNS Server") {
-                TextField("1.1.1.1", text: $dnsServer)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .multilineTextAlignment(.trailing)
-                    .keyboardType(.decimalPad)
-            }
-            LabeledContent("MTU") {
-                TextField("1420", text: $mtuStr)
-                    .keyboardType(.numberPad)
-                    .multilineTextAlignment(.trailing)
-            }
-        } header: {
-            Text("Network")
-        }
-    }
-
-    @ViewBuilder
-    private var clearSection: some View {
-        Section {
-            Button("Clear Configuration", role: .destructive) {
-                clearAndDismiss()
-            }
+            .onAppear { populateFields() }
         }
     }
 
