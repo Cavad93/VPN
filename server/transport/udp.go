@@ -207,9 +207,18 @@ func (c *Conn) Write(data []byte) error {
 	return nil
 }
 
+// sendBufPool pools packet encode buffers to avoid allocation on the hot path.
+var sendBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, HeaderSize+MaxPayloadSize)
+		return &b
+	},
+}
+
 // writePacket sends one packet and registers it for ACK tracking.
-// Blocks if BBR's congestion window is full. Uses BBR pacing to space
-// packet transmissions evenly.
+// Blocks if BBR's congestion window is full. Flow control is done entirely
+// through cwnd — no per-packet pacing sleep (time.Sleep has ~1ms granularity
+// in Go, which caps throughput at ~11 Mbps with 1400-byte packets).
 func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
@@ -227,15 +236,6 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 		cwndTarget = c.bbr.CwndTarget()
 	}
 
-	// BBR pacing: wait for the next send slot (releases sendMu briefly).
-	// We unlock during the sleep so ACK processing is not blocked.
-	c.sendMu.Unlock()
-	c.bbr.pacer.WaitForSlot(len(payload))
-	c.sendMu.Lock()
-	if c.ctx.Err() != nil {
-		return errors.New("transport: connection closed")
-	}
-
 	seq := c.sendSeq
 	c.sendSeq++
 
@@ -243,15 +243,14 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 	ackNum := c.recvSeq
 	c.recvMu.Unlock()
 
-	pkt := &Packet{
-		Type:   pktType,
-		SeqNum: seq,
-		AckNum: ackNum,
-	}
-	if len(payload) > 0 {
-		pkt.Payload = make([]byte, len(payload))
-		copy(pkt.Payload, payload)
-	}
+	// Encode packet using pooled buffer to avoid allocation.
+	bp := sendBufPool.Get().(*[]byte)
+	buf := (*bp)[:HeaderSize+len(payload)]
+	buf[0] = pktType
+	binary.BigEndian.PutUint32(buf[1:5], seq)
+	binary.BigEndian.PutUint32(buf[5:9], ackNum)
+	binary.BigEndian.PutUint16(buf[9:11], uint16(len(payload)))
+	copy(buf[HeaderSize:], payload)
 
 	// Take delivery-rate snapshot for BBR estimator.
 	delivered, deliveredTime := c.bbr.estimator.DeliveredSnapshot()
@@ -259,9 +258,19 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 	appLimited := len(c.pending) == 0
 
 	now := time.Now()
-	if _, err := c.conn.WriteToUDP(pkt.Encode(), c.remote); err != nil {
+	_, err := c.conn.WriteToUDP(buf, c.remote)
+	sendBufPool.Put(bp)
+	if err != nil {
 		return err
 	}
+
+	// Store packet for potential retransmission (need a copy of payload).
+	pkt := &Packet{Type: pktType, SeqNum: seq, AckNum: ackNum}
+	if len(payload) > 0 {
+		pkt.Payload = make([]byte, len(payload))
+		copy(pkt.Payload, payload)
+	}
+
 	c.pending[seq] = &pendingPacket{
 		pkt:           pkt,
 		firstSentAt:   now,
