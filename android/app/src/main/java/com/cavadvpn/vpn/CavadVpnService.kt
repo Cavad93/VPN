@@ -57,11 +57,13 @@ class CavadVpnService : VpnService() {
     private var vpnClient: VpnClient? = null
     private var tunFd: ParcelFileDescriptor? = null
     private var serviceScope: CoroutineScope? = null
+    private var telemetry: TelemetryCollector? = null
 
     private val bytesIn  = AtomicLong(0L)
     private val bytesOut = AtomicLong(0L)
     private var connectedSinceMs = 0L
     private var assignedIp = ""
+    private var currentServerAddr = ""
 
     /** Prevents re-entrant startVpn while a connection attempt is in progress. */
     private val connecting = AtomicBoolean(false)
@@ -124,6 +126,21 @@ class CavadVpnService : VpnService() {
         bytesOut.set(0L)
         connectedSinceMs = 0L
         assignedIp = ""
+        currentServerAddr = "${config.serverHost}:${config.serverPort}"
+
+        // Initialize telemetry collector.
+        // API server URL: same host as VPN server, port 8080.
+        val telemetryUrl = "http://${config.serverHost}:8080"
+        telemetry = TelemetryCollector(
+            serverUrl = telemetryUrl,
+            context = this,
+            getVpnState = {
+                TelemetryCollector.VpnState(
+                    state = if (connectedSinceMs > 0) "connected" else "disconnected",
+                    serverAddr = currentServerAddr,
+                )
+            },
+        )
 
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         serviceScope = scope
@@ -134,7 +151,10 @@ class CavadVpnService : VpnService() {
                 vpnClient = client
 
                 Log.i(TAG, "Connecting to ${config.serverHost}:${config.serverPort}")
+                val hsStart = System.nanoTime()
                 val route = client.connect()
+                val hsMs = (System.nanoTime() - hsStart) / 1_000_000.0
+                telemetry?.handshakeMs = hsMs
                 Log.i(TAG, "Connected — assigned IP ${route.assignedIp}/${route.prefixLen}")
 
                 // CRITICAL: Protect the VPN tunnel socket BEFORE setting up the
@@ -153,10 +173,16 @@ class CavadVpnService : VpnService() {
                 updateNotification("Connected — ${route.assignedIp}")
                 broadcastState("CONNECTED")
 
+                // Start telemetry collection.
+                telemetry?.recordConnect()
+                telemetry?.start()
+
                 // Start stats broadcast coroutine
                 launch {
                     while (isActive) {
                         delay(1000L)
+                        // Update telemetry byte counters.
+                        telemetry?.updateBytes(bytesIn.get(), bytesOut.get())
                         broadcastStats()
                         val statsText = "↓ ${formatBytes(bytesIn.get())}  ↑ ${formatBytes(bytesOut.get())}"
                         updateNotification("${route.assignedIp}  $statsText")
@@ -188,6 +214,11 @@ class CavadVpnService : VpnService() {
     private fun cleanupResources() {
         serviceScope?.cancel()
         serviceScope = null
+
+        // Stop telemetry collection.
+        telemetry?.recordDisconnect()
+        telemetry?.stop()
+        telemetry = null
 
         try { vpnClient?.disconnect() } catch (_: Exception) {}
         vpnClient = null
