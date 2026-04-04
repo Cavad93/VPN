@@ -1856,7 +1856,7 @@ func TestStreamBondResilientWrite(t *testing.T) {
 
 // allStreamsAt is a helper used by TestStreamBondResilientWrite to peek at
 // stream by index without exposing streamBond internals beyond the test file.
-func allStreamsAt(b *streamBond, _ int) *transport.Stream {
+func allStreamsAt(b *streamBond, _ int) dataWriter {
 	return b.next()
 }
 

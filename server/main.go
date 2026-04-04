@@ -68,23 +68,30 @@ func DefaultConfig() Config {
 // SessionStats is an alias for api.SessionInfo — exported for compatibility.
 type SessionStats = api.SessionInfo
 
+// dataWriter is the minimal interface for writing IP packets to a client.
+// Both *transport.Stream (Noise+Mux) and *vlessWriter (VLESS+WS) implement it.
+type dataWriter interface {
+	Write(p []byte) (int, error)
+	Close() error
+}
+
 // streamBond distributes download traffic across multiple parallel TCP
 // connections. Each connection has its own TCP congestion window; the
 // aggregate throughput ≈ N × per-connection throughput. With 0.7% packet
 // loss limiting each connection to ~1.7 Mbps, 8 connections yield ~14 Mbps.
 type streamBond struct {
 	mu   sync.Mutex
-	list []*transport.Stream
+	list []dataWriter
 	idx  int
 }
 
-func (sb *streamBond) add(s *transport.Stream) {
+func (sb *streamBond) add(s dataWriter) {
 	sb.mu.Lock()
 	sb.list = append(sb.list, s)
 	sb.mu.Unlock()
 }
 
-func (sb *streamBond) remove(s *transport.Stream) {
+func (sb *streamBond) remove(s dataWriter) {
 	sb.mu.Lock()
 	for i, st := range sb.list {
 		if st == s {
@@ -96,7 +103,7 @@ func (sb *streamBond) remove(s *transport.Stream) {
 }
 
 // next returns the next stream in round-robin order, or nil if empty.
-func (sb *streamBond) next() *transport.Stream {
+func (sb *streamBond) next() dataWriter {
 	sb.mu.Lock()
 	n := len(sb.list)
 	if n == 0 {
@@ -1253,11 +1260,16 @@ func main() {
 	cfg := DefaultConfig()
 	apiCfg := api.DefaultConfig()
 
+	var vlessAddr, vlessCert, vlessKey, vlessPath string
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
 	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
 	flag.StringVar(&cfg.PrivKeyFile, "privkey", cfg.PrivKeyFile, "path to hex-encoded private key file")
 	flag.StringVar(&apiCfg.ListenAddr, "api-addr", apiCfg.ListenAddr, "REST API listen address (empty to disable)")
 	flag.StringVar(&apiCfg.APIToken, "api-token", "", "Bearer token for the REST API (empty disables auth)")
+	flag.StringVar(&vlessAddr, "vless-addr", "", "VLESS+WS+TLS listen address (e.g. 0.0.0.0:443)")
+	flag.StringVar(&vlessCert, "vless-cert", "cert.pem", "TLS certificate file for VLESS")
+	flag.StringVar(&vlessKey, "vless-key", "key.pem", "TLS private key file for VLESS")
+	flag.StringVar(&vlessPath, "vless-path", "/tunnel", "WebSocket path for VLESS")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
@@ -1300,6 +1312,40 @@ func main() {
 	defer stop()
 
 	startAPIServer(ctx, apiCfg, srv, logger)
+
+	// Start VLESS+WS+TLS listener if configured.
+	if vlessAddr != "" {
+		uuid, err := loadOrGenerateVLESSUUID(vlessUUIDFile, logger)
+		if err != nil {
+			logger.Error("failed to load VLESS UUID", "err", err)
+			os.Exit(1)
+		}
+		vlessCfg := VLESSConfig{
+			ListenAddr: vlessAddr,
+			UUID:       uuid,
+			WSPath:     vlessPath,
+			TLSCert:    vlessCert,
+			TLSKey:     vlessKey,
+		}
+		// Print the VLESS link for easy import into V2Ray clients.
+		host, port := splitVLESSHostPort(vlessAddr)
+		link := generateVLESSLink(uuid, host, port, vlessPath)
+		logger.Info("VLESS link (copy to V2Ray client)", "link", link)
+		fmt.Println()
+		fmt.Println("═══════════════════════════════════════════════")
+		fmt.Println("  VLESS link for V2Ray client (iPhone/Android):")
+		fmt.Println()
+		fmt.Println(" ", link)
+		fmt.Println()
+		fmt.Println("═══════════════════════════════════════════════")
+		fmt.Println()
+
+		go func() {
+			if err := srv.RunVLESS(ctx, vlessCfg); err != nil {
+				logger.Error("VLESS server error", "err", err)
+			}
+		}()
+	}
 
 	if err := srv.Run(ctx); err != nil {
 		logger.Error("server error", "err", err)
