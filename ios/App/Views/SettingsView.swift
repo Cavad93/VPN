@@ -21,7 +21,7 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationStack {
-            List {
+            Form {
                 Section("Server") {
                     LabeledContent("Host") {
                         TextField("IP or hostname", text: $host)
@@ -79,7 +79,6 @@ struct SettingsView: View {
                     }
                 }
             }
-            .listStyle(.insetGrouped)
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
