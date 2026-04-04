@@ -153,64 +153,25 @@ function Invoke-GracefulRestart {
         Write-Log "INFO" "Restarting Windows service '$ServiceName'..."
         Restart-Service -Name $ServiceName -Force
         Start-Sleep -Seconds 3
-
-        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        if ($svc.Status -eq 'Running') {
-            Write-Log "INFO" "Service restarted successfully"
-            return
-        }
-        Write-Log "ERROR" "Service did not restart"
         return
     }
 
-    # Not a service — find and restart the process
+    # Not a service — just stop the process. Watchdog (watchdog.ps1) handles restart.
     $proc = Get-Process -Name "cavad-vpn" -ErrorAction SilentlyContinue
     if ($proc) {
         Write-Log "INFO" "Stopping process (PID $($proc.Id))..."
         Stop-Process -Id $proc.Id -Force
 
-        # Wait for process to fully exit and release the port
+        # Wait for process to fully exit
         for ($i = 0; $i -lt 15; $i++) {
             Start-Sleep -Seconds 1
             $still = Get-Process -Name "cavad-vpn" -ErrorAction SilentlyContinue
             if (-not $still) { break }
         }
-        if (Get-Process -Name "cavad-vpn" -ErrorAction SilentlyContinue) {
-            Write-Log "ERROR" "Old process did not exit after 15s"
-            return
-        }
-        Write-Log "INFO" "Old process stopped"
-
-        # Wait for port to be released (TCP TIME_WAIT)
-        $port = 8443
-        if ($ServerArgs -match '-addr\s+\S+:(\d+)') { $port = [int]$Matches[1] }
-        for ($i = 0; $i -lt 10; $i++) {
-            $inUse = netstat -ano | Select-String ":$port\s" | Select-String "LISTENING"
-            if (-not $inUse) { break }
-            Write-Log "INFO" "Port $port still in use, waiting..."
-            Start-Sleep -Seconds 2
-        }
+        Write-Log "INFO" "Process stopped. Watchdog will restart it."
     } else {
-        Write-Log "INFO" "No running process found, starting fresh"
+        Write-Log "INFO" "No running process found."
     }
-
-    # Start server with retry (up to 3 attempts)
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        Write-Log "INFO" "Starting $BinaryPath (attempt $attempt/3)..."
-        Start-Process -FilePath $BinaryPath -ArgumentList $ServerArgs -WindowStyle Hidden
-        Start-Sleep -Seconds 3
-
-        $newProc = Get-Process -Name "cavad-vpn" -ErrorAction SilentlyContinue
-        if ($newProc) {
-            Write-Log "INFO" "Server running (PID $($newProc.Id))"
-            return
-        }
-        Write-Log "WARN" "Process not found after start, retrying in 5s..."
-        Start-Sleep -Seconds 5
-    }
-
-    Write-Log "ERROR" "Failed to start server after 3 attempts. Start manually:"
-    Write-Log "ERROR" "  $BinaryPath $ServerArgs"
 }
 
 # ---------------------------------------------------------------------------
