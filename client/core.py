@@ -843,6 +843,7 @@ class VPNConfig:
     key_pair: Optional[KeyPair] = None       # or provide directly
     connect_timeout: float = 30.0
     read_timeout: float = 60.0
+    transport: str = "tcp"      # "tcp" or "udp" (user-space BBR on server)
 
 
 # ---------------------------------------------------------------------------
@@ -878,43 +879,14 @@ class VPNClient:
         kp = self._load_key_pair()
 
         host, port = self._parse_addr(self._config.server_addr)
-        self._log.info("vpn_connecting", host=host, port=port)
+        self._log.info("vpn_connecting", host=host, port=port,
+                       transport=self._config.transport)
 
-        # 1. TCP connection
-        self._sock = socket.create_connection(
-            (host, port), timeout=self._config.connect_timeout
-        )
-        # TCP_NODELAY: disable Nagle — VPN forwards TCP ACKs from inner
-        # connections; Nagle would buffer them for up to one RTT (118 ms),
-        # preventing the remote server from advancing its send window and
-        # killing throughput 10-20×.
-        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        # Socket buffers: 2 MB. BDP = 50 Mbps × 80ms = 500 KB.
-        # 2 MB gives 4× headroom without bufferbloat (16 MB caused 321ms latency).
-        _BUF_SIZE = 2 * 1024 * 1024
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _BUF_SIZE)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _BUF_SIZE)
-        # TCP keepalive: prevent ISP NAT/firewall from dropping idle connections.
-        # NAT tables typically expire TCP entries after 60–120 s; 15 s idle
-        # ensures probes fire well before any timeout.
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        try:
-            # macOS: TCP_KEEPALIVE sets idle time before first probe
-            import platform
-            if platform.system() == "Darwin":
-                TCP_KEEPALIVE = 0x10  # macOS TCP_KEEPALIVE
-                self._sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPALIVE, 15)
-            else:
-                # Linux: TCP_KEEPIDLE
-                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
-                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-        except (AttributeError, OSError):
-            pass  # best-effort; SO_KEEPALIVE alone uses OS defaults
-        # After handshake switch to fully blocking reads so the mux read loop
-        # never receives spurious socket.timeout exceptions that close the conn.
-        self._sock.settimeout(None)
-        self._log.debug("tcp_connected")
+        # 1. Transport connection (TCP or UDP)
+        if self._config.transport == "udp":
+            self._sock = self._connect_udp(host, int(port))
+        else:
+            self._sock = self._connect_tcp(host, int(port))
 
         # 2. TLS obfuscation
         self._obfs = ObfsConn(self._sock)
@@ -1002,6 +974,38 @@ class VPNClient:
         if self._config.private_key_file is not None:
             return load_key_pair_from_file(self._config.private_key_file)
         return generate_key_pair()
+
+    def _connect_tcp(self, host: str, port: int):
+        """Establish a TCP connection with tuned socket options."""
+        sock = socket.create_connection(
+            (host, port), timeout=self._config.connect_timeout
+        )
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _BUF_SIZE = 2 * 1024 * 1024
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _BUF_SIZE)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _BUF_SIZE)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        try:
+            import platform
+            if platform.system() == "Darwin":
+                TCP_KEEPALIVE = 0x10
+                sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPALIVE, 15)
+            else:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except (AttributeError, OSError):
+            pass
+        sock.settimeout(None)
+        self._log.debug("tcp_connected")
+        return sock
+
+    def _connect_udp(self, host: str, port: int):
+        """Establish a reliable UDP connection (server runs user-space BBR)."""
+        from reliable_udp import connect_udp
+        conn = connect_udp(host, port, timeout=self._config.connect_timeout)
+        self._log.debug("udp_connected")
+        return conn
 
     def _do_noise_handshake(self, kp: KeyPair) -> NoiseSession:
         hs = NoiseHandshake(kp)
