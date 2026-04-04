@@ -40,24 +40,26 @@ struct SettingsView: View {
                 })
 
                 Section(content: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Private Key (hex)").font(.caption).foregroundStyle(.secondary)
-                        TextField("64 hex characters", text: $privateKey)
-                            .font(.caption.monospaced())
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
+                    Group {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Private Key (hex)").font(.caption).foregroundStyle(.secondary)
+                            TextField("64 hex characters", text: $privateKey)
+                                .font(.caption.monospaced())
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                        }
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Server Public Key (hex, optional)").font(.caption).foregroundStyle(.secondary)
+                            TextField("64 hex characters", text: $serverKey)
+                                .font(.caption.monospaced())
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                        }
+                        Button("Generate New Private Key") {
+                            generateKey()
+                        }
+                        .foregroundStyle(.accentColor)
                     }
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Server Public Key (hex, optional)").font(.caption).foregroundStyle(.secondary)
-                        TextField("64 hex characters", text: $serverKey)
-                            .font(.caption.monospaced())
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                    }
-                    Button("Generate New Private Key") {
-                        generateKey()
-                    }
-                    .foregroundStyle(.accentColor)
                 }, header: {
                     Text("Encryption Keys")
                 })
