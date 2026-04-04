@@ -80,6 +80,15 @@ def cmd_connect(args: argparse.Namespace) -> int:
         Path.home() / ".config" / "cavadvpn" / "client.key"
     )
 
+    # Telemetry: server URL for sending metrics (API port, not VPN port).
+    # Defaults to http://<server_host>:8080, overridable via config or --telemetry-url.
+    server_host = server.split(":")[0]
+    telemetry_url = (
+        args.telemetry_url
+        or cfg.get("telemetry_url")
+        or f"http://{server_host}:8080"
+    )
+
     print(f"Connecting to {server} ...")
 
     try:
@@ -94,6 +103,25 @@ def cmd_connect(args: argparse.Namespace) -> int:
         client.connect()
         print("Connected.")
 
+        # Start telemetry collector — sends metrics every 5 minutes.
+        telemetry = None
+        try:
+            from telemetry import create_telemetry_collector  # type: ignore
+
+            def _get_vpn_state():
+                return {"server_addr": server, "state": "connected"}
+
+            telemetry = create_telemetry_collector(
+                server_url=telemetry_url,
+                get_vpn_state=_get_vpn_state,
+                interval=300.0,
+            )
+            telemetry.record_connect()
+            telemetry.start()
+            print(f"Telemetry active → {telemetry_url}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: telemetry not started: {exc}", file=sys.stderr)
+
         # Write pid file
         pid_file = Path.home() / ".config" / "cavadvpn" / "cavadvpn.pid"
         pid_file.parent.mkdir(parents=True, exist_ok=True)
@@ -105,6 +133,9 @@ def cmd_connect(args: argparse.Namespace) -> int:
 
         def _handle_signal(_sig, _frame):
             print("\nDisconnecting ...")
+            if telemetry:
+                telemetry.record_disconnect()
+                telemetry.stop()
             client.disconnect()
             pid_file.unlink(missing_ok=True)
             sys.exit(0)
@@ -192,6 +223,8 @@ def build_parser() -> argparse.ArgumentParser:
     conn = subs.add_parser("connect", help="connect to VPN server")
     conn.add_argument("--server", metavar="HOST:PORT", help="server address")
     conn.add_argument("--key", metavar="FILE", help="private key file")
+    conn.add_argument("--telemetry-url", metavar="URL",
+                       help="telemetry endpoint (default: http://<server>:8080)")
 
     subs.add_parser("disconnect", help="disconnect from VPN")
 
