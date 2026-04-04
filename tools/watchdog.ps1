@@ -14,6 +14,7 @@ param(
     [string]$RepoDir = "C:\CavadVPN\repo",
     [string]$BinaryPath = "C:\CavadVPN\cavad-vpn.exe",
     [string]$ServerArgs = "-addr 0.0.0.0:8443 -tun-cidr 10.8.0.1/24 -api-addr 127.0.0.1:8080",
+    [string]$VlessArgs = "",  # e.g. "-vless-addr 0.0.0.0:443 -vless-cert C:\CavadVPN\cert.pem -vless-key C:\CavadVPN\key.pem"
     [int]$CheckInterval = 10,
     [int]$Port = 8443
 )
@@ -24,9 +25,12 @@ function Write-Log {
     Write-Host "[$ts] $Message"
 }
 
+$FullArgs = $ServerArgs
+if ($VlessArgs) { $FullArgs = "$ServerArgs $VlessArgs" }
+
 Write-Log "Watchdog started. Monitoring cavad-vpn.exe..."
 Write-Log "Binary: $BinaryPath"
-Write-Log "Args: $ServerArgs"
+Write-Log "Args: $FullArgs"
 Write-Log ""
 
 while ($true) {
@@ -68,7 +72,7 @@ while ($true) {
         # 4. Start server with retry
         for ($attempt = 1; $attempt -le 3; $attempt++) {
             Write-Log "  [4/4] Starting server (attempt $attempt/3)..."
-            Start-Process -FilePath $BinaryPath -ArgumentList $ServerArgs -WindowStyle Normal
+            Start-Process -FilePath $BinaryPath -ArgumentList $FullArgs -WindowStyle Normal
             Start-Sleep -Seconds 5
 
             $check = Get-Process -Name "cavad-vpn" -ErrorAction SilentlyContinue
