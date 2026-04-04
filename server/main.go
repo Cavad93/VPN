@@ -1261,6 +1261,7 @@ func main() {
 	apiCfg := api.DefaultConfig()
 
 	var vlessAddr, vlessCert, vlessKey, vlessPath string
+	var anthropicKey string
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
 	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
 	flag.StringVar(&cfg.PrivKeyFile, "privkey", cfg.PrivKeyFile, "path to hex-encoded private key file")
@@ -1270,7 +1271,13 @@ func main() {
 	flag.StringVar(&vlessCert, "vless-cert", "cert.pem", "TLS certificate file for VLESS")
 	flag.StringVar(&vlessKey, "vless-key", "key.pem", "TLS private key file for VLESS")
 	flag.StringVar(&vlessPath, "vless-path", "/tunnel", "WebSocket path for VLESS")
+	flag.StringVar(&anthropicKey, "anthropic-key", "", "Anthropic API key for telemetry analysis (or ANTHROPIC_API_KEY env)")
 	flag.Parse()
+
+	// Anthropic API key: flag takes precedence, then environment variable.
+	if anthropicKey == "" {
+		anthropicKey = os.Getenv("ANTHROPIC_API_KEY")
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -1311,7 +1318,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	apiSrv := startAPIServer(ctx, apiCfg, srv, logger)
+	apiSrv := startAPIServer(ctx, apiCfg, srv, logger, anthropicKey)
 
 	// Start VLESS+WS+TLS listener if configured.
 	if vlessAddr != "" {
@@ -1371,7 +1378,7 @@ func main() {
 
 // startAPIServer launches the REST management API in a background goroutine.
 // If cfg.ListenAddr is empty the API is not started.
-func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *slog.Logger) *api.APIServer {
+func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *slog.Logger, anthropicKey string) *api.APIServer {
 	if cfg.ListenAddr == "" {
 		return nil
 	}
@@ -1390,9 +1397,24 @@ func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *sl
 		apiSrv.SetPerfCollector(srv.Perf)
 	}
 
+	// Enable telemetry collection and AI-powered analysis.
+	telemetryStore := api.NewTelemetryStore(10000)
+	var analyzer *api.TelemetryAnalyzer
+	if anthropicKey != "" {
+		analyzer = api.NewTelemetryAnalyzer(telemetryStore, api.SonnetAnalyze, anthropicKey, time.Hour)
+		analyzer.Start()
+		logger.Info("telemetry AI analysis enabled (hourly)")
+	} else {
+		logger.Info("telemetry collection enabled (no AI analysis — set -anthropic-key or ANTHROPIC_API_KEY)")
+	}
+	apiSrv.SetTelemetryStore(telemetryStore, analyzer)
+
 	go func() {
 		<-ctx.Done()
 		notifSvc.Stop()
+		if analyzer != nil {
+			analyzer.Stop()
+		}
 	}()
 
 	go func() {
