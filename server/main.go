@@ -965,28 +965,42 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 	// record contains one complete noise frame [2-byte len ‖ ciphertext].
 	// Passing the full recvBuf (65 KB) triggers ObfsConn's zero-alloc fast
 	// path: the TLS payload is read directly into recvBuf without make().
-	var obfsReadStart time.Time
+	//
+	// Timer ordering: obfs_read (outer) starts FIRST, then obfs_read_wait
+	// (inner) starts SECOND. This prevents the timer inversion bug where
+	// the subtimer could exceed its container.
+	var obfsReadStart, afterRead time.Time
 	if nc.perf != nil {
 		obfsReadStart = time.Now()
 	}
 	n, err := nc.conn.Read(nc.recvBuf[:])
-	var procStart time.Time
 	if nc.perf != nil {
-		procStart = time.Now()
+		afterRead = time.Now()
 		// obfs_read_wait: time blocked waiting for data from the network.
-		// This is dominated by TCP RTT and retransmission timeouts — the
-		// single largest contributor to full_ingress latency (404ms mean).
-		nc.perf.TrackLatency(perf.StageObfsReadWait, procStart.Sub(obfsReadStart))
+		// Recorded on ALL paths (including error) to keep counts in sync
+		// with obfs_read — fixes the count orphan bug where handshake
+		// error paths recorded wait but not the outer timer.
+		nc.perf.TrackLatency(perf.StageObfsReadWait, afterRead.Sub(obfsReadStart))
 	}
 	if err != nil {
+		if nc.perf != nil {
+			// Record outer timer on error path too — fixes count orphan.
+			nc.perf.TrackLatency(perf.StageObfsRead, time.Since(obfsReadStart))
+		}
 		return 0, err
 	}
 	if n < 2 {
+		if nc.perf != nil {
+			nc.perf.TrackLatency(perf.StageObfsRead, time.Since(obfsReadStart))
+		}
 		return 0, fmt.Errorf("noiseConn: frame too short (%d bytes)", n)
 	}
 
 	frameLen := int(binary.BigEndian.Uint16(nc.recvBuf[:2]))
 	if frameLen == 0 || frameLen > maxNoiseFrame {
+		if nc.perf != nil {
+			nc.perf.TrackLatency(perf.StageObfsRead, time.Since(obfsReadStart))
+		}
 		return 0, fmt.Errorf("noiseConn: frame size %d out of range", frameLen)
 	}
 
@@ -999,10 +1013,11 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 		}
 	}
 	if nc.perf != nil {
-		// obfs_read_proc: time after first Read returns until decrypt starts.
-		// Covers TLS record parsing and the rare ReadFull fallback path.
-		nc.perf.TrackLatency(perf.StageObfsReadProc, time.Since(procStart))
-		// obfs_read (total) kept for backwards compatibility.
+		// obfs_read_proc: time spent parsing/validating frame header and
+		// potentially reading remaining bytes (io.ReadFull). Measured from
+		// the moment conn.Read returned to now.
+		nc.perf.TrackLatency(perf.StageObfsReadProc, time.Since(afterRead))
+		// obfs_read (total) — always recorded, count matches obfs_read_wait.
 		nc.perf.TrackLatency(perf.StageObfsRead, time.Since(obfsReadStart))
 		nc.perf.TrackPacket(perf.StageObfsRead, n)
 	}

@@ -163,6 +163,7 @@ type TCPInfo struct {
 	LostSegs       atomic.Uint64 // segments considered lost
 	CwndSegs       atomic.Uint64 // current congestion window in segments
 	SndMSS         atomic.Uint64 // sender maximum segment size
+	SSThresh       atomic.Uint64 // slow start threshold in segments
 }
 
 // TCPInfoSnapshot is a JSON-friendly copy of TCPInfo.
@@ -173,6 +174,7 @@ type TCPInfoSnapshot struct {
 	LostSegs       uint64 `json:"lost_segs"`
 	CwndSegs       uint64 `json:"cwnd_segs"`
 	SndMSS         uint64 `json:"snd_mss"`
+	SSThresh       uint64 `json:"ssthresh"`
 }
 
 func (ti *TCPInfo) snapshot() TCPInfoSnapshot {
@@ -183,6 +185,7 @@ func (ti *TCPInfo) snapshot() TCPInfoSnapshot {
 		LostSegs:       ti.LostSegs.Load(),
 		CwndSegs:       ti.CwndSegs.Load(),
 		SndMSS:         ti.SndMSS.Load(),
+		SSThresh:       ti.SSThresh.Load(),
 	}
 }
 

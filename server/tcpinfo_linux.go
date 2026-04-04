@@ -41,4 +41,11 @@ func pollTCPInfo(conn net.Conn, pc *perf.Collector) {
 	pc.TCP.LostSegs.Store(uint64(info.Lost))
 	pc.TCP.CwndSegs.Store(uint64(info.Snd_cwnd))
 	pc.TCP.SndMSS.Store(uint64(info.Snd_mss))
+	pc.TCP.SSThresh.Store(uint64(info.Snd_ssthresh))
+
+	// Sync top-level perf fields with OS TCP info so the diagnostics AI
+	// sees consistent retransmit_count, congestion_window, and ssthresh.
+	pc.RetransmitCount.Store(uint64(info.Total_retrans))
+	pc.CongestionWindow.Store(int64(info.Snd_cwnd))
+	pc.SSThresh.Store(int64(info.Snd_ssthresh))
 }

@@ -73,8 +73,17 @@ func pollTCPInfo(conn net.Conn, pc *perf.Collector) {
 	if mss == 0 {
 		mss = 1
 	}
-	pc.TCP.RetransmitSegs.Store(uint64(info.BytesRetrans) / mss)
+	retransSegs := uint64(info.BytesRetrans) / mss
+	cwndSegs := uint64(info.Cwnd) / mss
+	pc.TCP.RetransmitSegs.Store(retransSegs)
 	pc.TCP.LostSegs.Store(uint64(info.TimeoutEpisodes))
-	pc.TCP.CwndSegs.Store(uint64(info.Cwnd) / mss)
+	pc.TCP.CwndSegs.Store(cwndSegs)
 	pc.TCP.SndMSS.Store(uint64(info.Mss))
+	pc.TCP.SSThresh.Store(0) // Not available in TCP_INFO_v0
+
+	// Sync top-level perf fields with OS TCP info so the diagnostics AI
+	// sees consistent retransmit_count, congestion_window, and ssthresh.
+	pc.RetransmitCount.Store(retransSegs)
+	pc.CongestionWindow.Store(int64(cwndSegs))
+	// SSThresh not available from Windows TCP_INFO_v0; leave unchanged.
 }
