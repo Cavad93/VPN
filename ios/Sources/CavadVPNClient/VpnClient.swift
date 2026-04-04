@@ -2,6 +2,9 @@
 // TCP → TLS obfuscation → Noise_XX → NoiseConn → ClientMux → control/data streams
 
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 import CavadVPNCrypto
 import CavadVPNTransport
 
@@ -24,6 +27,7 @@ public final class VpnClient {
 
     private var inputStream:  InputStream?
     private var outputStream: OutputStream?
+    private var socketFD: Int32 = -1    // raw BSD socket for TCP tuning
     private var obfs: ObfsConn?
     private var noiseConn: NoiseConn?
     private var mux: ClientMux?
@@ -69,6 +73,19 @@ public final class VpnClient {
         if outs.streamError != nil { throw VpnClientError.connectionFailed(outs.streamError!.localizedDescription) }
         inputStream  = ins
         outputStream = outs
+
+        // TCP socket tuning (matches Android VpnClient):
+        // - TCP_NODELAY: VPN forwards inner TCP ACKs as small frames; Nagle would
+        //   buffer them for up to one RTT (~80-120 ms), killing download throughput.
+        // - 4 MB send/receive buffers: BDP for 30 Mbps × 100 ms ≈ 375 KB.
+        if let rawSocket = extractSocketFD(from: ins) {
+            socketFD = rawSocket
+            var flag: Int32 = 1
+            setsockopt(rawSocket, IPPROTO_TCP, TCP_NODELAY, &flag, socklen_t(MemoryLayout<Int32>.size))
+            var bufSize: Int32 = 4 * 1024 * 1024
+            setsockopt(rawSocket, SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+            setsockopt(rawSocket, SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+        }
 
         // 2. TLS obfuscation
         let obfsConn = ObfsConn(inputStream: ins, outputStream: outs)
@@ -132,6 +149,7 @@ public final class VpnClient {
         obfs         = nil
         inputStream  = nil
         outputStream = nil
+        socketFD     = -1
     }
 
     // MARK: Private helpers
@@ -176,6 +194,19 @@ public final class VpnClient {
         let lenBytes = try obfsConn.read(2)
         let length = Int(lenBytes[0]) << 8 | Int(lenBytes[1])
         return try obfsConn.read(length)
+    }
+
+    /// Extracts the underlying BSD socket file descriptor from an InputStream
+    /// using CFReadStream's kCFStreamPropertySocketNativeHandle.
+    private func extractSocketFD(from stream: InputStream) -> Int32? {
+        let cfStream = stream as CFReadStream
+        guard let handle = CFReadStreamCopyProperty(cfStream, .socketNativeHandle) else { return nil }
+        guard CFGetTypeID(handle) == CFNumberGetTypeID() else { return nil }
+        var fd: CFSocketNativeHandle = -1
+        if CFNumberGetValue((handle as! CFNumber), .intType, &fd), fd >= 0 {
+            return fd
+        }
+        return nil
     }
 
     private func doControlStream(_ muxConn: ClientMux) throws -> RouteInfo {

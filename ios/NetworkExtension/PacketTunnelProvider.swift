@@ -16,6 +16,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private var vpnClient: VpnClient?
     private var tunnelQueue = DispatchQueue(label: "com.cavadvpn.tunnel", qos: .userInitiated)
+    /// Dedicated queue for server→device forwarding so it runs concurrently
+    /// with device→server (which uses the readPackets callback on tunnelQueue).
+    private var serverReadQueue = DispatchQueue(label: "com.cavadvpn.serverRead", qos: .userInitiated)
 
     // MARK: – Lifecycle
 
@@ -115,29 +118,35 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // MARK: – Packet forwarding
 
     private func startForwarding() {
-        // Device → VPN server
-        tunnelQueue.async { [weak self] in
-            self?.forwardFromDevice()
-        }
-        // VPN server → Device
-        tunnelQueue.async { [weak self] in
+        // Device → VPN server: uses readPackets' async callback pattern.
+        // Each callback re-registers for the next batch — no blocking loop needed.
+        readPacketsFromDevice()
+
+        // VPN server → Device: runs on a SEPARATE concurrent queue because
+        // recvPacket() blocks until data arrives. If this ran on the same
+        // serial queue as device→server, one direction would starve the other.
+        serverReadQueue.async { [weak self] in
             self?.forwardFromServer()
         }
     }
 
     /// Reads packets from the TUN interface and sends them to the VPN server.
-    private func forwardFromDevice() {
-        while let client = vpnClient, client.isConnected {
-            packetFlow.readPackets { [weak self] packets, _ in
-                guard let self = self, let client = self.vpnClient else { return }
-                for packet in packets {
-                    try? client.sendPacket(packet)
-                }
+    /// Uses the recursive callback pattern required by NEPacketTunnelProvider:
+    /// readPackets calls the completion handler once when packets are available,
+    /// then we re-register for the next batch.
+    private func readPacketsFromDevice() {
+        packetFlow.readPackets { [weak self] packets, _ in
+            guard let self = self, let client = self.vpnClient, client.isConnected else { return }
+            for packet in packets {
+                try? client.sendPacket(packet)
             }
+            // Re-register for the next batch of packets
+            self.readPacketsFromDevice()
         }
     }
 
     /// Reads packets from the VPN server and injects them into the TUN interface.
+    /// Runs on serverReadQueue — blocks on recvPacket() without starving device→server.
     private func forwardFromServer() {
         while let client = vpnClient, client.isConnected {
             let packet = client.recvPacket()
