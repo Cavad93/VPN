@@ -19,10 +19,34 @@ struct SettingsView: View {
     @State private var showKeyAlert = false
     @State private var generatedKey = ""
 
+    /// Workaround: Xcode 16.1 + iOS SDK 18 — Section has both View-based
+    /// and TableRowBuilder-based overloads. Generic constraint `Content: View`
+    /// excludes the Table overload (FB15338009).
+    @ViewBuilder
+    private func formSection<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        Section {
+            content()
+        } header: {
+            Text(title)
+        }
+    }
+
+    @ViewBuilder
+    private func formSection<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        Section {
+            content()
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
-                Section("Server") {
+                formSection("Server") {
                     LabeledContent("Host") {
                         TextField("IP or hostname", text: $host)
                             .textInputAutocapitalization(.never)
@@ -37,7 +61,7 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("Encryption Keys") {
+                formSection("Encryption Keys") {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Private Key (hex)").font(.caption).foregroundStyle(.secondary)
                         TextField("64 hex characters", text: $privateKey)
@@ -58,7 +82,7 @@ struct SettingsView: View {
                     .foregroundStyle(.accentColor)
                 }
 
-                Section("Network") {
+                formSection("Network") {
                     LabeledContent("DNS Server") {
                         TextField("1.1.1.1", text: $dnsServer)
                             .textInputAutocapitalization(.never)
@@ -73,7 +97,7 @@ struct SettingsView: View {
                     }
                 }
 
-                Section {
+                formSection {
                     Button("Clear Configuration", role: .destructive) {
                         clearAndDismiss()
                     }
