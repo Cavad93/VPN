@@ -89,7 +89,8 @@ func DecodePacket(data []byte) (*Packet, error) {
 // pendingPacket tracks a sent but unACKed packet for retransmission.
 type pendingPacket struct {
 	pkt         *Packet
-	sentAt      time.Time
+	firstSentAt time.Time // original send time (for RTT measurement — never updated)
+	sentAt      time.Time // last send time (updated on retransmit — for RTO timeout)
 	retransmits int
 
 	// BBR delivery-rate snapshots taken at send time.
@@ -173,7 +174,7 @@ func newConn(conn *net.UDPConn, remote *net.UDPAddr, ownConn bool) *Conn {
 		remote:  remote,
 		pending: make(map[uint32]*pendingPacket),
 		recvBuf: make(map[uint32]*Packet),
-		readCh:  make(chan []byte, 256),
+		readCh:  make(chan []byte, 8192),
 		bbr:     bbr,
 		rto:     initialRTO,
 		ctx:     ctx,
@@ -263,6 +264,7 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 	}
 	c.pending[seq] = &pendingPacket{
 		pkt:           pkt,
+		firstSentAt:   now,
 		sentAt:        now,
 		delivered:     delivered,
 		deliveredTime: deliveredTime,
@@ -323,48 +325,67 @@ func (c *Conn) getRTO() time.Duration {
 // processACK handles an incoming ACK, releasing pending packets up to ackNum
 // and feeding the BBR estimator with per-ACK measurements.
 func (c *Conn) processACK(ackNum uint32) {
-	c.sendMu.Lock()
+	// Phase 1: collect ACKed packets under sendMu (fast — just map lookups).
+	type ackedInfo struct {
+		seq           uint32
+		rtt           time.Duration
+		payloadSize   int
+		delivered     int64
+		deliveredTime time.Time
+		sentAt        time.Time
+		appLimited    bool
+		retransmitted bool
+	}
 
+	c.sendMu.Lock()
 	now := time.Now()
-	cleared := 0
+	var acked []ackedInfo
 	for seq := range c.pending {
 		if seq < ackNum {
 			pp := c.pending[seq]
 			delete(c.pending, seq)
-			cleared++
 
-			// Only use RTT from non-retransmitted packets (Karn's algorithm).
-			rtt := now.Sub(pp.sentAt)
+			rtt := now.Sub(pp.firstSentAt)
 			if rtt < 0 {
-				rtt = time.Microsecond // safety floor
-			}
-			if pp.retransmits == 0 {
-				c.updateRTO(rtt)
+				rtt = time.Microsecond
 			}
 
-			// Build inflight metadata for BBR.
-			iflPkt := &inflightPkt{
-				SeqNum:        seq,
-				Size:          len(pp.pkt.Payload),
-				SentAt:        pp.sentAt,
-				Delivered:     pp.delivered,
-				DeliveredTime: pp.deliveredTime,
-				AppLimited:    pp.appLimited,
-			}
-
-			// Remove from inflight tracker.
-			c.bbr.inflight.OnACK(seq)
-
-			// Feed BBR state machine.
-			c.bbr.OnACK(rtt, int64(len(pp.pkt.Payload)), iflPkt)
+			acked = append(acked, ackedInfo{
+				seq:           seq,
+				rtt:           rtt,
+				payloadSize:   len(pp.pkt.Payload),
+				delivered:     pp.delivered,
+				deliveredTime: pp.deliveredTime,
+				sentAt:        pp.firstSentAt,
+				appLimited:    pp.appLimited,
+				retransmitted: pp.retransmits > 0,
+			})
 		}
 	}
 	c.sendMu.Unlock()
 
-	// Wake any writePacket goroutine blocked on a full window.
-	if cleared > 0 {
-		c.sendCond.Broadcast()
+	if len(acked) == 0 {
+		return
 	}
+
+	// Phase 2: feed BBR outside sendMu (no lock contention with writePacket).
+	for _, a := range acked {
+		if !a.retransmitted {
+			c.updateRTO(a.rtt)
+		}
+		c.bbr.inflight.OnACK(a.seq)
+		c.bbr.OnACK(a.rtt, int64(a.payloadSize), &inflightPkt{
+			SeqNum:        a.seq,
+			Size:          a.payloadSize,
+			SentAt:        a.sentAt,
+			Delivered:     a.delivered,
+			DeliveredTime: a.deliveredTime,
+			AppLimited:    a.appLimited,
+		})
+	}
+
+	// Wake any writePacket goroutine blocked on a full window.
+	c.sendCond.Broadcast()
 }
 
 // processData handles an incoming data packet, buffers out-of-order packets,
@@ -372,15 +393,13 @@ func (c *Conn) processACK(ackNum uint32) {
 func (c *Conn) processData(pkt *Packet) {
 	c.recvMu.Lock()
 
+	var toDeliver [][]byte
 	if pkt.SeqNum == c.recvSeq {
 		// In-order: deliver immediately.
 		if len(pkt.Payload) > 0 {
 			payload := make([]byte, len(pkt.Payload))
 			copy(payload, pkt.Payload)
-			select {
-			case c.readCh <- payload:
-			default:
-			}
+			toDeliver = append(toDeliver, payload)
 		}
 		c.recvSeq++
 
@@ -393,10 +412,7 @@ func (c *Conn) processData(pkt *Packet) {
 			if len(buffered.Payload) > 0 {
 				payload := make([]byte, len(buffered.Payload))
 				copy(payload, buffered.Payload)
-				select {
-				case c.readCh <- payload:
-				default:
-				}
+				toDeliver = append(toDeliver, payload)
 			}
 			delete(c.recvBuf, c.recvSeq)
 			c.recvSeq++
@@ -409,6 +425,15 @@ func (c *Conn) processData(pkt *Packet) {
 
 	ackNum := c.recvSeq
 	c.recvMu.Unlock()
+
+	// Deliver payloads OUTSIDE recvMu to avoid deadlock if readCh is full.
+	for _, payload := range toDeliver {
+		select {
+		case c.readCh <- payload:
+		case <-c.closed:
+			return
+		}
+	}
 
 	// Schedule a delayed ACK (RFC 1122 §4.2.3.2).
 	// If the timer is already running the existing timer will flush the ACK;
