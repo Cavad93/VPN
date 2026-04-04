@@ -157,48 +157,132 @@ func (s *Server) handleVLESSConn(ctx context.Context, conn net.Conn, cfg VLESSCo
 		return
 	}
 
-	// Only support TCP proxy
-	if req.Command != transport.VLESSCmdTCP {
-		s.logger.Warn("vless unsupported command", "cmd", req.Command)
-		return
-	}
-
-	// Dial destination
 	dest := net.JoinHostPort(req.Addr, fmt.Sprintf("%d", req.Port))
+
+	switch req.Command {
+	case transport.VLESSCmdTCP:
+		s.vlessTCPRelay(ctx, reader, writer, req, dest, remote)
+	case transport.VLESSCmdUDP:
+		s.vlessUDPRelay(ctx, reader, writer, req, dest, remote)
+	default:
+		s.logger.Warn("vless unsupported command", "cmd", req.Command)
+	}
+}
+
+// vlessTCPRelay proxies a single TCP connection to the destination.
+func (s *Server) vlessTCPRelay(ctx context.Context, reader io.Reader, writer io.Writer, req *transport.VLESSRequest, dest, remote string) {
 	target, err := net.DialTimeout("tcp", dest, 10*time.Second)
 	if err != nil {
-		s.logger.Debug("vless dial failed", "dest", dest, "err", err)
+		s.logger.Debug("vless tcp dial failed", "dest", dest, "err", err)
 		return
 	}
 	defer target.Close()
 
-	// Send VLESS response
 	if err := transport.VLESSWriteResponse(writer); err != nil {
-		s.logger.Warn("vless write response failed", "err", err)
 		return
 	}
 
 	vlessActiveConns.Add(1)
 	defer vlessActiveConns.Add(-1)
-
 	s.logger.Info("vless relay", "dest", dest, "remote", remote)
 
-	// Forward initial payload
 	if len(req.Payload) > 0 {
 		target.Write(req.Payload) //nolint:errcheck
 	}
 
-	// Bidirectional relay
 	done := make(chan struct{}, 1)
 	go func() {
 		io.Copy(writer, target) //nolint:errcheck
 		done <- struct{}{}
 	}()
 	io.Copy(target, reader) //nolint:errcheck
-
 	select {
 	case <-done:
 	case <-ctx.Done():
+	}
+}
+
+// vlessUDPRelay proxies UDP packets (DNS etc.) to the destination.
+// VLESS UDP framing: each datagram is prefixed with 2-byte BE length.
+func (s *Server) vlessUDPRelay(ctx context.Context, reader io.Reader, writer io.Writer, req *transport.VLESSRequest, dest, remote string) {
+	udpAddr, err := net.ResolveUDPAddr("udp", dest)
+	if err != nil {
+		s.logger.Debug("vless udp resolve failed", "dest", dest, "err", err)
+		return
+	}
+	udpConn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		s.logger.Debug("vless udp dial failed", "dest", dest, "err", err)
+		return
+	}
+	defer udpConn.Close()
+	udpConn.SetDeadline(time.Now().Add(120 * time.Second))
+
+	if err := transport.VLESSWriteResponse(writer); err != nil {
+		return
+	}
+
+	s.logger.Debug("vless udp relay", "dest", dest, "remote", remote)
+
+	// Forward initial payload (length-prefixed UDP packets)
+	if len(req.Payload) > 0 {
+		forwardUDPFromStream(req.Payload, udpConn)
+	}
+
+	// Client → UDP destination
+	go func() {
+		lenBuf := make([]byte, 2)
+		for {
+			if _, err := io.ReadFull(reader, lenBuf); err != nil {
+				return
+			}
+			pktLen := int(lenBuf[0])<<8 | int(lenBuf[1])
+			if pktLen <= 0 || pktLen > 65535 {
+				return
+			}
+			pkt := make([]byte, pktLen)
+			if _, err := io.ReadFull(reader, pkt); err != nil {
+				return
+			}
+			udpConn.Write(pkt) //nolint:errcheck
+			// Refresh deadline on activity
+			udpConn.SetDeadline(time.Now().Add(120 * time.Second))
+		}
+	}()
+
+	// UDP destination → client
+	respBuf := make([]byte, 65536)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		n, err := udpConn.Read(respBuf)
+		if err != nil {
+			return
+		}
+		// 2-byte BE length prefix + packet
+		hdr := [2]byte{byte(n >> 8), byte(n)}
+		if _, err := writer.Write(hdr[:]); err != nil {
+			return
+		}
+		if _, err := writer.Write(respBuf[:n]); err != nil {
+			return
+		}
+	}
+}
+
+// forwardUDPFromStream extracts length-prefixed UDP datagrams and sends them.
+func forwardUDPFromStream(data []byte, conn *net.UDPConn) {
+	for len(data) >= 2 {
+		pktLen := int(data[0])<<8 | int(data[1])
+		data = data[2:]
+		if pktLen > len(data) {
+			break
+		}
+		conn.Write(data[:pktLen]) //nolint:errcheck
+		data = data[pktLen:]
 	}
 }
 
