@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Creates cert.pem and key.pem in the specified directory.
-    Uses OpenSSL if available, otherwise pure PowerShell + certutil.
+    Works on Windows Server 2019+ with PowerShell 5.1 (no OpenSSL needed).
 
 .EXAMPLE
     .\gen_cert.ps1 -OutputDir C:\CavadVPN -Domain vpn.example.com
@@ -24,18 +24,17 @@ if (-not (Test-Path $OutputDir)) {
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 }
 
-# Try OpenSSL first (cleaner PEM output)
+# Try OpenSSL first (cleaner output)
 $openssl = Get-Command openssl -ErrorAction SilentlyContinue
 if ($openssl) {
-    Write-Host "Using OpenSSL to generate certificate..."
+    Write-Host "Using OpenSSL..."
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 `
         -keyout $keyPath -out $certPath `
         -days $Days -nodes `
         -subj "/CN=$Domain" `
         -addext "subjectAltName=DNS:$Domain" 2>&1 | Out-Null
 
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "Certificate generated:"
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $keyPath) -and (Get-Item $keyPath).Length -gt 100) {
         Write-Host "  cert: $certPath"
         Write-Host "  key:  $keyPath"
         exit 0
@@ -43,8 +42,8 @@ if ($openssl) {
     Write-Host "OpenSSL failed, falling back to PowerShell..."
 }
 
-# Fallback: pure PowerShell + certutil (no OpenSSL needed)
-Write-Host "Using PowerShell New-SelfSignedCertificate..."
+# Pure PowerShell path (Windows Server 2019+, PowerShell 5.1)
+Write-Host "Generating certificate with PowerShell..."
 
 $cert = New-SelfSignedCertificate `
     -DnsName $Domain `
@@ -55,62 +54,45 @@ $cert = New-SelfSignedCertificate `
     -KeyExportPolicy Exportable
 
 $thumbprint = $cert.Thumbprint
-Write-Host "Created certificate: $thumbprint"
+Write-Host "  Thumbprint: $thumbprint"
 
-# Export to PFX
-$pfxPath = Join-Path $OutputDir "temp.pfx"
-$password = ConvertTo-SecureString -String "temppass123" -Force -AsPlainText
-Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$thumbprint" -FilePath $pfxPath -Password $password | Out-Null
-
-# Convert PFX → PEM using certutil (built into Windows)
-# Step 1: Extract certificate (public part)
-$derCertPath = Join-Path $OutputDir "temp_cert.der"
-Export-Certificate -Cert "Cert:\CurrentUser\My\$thumbprint" -FilePath $derCertPath -Type CERT | Out-Null
-
-# Convert DER → Base64 PEM
-$certBytes = [System.IO.File]::ReadAllBytes($derCertPath)
-$certBase64 = [Convert]::ToBase64String($certBytes, [Base64FormattingOptions]::InsertLineBreaks)
-$certPem = "-----BEGIN CERTIFICATE-----`r`n$certBase64`r`n-----END CERTIFICATE-----`r`n"
+# --- Export certificate (public) as PEM ---
+$certDer = $cert.RawData
+$certB64 = [Convert]::ToBase64String($certDer, [Base64FormattingOptions]::InsertLineBreaks)
+$certPem = "-----BEGIN CERTIFICATE-----`r`n$certB64`r`n-----END CERTIFICATE-----`r`n"
 [System.IO.File]::WriteAllText($certPath, $certPem)
 
-# Step 2: Extract private key from PFX using .NET
-$pfxCollection = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
-$pfxCollection.Import($pfxPath, "temppass123", [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+# --- Export private key as PEM ---
+# On PowerShell 5.1 (.NET Framework), PrivateKey is RSACng.
+# RSACng.Key (CngKey) supports Export(Pkcs8PrivateBlob).
+$rsa = $cert.PrivateKey
+$keyExported = $false
 
-$privKey = $pfxCollection[0].PrivateKey
-if ($null -eq $privKey) {
-    # .NET Core / 5+ path
-    $privKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($pfxCollection[0])
+try {
+    $pkcs8 = $rsa.Key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob)
+    $keyB64 = [Convert]::ToBase64String($pkcs8, [Base64FormattingOptions]::InsertLineBreaks)
+    $keyPem = "-----BEGIN PRIVATE KEY-----`r`n$keyB64`r`n-----END PRIVATE KEY-----`r`n"
+    [System.IO.File]::WriteAllText($keyPath, $keyPem)
+    $keyExported = $true
+} catch {
+    Write-Host "  CNG export failed: $_" -ForegroundColor Yellow
 }
 
-if ($privKey) {
-    $keyBytes = $privKey.ExportRSAPrivateKey()
-    $keyBase64 = [Convert]::ToBase64String($keyBytes, [Base64FormattingOptions]::InsertLineBreaks)
-    $keyPem = "-----BEGIN RSA PRIVATE KEY-----`r`n$keyBase64`r`n-----END RSA PRIVATE KEY-----`r`n"
-    [System.IO.File]::WriteAllText($keyPath, $keyPem)
-} else {
-    # Last resort: export PKCS8
-    $keyBytes = $pfxCollection[0].GetRSAPrivateKey().ExportPkcs8PrivateKey()
-    $keyBase64 = [Convert]::ToBase64String($keyBytes, [Base64FormattingOptions]::InsertLineBreaks)
-    $keyPem = "-----BEGIN PRIVATE KEY-----`r`n$keyBase64`r`n-----END PRIVATE KEY-----`r`n"
-    [System.IO.File]::WriteAllText($keyPath, $keyPem)
-}
-
-# Clean up temp files and cert store
-Remove-Item $pfxPath -ErrorAction SilentlyContinue
-Remove-Item $derCertPath -ErrorAction SilentlyContinue
+# Clean up cert from store
 Remove-Item "Cert:\CurrentUser\My\$thumbprint" -ErrorAction SilentlyContinue
 
-# Verify files exist and have content
+# Verify
 $certSize = (Get-Item $certPath -ErrorAction SilentlyContinue).Length
 $keySize  = (Get-Item $keyPath -ErrorAction SilentlyContinue).Length
 
-if ($certSize -gt 0 -and $keySize -gt 0) {
+if ($certSize -gt 100 -and $keySize -gt 100) {
     Write-Host ""
-    Write-Host "Certificate generated successfully:"
+    Write-Host "Certificate generated successfully:" -ForegroundColor Green
     Write-Host "  cert: $certPath ($certSize bytes)"
     Write-Host "  key:  $keyPath ($keySize bytes)"
 } else {
-    Write-Host "ERROR: Certificate generation failed!" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "ERROR: Generation failed (cert=$certSize bytes, key=$keySize bytes)" -ForegroundColor Red
+    Write-Host "  Try installing OpenSSL: winget install OpenSSL" -ForegroundColor Yellow
     exit 1
 }
