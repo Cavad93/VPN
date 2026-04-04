@@ -2,10 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/pem"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net"
 	"os"
 	"sync"
@@ -30,6 +37,11 @@ type VLESSConfig struct {
 
 // RunVLESS starts the VLESS+WS+TLS listener. Blocks until ctx is cancelled.
 func (s *Server) RunVLESS(ctx context.Context, cfg VLESSConfig) error {
+	// Auto-generate self-signed cert if files don't exist.
+	if err := ensureTLSCert(cfg.TLSCert, cfg.TLSKey, s.logger); err != nil {
+		return fmt.Errorf("vless: ensure TLS cert: %w", err)
+	}
+
 	tlsCert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
 	if err != nil {
 		return fmt.Errorf("vless: load TLS cert: %w", err)
@@ -231,6 +243,66 @@ func loadOrGenerateVLESSUUID(path string, logger *slog.Logger) ([16]byte, error)
 
 	logger.Info("generated new VLESS UUID", "uuid", transport.FormatUUID(uuid))
 	return uuid, nil
+}
+
+// ensureTLSCert checks if cert and key files exist. If not, generates a
+// self-signed ECDSA P-256 certificate valid for 10 years. This avoids the
+// need for OpenSSL or PowerShell certificate generation on Windows Server.
+func ensureTLSCert(certPath, keyPath string, logger *slog.Logger) error {
+	_, certErr := os.Stat(certPath)
+	_, keyErr := os.Stat(keyPath)
+	if certErr == nil && keyErr == nil {
+		logger.Info("TLS cert found", "cert", certPath, "key", keyPath)
+		return nil
+	}
+
+	logger.Info("generating self-signed TLS certificate", "cert", certPath, "key", keyPath)
+
+	// Generate ECDSA P-256 key
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate key: %w", err)
+	}
+
+	// Build self-signed X.509 certificate
+	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "CavadVPN"},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"CavadVPN"},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		return fmt.Errorf("create certificate: %w", err)
+	}
+
+	// Write cert PEM
+	certFile, err := os.OpenFile(certPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("write cert: %w", err)
+	}
+	pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	certFile.Close()
+
+	// Write key PEM
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		return fmt.Errorf("marshal key: %w", err)
+	}
+	keyFile, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("write key: %w", err)
+	}
+	pem.Encode(keyFile, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	keyFile.Close()
+
+	logger.Info("self-signed TLS certificate generated", "cert", certPath, "key", keyPath)
+	return nil
 }
 
 // splitVLESSHostPort splits "host:port" for the VLESS link.
