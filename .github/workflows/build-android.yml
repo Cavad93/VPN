@@ -2,7 +2,7 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ "claude/optimize-vpn-tests-T2zNP", "main" ]
+    branches: [ "claude/optimize-vpn-tests-T2zNP", "claude/investigate-vpn-performance-IJ0iX", "main" ]
     paths:
       - 'android/**'
       - '.github/workflows/build-android.yml'
