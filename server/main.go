@@ -1311,7 +1311,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	startAPIServer(ctx, apiCfg, srv, logger)
+	apiSrv := startAPIServer(ctx, apiCfg, srv, logger)
 
 	// Start VLESS+WS+TLS listener if configured.
 	if vlessAddr != "" {
@@ -1330,6 +1330,17 @@ func main() {
 		// Print the VLESS link for easy import into V2Ray clients.
 		host, port := splitVLESSHostPort(vlessAddr)
 		link := generateVLESSLink(uuid, host, port, vlessPath)
+
+		// Register VLESS link in the REST API.
+		if apiSrv != nil {
+			apiSrv.SetVLESSInfo(api.VLESSInfo{
+				Link: link,
+				UUID: transport.FormatUUID(uuid),
+				Host: host,
+				Port: port,
+				Path: vlessPath,
+			})
+		}
 		logger.Info("VLESS link (copy to V2Ray client)", "link", link)
 		fmt.Println()
 		fmt.Println("═══════════════════════════════════════════════")
@@ -1355,9 +1366,9 @@ func main() {
 
 // startAPIServer launches the REST management API in a background goroutine.
 // If cfg.ListenAddr is empty the API is not started.
-func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *slog.Logger) {
+func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *slog.Logger) *api.APIServer {
 	if cfg.ListenAddr == "" {
-		return
+		return nil
 	}
 	// Create the push notification service and attach it to the server so that
 	// session connect/disconnect events trigger push alerts.
@@ -1384,4 +1395,6 @@ func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *sl
 			logger.Error("api server error", "err", err)
 		}
 	}()
+
+	return apiSrv
 }
