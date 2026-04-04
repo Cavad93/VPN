@@ -11,9 +11,8 @@ packages:
   swift-crypto:
     url: https://github.com/apple/swift-crypto.git
     from: "3.0.0"
-
-localPackages:
-  - "."
+  CavadVPNLib:
+    path: "."
 
 targets:
 
@@ -36,11 +35,11 @@ targets:
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: "YES"
     dependencies:
-      - package: CavadVPN
+      - package: CavadVPNLib
         product: CavadVPNClient
-      - package: CavadVPN
+      - package: CavadVPNLib
         product: CavadVPNCrypto
-      - package: CavadVPN
+      - package: CavadVPNLib
         product: CavadVPNTransport
       - target: CavadVPNTunnel
         embed: true
@@ -63,11 +62,11 @@ targets:
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"
         SKIP_INSTALL: "YES"
     dependencies:
-      - package: CavadVPN
+      - package: CavadVPNLib
         product: CavadVPNClient
-      - package: CavadVPN
+      - package: CavadVPNLib
         product: CavadVPNCrypto
-      - package: CavadVPN
+      - package: CavadVPNLib
         product: CavadVPNTransport
       - sdk: NetworkExtension.framework
 
