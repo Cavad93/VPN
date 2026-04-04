@@ -54,6 +54,7 @@ type Config struct {
 	ListenAddr  string
 	TunCIDR     string
 	PrivKeyFile string
+	Transport   string // "tcp" (default) or "udp" (user-space BBR)
 }
 
 // DefaultConfig returns a Config populated with sensible defaults.
@@ -62,6 +63,7 @@ func DefaultConfig() Config {
 		ListenAddr:  "0.0.0.0:443",
 		TunCIDR:     "10.8.0.1/24",
 		PrivKeyFile: "server_privkey.hex",
+		Transport:   "tcp",
 	}
 }
 
@@ -218,6 +220,14 @@ func NewServer(cfg Config, kp *crypto.KeyPair, tun TunDevice, allowedKeys [][cry
 
 // Run starts the server and blocks until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
+	if s.cfg.Transport == "udp" {
+		return s.runUDP(ctx)
+	}
+	return s.runTCP(ctx)
+}
+
+// runTCP starts the server over TCP (kernel congestion control).
+func (s *Server) runTCP(ctx context.Context) error {
 	ln, err := net.Listen("tcp", s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("server: listen %s: %w", s.cfg.ListenAddr, err)
@@ -229,7 +239,7 @@ func (s *Server) Run(ctx context.Context) error {
 		setListenerDeferAccept(tcpLn, 5) // 5-second timeout
 		setListenerTFO(tcpLn)            // TCP Fast Open — saves 1 RTT on reconnect
 	}
-	s.logger.Info("server listening", "addr", s.cfg.ListenAddr)
+	s.logger.Info("server listening", "transport", "tcp", "addr", s.cfg.ListenAddr)
 
 	go s.routeFromTun(ctx)
 
@@ -269,6 +279,39 @@ func (s *Server) Run(ctx context.Context) error {
 			// after a few minutes (common with Rostelecom / MTS stateful firewalls).
 			tc.SetKeepAlive(true)
 			tc.SetKeepAlivePeriod(15 * time.Second)
+		}
+		go s.handleConn(ctx, conn)
+	}
+}
+
+// runUDP starts the server over UDP with user-space BBR congestion control.
+// This bypasses the OS TCP stack entirely — BBR runs inside the application,
+// making it work on any OS including Windows Server 2019 (which lacks BBR).
+func (s *Server) runUDP(ctx context.Context) error {
+	ln, err := transport.ListenUDP(s.cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("server: listen udp %s: %w", s.cfg.ListenAddr, err)
+	}
+	s.logger.Info("server listening", "transport", "udp+bbr", "addr", s.cfg.ListenAddr)
+
+	go s.routeFromTun(ctx)
+
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+		s.tun.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				s.logger.Warn("accept error", "err", err)
+				continue
+			}
 		}
 		go s.handleConn(ctx, conn)
 	}
@@ -1277,6 +1320,7 @@ func main() {
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
 	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
 	flag.StringVar(&cfg.PrivKeyFile, "privkey", cfg.PrivKeyFile, "path to hex-encoded private key file")
+	flag.StringVar(&cfg.Transport, "transport", cfg.Transport, "transport protocol: tcp (kernel CC) or udp (user-space BBR)")
 	flag.StringVar(&apiCfg.ListenAddr, "api-addr", apiCfg.ListenAddr, "REST API listen address (empty to disable)")
 	flag.StringVar(&apiCfg.APIToken, "api-token", "", "Bearer token for the REST API (empty disables auth)")
 	flag.StringVar(&vlessAddr, "vless-addr", "", "VLESS+WS+TLS listen address (e.g. 0.0.0.0:443)")
