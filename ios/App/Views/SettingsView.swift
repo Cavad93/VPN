@@ -22,7 +22,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section {
+                Section(content: {
                     LabeledContent("Host") {
                         TextField("IP or hostname", text: $host)
                             .textInputAutocapitalization(.never)
@@ -35,11 +35,11 @@ struct SettingsView: View {
                             .keyboardType(.numberPad)
                             .multilineTextAlignment(.trailing)
                     }
-                } header: {
+                }, header: {
                     Text("Server")
-                }
+                })
 
-                Section {
+                Section(content: {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Private Key (hex)").font(.caption).foregroundStyle(.secondary)
                         TextField("64 hex characters", text: $privateKey)
@@ -58,11 +58,11 @@ struct SettingsView: View {
                         generateKey()
                     }
                     .foregroundStyle(.accentColor)
-                } header: {
+                }, header: {
                     Text("Encryption Keys")
-                }
+                })
 
-                Section {
+                Section(content: {
                     LabeledContent("DNS Server") {
                         TextField("1.1.1.1", text: $dnsServer)
                             .textInputAutocapitalization(.never)
@@ -75,9 +75,9 @@ struct SettingsView: View {
                             .keyboardType(.numberPad)
                             .multilineTextAlignment(.trailing)
                     }
-                } header: {
+                }, header: {
                     Text("Network")
-                }
+                })
 
                 Section {
                     Button("Clear Configuration", role: .destructive) {
