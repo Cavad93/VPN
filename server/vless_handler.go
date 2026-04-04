@@ -8,17 +8,16 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/binary"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/big"
 	"net"
 	"os"
-	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/cavad93/vpn/server/perf"
 	"github.com/cavad93/vpn/server/transport"
 )
 
@@ -50,7 +49,7 @@ func (s *Server) RunVLESS(ctx context.Context, cfg VLESSConfig) error {
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
 		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"h2", "http/1.1"},
+		NextProtos:   []string{"http/1.1"}, // WS requires HTTP/1.1, no h2
 	}
 
 	ln, err := tls.Listen("tcp", cfg.ListenAddr, tlsConfig)
@@ -80,24 +79,36 @@ func (s *Server) RunVLESS(ctx context.Context, cfg VLESSConfig) error {
 	}
 }
 
-// handleVLESSConn handles a single VLESS+WS connection.
+// vlessActiveConns tracks active VLESS proxy connections for stats.
+var vlessActiveConns atomic.Int64
+
+// handleVLESSConn handles a single VLESS+WS connection as a TCP proxy.
+// V2Ray clients use VLESS as a proxy protocol: each TCP connection from the
+// phone (e.g. to google.com:443) becomes a separate VLESS request with the
+// destination address. We dial the destination and relay data bidirectionally.
 func (s *Server) handleVLESSConn(ctx context.Context, conn net.Conn, cfg VLESSConfig) {
 	defer conn.Close()
+
+	// Set a deadline for the handshake phase
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
 
 	// 1. WebSocket upgrade
 	ws, err := transport.WSUpgrade(conn, cfg.WSPath)
 	if err != nil {
-		s.logger.Debug("vless ws upgrade failed", "err", err)
+		s.logger.Warn("vless ws upgrade failed", "err", err, "remote", conn.RemoteAddr())
 		return
 	}
 	defer ws.Close()
 
-	// 2. Parse VLESS request
+	// 2. Parse VLESS request (contains destination addr:port)
 	req, err := transport.VLESSParseRequest(ws)
 	if err != nil {
-		s.logger.Warn("vless parse request failed", "err", err)
+		s.logger.Warn("vless parse request failed", "err", err, "remote", conn.RemoteAddr())
 		return
 	}
+
+	// Clear handshake deadline
+	conn.SetDeadline(time.Time{})
 
 	// 3. Authenticate UUID
 	if req.UUID != cfg.UUID {
@@ -105,110 +116,56 @@ func (s *Server) handleVLESSConn(ctx context.Context, conn net.Conn, cfg VLESSCo
 		return
 	}
 
-	// 4. Send VLESS response (version + 0 addons)
+	// 4. Only support TCP proxy (V2Ray command 1)
+	if req.Command != transport.VLESSCmdTCP {
+		s.logger.Warn("vless unsupported command", "cmd", req.Command)
+		return
+	}
+
+	// 5. Dial the destination that V2Ray client wants to reach
+	dest := net.JoinHostPort(req.Addr, fmt.Sprintf("%d", req.Port))
+	target, err := net.DialTimeout("tcp", dest, 10*time.Second)
+	if err != nil {
+		s.logger.Debug("vless dial failed", "dest", dest, "err", err)
+		return
+	}
+	defer target.Close()
+
+	// 6. Send VLESS response (version + 0 addons) — tells client we're ready
 	if err := transport.VLESSWriteResponse(ws); err != nil {
 		s.logger.Warn("vless write response failed", "err", err)
 		return
 	}
 
-	// 5. Allocate IP
-	ip, err := s.pool.allocate()
-	if err != nil {
-		s.logger.Warn("vless ip allocation failed", "err", err)
-		return
-	}
+	vlessActiveConns.Add(1)
+	defer vlessActiveConns.Add(-1)
 
-	connCtx, cancel := context.WithCancel(ctx)
-	cs := &clientSession{
-		id:          s.nextSessionID(),
-		rawConn:     conn,
-		connectedAt: time.Now(),
-		cancel:      cancel,
-		assignedIP:  ip,
-	}
+	s.logger.Debug("vless relay", "dest", dest, "remote", conn.RemoteAddr())
 
-	// Register session
-	s.mu.Lock()
-	s.sessions[cs.id] = cs
-	s.mu.Unlock()
-
-	packed := binary.BigEndian.Uint32(ip.To4())
-	s.ipIndex.Store(packed, cs)
-
-	if s.Perf != nil {
-		s.Perf.ActiveSessions.Add(1)
-		s.Perf.TotalSessions.Add(1)
-	}
-	s.logger.Info("vless session", "id", cs.id, "ip", ip.String())
-	if s.notifSvc != nil {
-		s.notifSvc.NotifySessionConnected(cs.id, ip.String())
-	}
-
-	defer func() {
-		cancel()
-		if s.Perf != nil {
-			s.Perf.ActiveSessions.Add(-1)
+	// 7. Forward initial payload (if any arrived with the VLESS header)
+	if len(req.Payload) > 0 {
+		if _, err := target.Write(req.Payload); err != nil {
+			return
 		}
-		s.mu.Lock()
-		delete(s.sessions, cs.id)
-		s.mu.Unlock()
-		s.ipIndex.Delete(packed)
-		s.pool.release(ip)
-		s.logger.Info("vless session closed", "id", cs.id, "ip", ip.String())
-		if s.notifSvc != nil {
-			s.notifSvc.NotifySessionDisconnected(cs.id, ip.String())
-		}
+	}
+
+	// 8. Bidirectional relay: WS ↔ destination
+	done := make(chan struct{}, 1)
+
+	// destination → V2Ray client
+	go func() {
+		io.Copy(ws, target) //nolint:errcheck
+		done <- struct{}{}
 	}()
 
-	// 6. Create a vlessWriter for the TUN→client direction and add to bond
-	vw := &vlessWriter{ws: ws}
-	cs.bond.add(vw)
-	defer cs.bond.remove(vw)
+	// V2Ray client → destination
+	io.Copy(target, ws) //nolint:errcheck
 
-	// 7. Bidirectional relay: WS → TUN (this goroutine) + TUN → WS (via routeFromTun/bond)
-	buf := make([]byte, 65536)
-	for {
-		select {
-		case <-connCtx.Done():
-			return
-		default:
-		}
-
-		n, err := ws.Read(buf)
-		if err != nil {
-			return
-		}
-		if n < 20 {
-			continue // too short for IPv4
-		}
-
-		if s.Perf != nil {
-			t0 := time.Now()
-			s.tun.Write(buf[:n]) //nolint:errcheck
-			s.Perf.TrackLatency(perf.StageTunWrite, time.Since(t0))
-			s.Perf.TrackPacket(perf.StageTunWrite, n)
-		} else {
-			s.tun.Write(buf[:n]) //nolint:errcheck
-		}
-		cs.bytesIn.Add(uint64(n))
+	// Wait for the other direction or context cancel
+	select {
+	case <-done:
+	case <-ctx.Done():
 	}
-}
-
-// vlessWriter wraps a WSConn for writing IP packets from TUN to VLESS client.
-// Implements dataWriter interface.
-type vlessWriter struct {
-	ws *transport.WSConn
-	mu sync.Mutex
-}
-
-func (vw *vlessWriter) Write(p []byte) (int, error) {
-	vw.mu.Lock()
-	defer vw.mu.Unlock()
-	return vw.ws.Write(p)
-}
-
-func (vw *vlessWriter) Close() error {
-	return vw.ws.Close()
 }
 
 // generateVLESSLink builds a vless:// URI for V2Ray clients.
