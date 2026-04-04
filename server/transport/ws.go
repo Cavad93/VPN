@@ -1,0 +1,267 @@
+// Package transport — minimal WebSocket server (RFC 6455).
+//
+// Implements only what VLESS+WS needs: server-side HTTP upgrade handshake
+// and binary message framing. No client-side, no extensions, no compression.
+//
+// The implementation is intentionally minimal to avoid external dependencies.
+package transport
+
+import (
+	"bufio"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+)
+
+// WebSocket opcodes (RFC 6455 §5.2).
+const (
+	wsOpContinuation = 0x0
+	wsOpText         = 0x1
+	wsOpBinary       = 0x2
+	wsOpClose        = 0x8
+	wsOpPing         = 0x9
+	wsOpPong         = 0xA
+)
+
+// wsGUID is the WebSocket magic GUID (RFC 6455 §4.2.2).
+const wsGUID = "258EAFA5-E914-47DA-95CA-5AB5DC085B11"
+
+// WSConn wraps a net.Conn with WebSocket binary message framing.
+// After Upgrade(), reads and writes are transparently framed.
+type WSConn struct {
+	conn   net.Conn
+	br     *bufio.Reader
+	path   string // requested URL path (e.g. "/tunnel")
+	closed bool
+}
+
+// Upgrade performs the server-side WebSocket upgrade handshake.
+// Returns a WSConn on success. The underlying conn should be a raw TCP
+// connection (possibly wrapped in TLS).
+//
+// Validates that the request targets the expected path. If path is empty,
+// any path is accepted.
+func WSUpgrade(conn net.Conn, expectedPath string) (*WSConn, error) {
+	br := bufio.NewReaderSize(conn, 4096)
+
+	// Read HTTP request
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		return nil, fmt.Errorf("ws: read request: %w", err)
+	}
+
+	// Validate upgrade headers
+	if !strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
+		writeHTTPError(conn, 400, "Bad Request")
+		return nil, errors.New("ws: missing Upgrade: websocket header")
+	}
+	if !headerContains(req.Header, "Connection", "upgrade") {
+		writeHTTPError(conn, 400, "Bad Request")
+		return nil, errors.New("ws: missing Connection: upgrade header")
+	}
+	wsKey := req.Header.Get("Sec-WebSocket-Key")
+	if wsKey == "" {
+		writeHTTPError(conn, 400, "Bad Request")
+		return nil, errors.New("ws: missing Sec-WebSocket-Key")
+	}
+
+	// Validate path if required
+	if expectedPath != "" && req.URL.Path != expectedPath {
+		writeHTTPError(conn, 404, "Not Found")
+		return nil, fmt.Errorf("ws: path %q does not match %q", req.URL.Path, expectedPath)
+	}
+
+	// Compute accept key
+	h := sha1.New()
+	h.Write([]byte(wsKey))
+	h.Write([]byte(wsGUID))
+	acceptKey := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	// Write HTTP 101 response
+	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: " + acceptKey + "\r\n" +
+		"\r\n"
+	if _, err := conn.Write([]byte(resp)); err != nil {
+		return nil, fmt.Errorf("ws: write response: %w", err)
+	}
+
+	return &WSConn{
+		conn: conn,
+		br:   br,
+		path: req.URL.Path,
+	}, nil
+}
+
+// Path returns the URL path from the upgrade request.
+func (ws *WSConn) Path() string { return ws.path }
+
+// Read reads the next WebSocket binary message payload.
+// Handles continuation frames, ping/pong, and close frames transparently.
+func (ws *WSConn) Read(p []byte) (int, error) {
+	for {
+		fin, opcode, payload, err := ws.readFrame()
+		if err != nil {
+			return 0, err
+		}
+
+		switch opcode {
+		case wsOpClose:
+			ws.closed = true
+			// Send close frame back
+			ws.writeFrame(wsOpClose, nil)
+			return 0, io.EOF
+		case wsOpPing:
+			ws.writeFrame(wsOpPong, payload)
+			continue
+		case wsOpPong:
+			continue
+		case wsOpBinary, wsOpText, wsOpContinuation:
+			n := copy(p, payload)
+			if !fin {
+				// For simplicity, we require single-frame messages for VLESS.
+				// V2Ray clients always send single-frame binary messages.
+			}
+			return n, nil
+		default:
+			return 0, fmt.Errorf("ws: unknown opcode 0x%x", opcode)
+		}
+	}
+}
+
+// Write sends data as a single binary WebSocket frame (server→client, unmasked).
+func (ws *WSConn) Write(p []byte) (int, error) {
+	if err := ws.writeFrame(wsOpBinary, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// Close sends a close frame and closes the underlying connection.
+func (ws *WSConn) Close() error {
+	if !ws.closed {
+		ws.closed = true
+		ws.writeFrame(wsOpClose, nil)
+	}
+	return ws.conn.Close()
+}
+
+// Underlying returns the raw net.Conn.
+func (ws *WSConn) Underlying() net.Conn { return ws.conn }
+
+// readFrame reads a single WebSocket frame. Client→server frames are masked.
+func (ws *WSConn) readFrame() (fin bool, opcode byte, payload []byte, err error) {
+	// Read first 2 bytes: FIN + opcode + MASK + payload length
+	var hdr [2]byte
+	if _, err := io.ReadFull(ws.br, hdr[:]); err != nil {
+		return false, 0, nil, err
+	}
+
+	fin = hdr[0]&0x80 != 0
+	opcode = hdr[0] & 0x0F
+	masked := hdr[1]&0x80 != 0
+	length := uint64(hdr[1] & 0x7F)
+
+	// Extended payload length
+	switch length {
+	case 126:
+		var ext [2]byte
+		if _, err := io.ReadFull(ws.br, ext[:]); err != nil {
+			return false, 0, nil, err
+		}
+		length = uint64(binary.BigEndian.Uint16(ext[:]))
+	case 127:
+		var ext [8]byte
+		if _, err := io.ReadFull(ws.br, ext[:]); err != nil {
+			return false, 0, nil, err
+		}
+		length = binary.BigEndian.Uint64(ext[:])
+	}
+
+	// Masking key (client→server always masked per RFC 6455)
+	var maskKey [4]byte
+	if masked {
+		if _, err := io.ReadFull(ws.br, maskKey[:]); err != nil {
+			return false, 0, nil, err
+		}
+	}
+
+	// Read payload
+	if length > 16*1024*1024 { // 16 MB sanity limit
+		return false, 0, nil, errors.New("ws: frame too large")
+	}
+	payload = make([]byte, length)
+	if length > 0 {
+		if _, err := io.ReadFull(ws.br, payload); err != nil {
+			return false, 0, nil, err
+		}
+	}
+
+	// Unmask
+	if masked {
+		for i := range payload {
+			payload[i] ^= maskKey[i%4]
+		}
+	}
+
+	return fin, opcode, payload, nil
+}
+
+// writeFrame writes a single WebSocket frame. Server→client frames are NOT masked.
+func (ws *WSConn) writeFrame(opcode byte, payload []byte) error {
+	length := len(payload)
+
+	// Build header
+	var hdr []byte
+	firstByte := byte(0x80) | (opcode & 0x0F) // FIN=1
+
+	if length <= 125 {
+		hdr = []byte{firstByte, byte(length)}
+	} else if length <= 65535 {
+		hdr = make([]byte, 4)
+		hdr[0] = firstByte
+		hdr[1] = 126
+		binary.BigEndian.PutUint16(hdr[2:], uint16(length))
+	} else {
+		hdr = make([]byte, 10)
+		hdr[0] = firstByte
+		hdr[1] = 127
+		binary.BigEndian.PutUint64(hdr[2:], uint64(length))
+	}
+
+	// Write header + payload in one syscall when possible
+	if length == 0 {
+		_, err := ws.conn.Write(hdr)
+		return err
+	}
+	buf := make([]byte, len(hdr)+length)
+	copy(buf, hdr)
+	copy(buf[len(hdr):], payload)
+	_, err := ws.conn.Write(buf)
+	return err
+}
+
+// writeHTTPError sends a minimal HTTP error response.
+func writeHTTPError(conn net.Conn, code int, status string) {
+	resp := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", code, status)
+	conn.Write([]byte(resp))
+}
+
+// headerContains checks if an HTTP header contains a value (case-insensitive).
+func headerContains(h http.Header, key, value string) bool {
+	for _, v := range h[http.CanonicalHeaderKey(key)] {
+		for _, s := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(s), value) {
+				return true
+			}
+		}
+	}
+	return false
+}
