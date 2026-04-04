@@ -206,20 +206,28 @@ func TestProcessDataNoPayload(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// processACK — congestion window
+// processACK — BBR congestion window
 // ---------------------------------------------------------------------------
 
 func TestProcessACKClearsWindow(t *testing.T) {
 	t.Parallel()
 	c := makeTestConn(t)
 
-	// Manually populate pending packets.
+	now := time.Now()
+	// Manually populate pending packets with delivery snapshots.
 	c.sendMu.Lock()
 	for i := uint32(0); i < 5; i++ {
 		c.pending[i] = &pendingPacket{
-			pkt:    &Packet{SeqNum: i},
-			sentAt: time.Now(),
+			pkt:           &Packet{SeqNum: i, Payload: []byte("data")},
+			sentAt:        now.Add(-50 * time.Millisecond),
+			deliveredTime: now.Add(-100 * time.Millisecond),
 		}
+		c.bbr.inflight.OnSend(&inflightPkt{
+			SeqNum:        i,
+			Size:          4,
+			SentAt:        now.Add(-50 * time.Millisecond),
+			DeliveredTime: now.Add(-100 * time.Millisecond),
+		})
 	}
 	c.sendSeq = 5
 	c.sendMu.Unlock()
@@ -229,14 +237,14 @@ func TestProcessACKClearsWindow(t *testing.T) {
 
 	c.sendMu.Lock()
 	pending := len(c.pending)
-	cwnd := c.cwnd
 	c.sendMu.Unlock()
 
 	if pending != 2 {
 		t.Errorf("pending: got %d, want 2 (seq 3 and 4 remain)", pending)
 	}
-	if cwnd <= 4 {
-		t.Errorf("cwnd should have grown after ACKs, got %d", cwnd)
+	// BBR should have a positive pacing rate after processing ACKs.
+	if c.bbr.PacingRate() < 0 {
+		t.Errorf("BBR pacing rate should be non-negative, got %d", c.bbr.PacingRate())
 	}
 }
 
@@ -244,23 +252,31 @@ func TestProcessACKCongestionAvoidance(t *testing.T) {
 	t.Parallel()
 	c := makeTestConn(t)
 
-	// Force into congestion-avoidance phase (cwnd >= ssthresh).
+	now := time.Now()
+	// Populate pending packets with delivery snapshots.
 	c.sendMu.Lock()
-	c.cwnd = 32
-	c.ssthresh = 16
 	for i := uint32(0); i < 10; i++ {
-		c.pending[i] = &pendingPacket{pkt: &Packet{SeqNum: i}}
+		c.pending[i] = &pendingPacket{
+			pkt:           &Packet{SeqNum: i, Payload: []byte("data")},
+			sentAt:        now.Add(-50 * time.Millisecond),
+			deliveredTime: now.Add(-100 * time.Millisecond),
+		}
+		c.bbr.inflight.OnSend(&inflightPkt{
+			SeqNum:        i,
+			Size:          4,
+			SentAt:        now.Add(-50 * time.Millisecond),
+			DeliveredTime: now.Add(-100 * time.Millisecond),
+		})
 	}
 	c.sendMu.Unlock()
 
+	cwndBefore := c.bbr.CwndTarget()
 	c.processACK(10)
+	cwndAfter := c.bbr.CwndTarget()
 
-	c.sendMu.Lock()
-	cwnd := c.cwnd
-	c.sendMu.Unlock()
-
-	if cwnd < 32 {
-		t.Errorf("cwnd should not shrink in congestion avoidance, got %d", cwnd)
+	// BBR's cwnd should not shrink when processing ACKs (no loss).
+	if cwndAfter < cwndBefore {
+		t.Errorf("BBR cwnd should not shrink after ACKs: %d → %d", cwndBefore, cwndAfter)
 	}
 }
 
@@ -273,11 +289,20 @@ func TestDoRetransmitIncreasesCounter(t *testing.T) {
 	c := makeTestConn(t)
 
 	pkt := &Packet{Type: PacketTypeData, SeqNum: 0, Payload: []byte("retry")}
+	now := time.Now()
 	c.sendMu.Lock()
 	c.pending[0] = &pendingPacket{
-		pkt:    pkt,
-		sentAt: time.Now().Add(-RetransmitTimeout * 2), // far in the past
+		pkt:           pkt,
+		sentAt:        now.Add(-RetransmitTimeout * 2), // far in the past
+		deliveredTime: now.Add(-RetransmitTimeout * 3),
 	}
+	// Register in inflight tracker (doRetransmit calls OnLoss then OnSend).
+	c.bbr.inflight.OnSend(&inflightPkt{
+		SeqNum:        0,
+		Size:          5,
+		SentAt:        now.Add(-RetransmitTimeout * 2),
+		DeliveredTime: now.Add(-RetransmitTimeout * 3),
+	})
 	c.sendMu.Unlock()
 
 	c.doRetransmit()
@@ -298,12 +323,21 @@ func TestDoRetransmitDropsAfterMaxRetransmits(t *testing.T) {
 	t.Parallel()
 	c := makeTestConn(t)
 
+	now := time.Now()
 	c.sendMu.Lock()
 	c.pending[0] = &pendingPacket{
-		pkt:         &Packet{Type: PacketTypeData, SeqNum: 0},
-		sentAt:      time.Now().Add(-RetransmitTimeout * 2),
-		retransmits: MaxRetransmits, // already at max
+		pkt:           &Packet{Type: PacketTypeData, SeqNum: 0, Payload: []byte("x")},
+		sentAt:        now.Add(-RetransmitTimeout * 2),
+		retransmits:   MaxRetransmits, // already at max
+		deliveredTime: now.Add(-RetransmitTimeout * 3),
 	}
+	// Register in inflight tracker.
+	c.bbr.inflight.OnSend(&inflightPkt{
+		SeqNum:        0,
+		Size:          1,
+		SentAt:        now.Add(-RetransmitTimeout * 2),
+		DeliveredTime: now.Add(-RetransmitTimeout * 3),
+	})
 	c.sendMu.Unlock()
 
 	c.doRetransmit()
@@ -317,30 +351,30 @@ func TestDoRetransmitDropsAfterMaxRetransmits(t *testing.T) {
 	}
 }
 
-func TestDoRetransmitCongestionDecrease(t *testing.T) {
+func TestDoRetransmitBBRNoHalving(t *testing.T) {
+	// BBR does NOT halve cwnd on retransmit (unlike TCP Reno).
+	// At low loss rates (<2%), cwnd should remain unchanged.
 	t.Parallel()
 	c := makeTestConn(t)
+
+	// Set a known cwnd via BBR state.
+	c.bbr.mu.Lock()
+	c.bbr.cwndTarget = 20
+	c.bbr.mu.Unlock()
+
 	c.sendMu.Lock()
-	c.cwnd = 20
-	c.ssthresh = 32
 	c.pending[0] = &pendingPacket{
-		pkt:    &Packet{Type: PacketTypeData, SeqNum: 0},
+		pkt:    &Packet{Type: PacketTypeData, SeqNum: 0, Payload: []byte("x")},
 		sentAt: time.Now().Add(-RetransmitTimeout * 2),
 	}
 	c.sendMu.Unlock()
 
 	c.doRetransmit()
 
-	c.sendMu.Lock()
-	cwnd := c.cwnd
-	ssthresh := c.ssthresh
-	c.sendMu.Unlock()
-
-	if ssthresh != 10 {
-		t.Errorf("ssthresh: got %d, want 10 (20/2)", ssthresh)
-	}
-	if cwnd != 10 {
-		t.Errorf("cwnd: got %d, want 10 (= ssthresh)", cwnd)
+	// BBR should NOT have halved cwnd from a single retransmit.
+	cwnd := c.bbr.CwndTarget()
+	if cwnd < 20 {
+		t.Errorf("BBR cwnd should not halve on single retransmit: got %d, want >= 20", cwnd)
 	}
 }
 

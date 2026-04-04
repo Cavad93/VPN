@@ -1,5 +1,5 @@
 // Package transport implements reliable UDP transport with ACK, retransmission,
-// packet ordering, and congestion control (TCP Reno-style slow start).
+// packet ordering, and BBR congestion control (user-space).
 package transport
 
 import (
@@ -87,6 +87,11 @@ type pendingPacket struct {
 	pkt         *Packet
 	sentAt      time.Time
 	retransmits int
+
+	// BBR delivery-rate snapshots taken at send time.
+	delivered     int64
+	deliveredTime time.Time
+	appLimited    bool
 }
 
 // ackDelay is the maximum time to wait before flushing a coalesced ACK.
@@ -104,7 +109,8 @@ var ackBufPool = sync.Pool{
 	},
 }
 
-// Conn is a reliable UDP connection providing ordered, ACKed delivery.
+// Conn is a reliable UDP connection providing ordered, ACKed delivery
+// with BBR congestion control (user-space).
 // Multiple goroutines may call Write, Read, and Close concurrently.
 type Conn struct {
 	conn    *net.UDPConn
@@ -127,9 +133,8 @@ type Conn struct {
 	ackPending bool       // true when an ACK needs to be sent
 	ackTimer   *time.Timer
 
-	// Congestion control (TCP Reno-style).
-	cwnd     int // current congestion window
-	ssthresh int // slow-start threshold
+	// Congestion control: BBR (user-space).
+	bbr *BBRState
 
 	readCh    chan []byte
 	ctx       context.Context
@@ -138,22 +143,31 @@ type Conn struct {
 	closed    chan struct{}
 }
 
+// bbrMaxBurst is the initial pacing burst allowance in bytes (10 × MTU).
+// Allows a small burst on connection start before pacing kicks in.
+const bbrMaxBurst = 10 * MaxPayloadSize
+
 // newConn constructs a Conn. ownConn controls whether Close() shuts down the
 // underlying UDP socket (true for Dial-side, false for Listener-side).
 func newConn(conn *net.UDPConn, remote *net.UDPAddr, ownConn bool) *Conn {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	est := newBBREstimator()
+	ifl := newInflightTracker()
+	p := newPacer(0, bbrMaxBurst) // unlimited initial rate; Startup will ramp up
+	bbr := NewBBRState(est, ifl, p, MaxPayloadSize)
+
 	c := &Conn{
-		conn:     conn,
-		ownConn:  ownConn,
-		remote:   remote,
-		pending:  make(map[uint32]*pendingPacket),
-		recvBuf:  make(map[uint32]*Packet),
-		readCh:   make(chan []byte, 256),
-		cwnd:     4,
-		ssthresh: 32,
-		ctx:      ctx,
-		cancel:   cancel,
-		closed:   make(chan struct{}),
+		conn:    conn,
+		ownConn: ownConn,
+		remote:  remote,
+		pending: make(map[uint32]*pendingPacket),
+		recvBuf: make(map[uint32]*Packet),
+		readCh:  make(chan []byte, 256),
+		bbr:     bbr,
+		ctx:     ctx,
+		cancel:  cancel,
+		closed:  make(chan struct{}),
 	}
 	c.sendCond = sync.NewCond(&c.sendMu)
 	go c.retransmitLoop()
@@ -182,23 +196,32 @@ func (c *Conn) Write(data []byte) error {
 }
 
 // writePacket sends one packet and registers it for ACK tracking.
-// Blocks if the congestion window is full.
+// Blocks if BBR's congestion window is full. Uses BBR pacing to space
+// packet transmissions evenly.
 func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
-	// Wait for the congestion window to open.
-	// sendCond is signalled by processACK (window grew) and Close (conn dying).
-	// Using sync.Cond eliminates the 1 ms time.After poll on the hot write path,
-	// cutting latency and reducing timer allocations under sustained load.
-	for len(c.pending) >= c.cwnd {
+	// Wait for BBR congestion window to open.
+	cwndTarget := c.bbr.CwndTarget()
+	for len(c.pending) >= cwndTarget {
 		if c.ctx.Err() != nil {
 			return errors.New("transport: connection closed")
 		}
-		c.sendCond.Wait() // atomically releases sendMu and sleeps
+		c.sendCond.Wait()
 		if c.ctx.Err() != nil {
 			return errors.New("transport: connection closed")
 		}
+		cwndTarget = c.bbr.CwndTarget()
+	}
+
+	// BBR pacing: wait for the next send slot (releases sendMu briefly).
+	// We unlock during the sleep so ACK processing is not blocked.
+	c.sendMu.Unlock()
+	c.bbr.pacer.WaitForSlot(len(payload))
+	c.sendMu.Lock()
+	if c.ctx.Err() != nil {
+		return errors.New("transport: connection closed")
 	}
 
 	seq := c.sendSeq
@@ -218,29 +241,70 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 		copy(pkt.Payload, payload)
 	}
 
+	// Take delivery-rate snapshot for BBR estimator.
+	delivered, deliveredTime := c.bbr.estimator.DeliveredSnapshot()
+	// Check if sender is app-limited (no data queued beyond this packet).
+	appLimited := len(c.pending) == 0
+
+	now := time.Now()
 	if _, err := c.conn.WriteToUDP(pkt.Encode(), c.remote); err != nil {
 		return err
 	}
-	c.pending[seq] = &pendingPacket{pkt: pkt, sentAt: time.Now()}
+	c.pending[seq] = &pendingPacket{
+		pkt:           pkt,
+		sentAt:        now,
+		delivered:     delivered,
+		deliveredTime: deliveredTime,
+		appLimited:    appLimited,
+	}
+
+	// Register with BBR inflight tracker.
+	c.bbr.inflight.OnSend(&inflightPkt{
+		SeqNum:        seq,
+		Size:          len(payload),
+		SentAt:        now,
+		Delivered:     delivered,
+		DeliveredTime: deliveredTime,
+		AppLimited:    appLimited,
+	})
+
 	return nil
 }
 
 // processACK handles an incoming ACK, releasing pending packets up to ackNum
-// and growing the congestion window.
+// and feeding the BBR estimator with per-ACK measurements.
 func (c *Conn) processACK(ackNum uint32) {
 	c.sendMu.Lock()
 
+	now := time.Now()
 	cleared := 0
 	for seq := range c.pending {
 		if seq < ackNum {
+			pp := c.pending[seq]
 			delete(c.pending, seq)
 			cleared++
-			// Congestion window growth.
-			if c.cwnd < c.ssthresh {
-				c.cwnd++ // slow start: exponential
-			} else if c.cwnd < MaxWindowSize {
-				c.cwnd++ // congestion avoidance: linear (simplified)
+
+			// Compute RTT for this packet.
+			rtt := now.Sub(pp.sentAt)
+			if rtt < 0 {
+				rtt = time.Microsecond // safety floor
 			}
+
+			// Build inflight metadata for BBR.
+			iflPkt := &inflightPkt{
+				SeqNum:        seq,
+				Size:          len(pp.pkt.Payload),
+				SentAt:        pp.sentAt,
+				Delivered:     pp.delivered,
+				DeliveredTime: pp.deliveredTime,
+				AppLimited:    pp.appLimited,
+			}
+
+			// Remove from inflight tracker.
+			c.bbr.inflight.OnACK(seq)
+
+			// Feed BBR state machine.
+			c.bbr.OnACK(rtt, int64(len(pp.pkt.Payload)), iflPkt)
 		}
 	}
 	c.sendMu.Unlock()
@@ -348,12 +412,15 @@ func (c *Conn) retransmitLoop() {
 	}
 }
 
-// doRetransmit resends any packet whose RetransmitTimeout has elapsed and
-// applies multiplicative-decrease congestion control on each loss event.
+// doRetransmit resends any packet whose RetransmitTimeout has elapsed.
+// BBR does NOT halve cwnd on retransmit (unlike TCP Reno). It just
+// retransmits the packet and lets BBR.OnLoss() handle rate adjustment
+// only if loss rate exceeds 2%.
 func (c *Conn) doRetransmit() {
 	c.sendMu.Lock()
 
 	dropped := 0
+	lostBytes := int64(0)
 	now := time.Now()
 	for seq, pp := range c.pending {
 		if now.Sub(pp.sentAt) < RetransmitTimeout {
@@ -361,22 +428,42 @@ func (c *Conn) doRetransmit() {
 		}
 		if pp.retransmits >= MaxRetransmits {
 			// Give up on this packet — free the window slot.
+			payloadLen := int64(len(pp.pkt.Payload))
 			delete(c.pending, seq)
+			c.bbr.inflight.OnLoss(seq)
+			lostBytes += payloadLen
 			dropped++
 			continue
 		}
+
+		// Mark as loss in BBR inflight tracker and retransmit.
+		if pp.retransmits == 0 {
+			// First retransmit — count as a loss event.
+			lostBytes += int64(len(pp.pkt.Payload))
+			c.bbr.inflight.OnLoss(seq)
+		}
+
 		c.conn.WriteToUDP(pp.pkt.Encode(), c.remote) //nolint:errcheck
 		pp.sentAt = now
 		pp.retransmits++
 
-		// Multiplicative decrease (TCP Reno on loss).
-		c.ssthresh = c.cwnd / 2
-		if c.ssthresh < 2 {
-			c.ssthresh = 2
-		}
-		c.cwnd = c.ssthresh
+		// Re-register in inflight tracker with fresh delivery snapshot.
+		delivered, deliveredTime := c.bbr.estimator.DeliveredSnapshot()
+		c.bbr.inflight.OnSend(&inflightPkt{
+			SeqNum:        seq,
+			Size:          len(pp.pkt.Payload),
+			SentAt:        now,
+			Delivered:     delivered,
+			DeliveredTime: deliveredTime,
+			Retransmitted: true,
+		})
 	}
 	c.sendMu.Unlock()
+
+	// Notify BBR about loss (it only reduces cwnd if loss rate > 2%).
+	if lostBytes > 0 {
+		c.bbr.OnLoss(lostBytes)
+	}
 
 	// Dropped packets free window slots; wake any blocked writePacket callers.
 	if dropped > 0 {
