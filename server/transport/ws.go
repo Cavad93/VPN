@@ -3,6 +3,9 @@
 // Implements only what VLESS+WS needs: server-side HTTP upgrade handshake
 // and binary message framing. No client-side, no extensions, no compression.
 //
+// Supports V2Ray early data (0-RTT): if the client encodes the first bytes
+// in Sec-WebSocket-Protocol as base64, they are prepended to the first Read.
+//
 // The implementation is intentionally minimal to avoid external dependencies.
 package transport
 
@@ -35,10 +38,11 @@ const wsGUID = "258EAFA5-E914-47DA-95CA-5AB5DC085B11"
 // WSConn wraps a net.Conn with WebSocket binary message framing.
 // After Upgrade(), reads and writes are transparently framed.
 type WSConn struct {
-	conn   net.Conn
-	br     *bufio.Reader
-	path   string // requested URL path (e.g. "/tunnel")
-	closed bool
+	conn      net.Conn
+	br        *bufio.Reader
+	path      string // requested URL path (e.g. "/tunnel")
+	closed    bool
+	earlyData []byte // V2Ray 0-RTT data from Sec-WebSocket-Protocol
 }
 
 // Upgrade performs the server-side WebSocket upgrade handshake.
@@ -83,29 +87,64 @@ func WSUpgrade(conn net.Conn, expectedPath string) (*WSConn, error) {
 	h.Write([]byte(wsGUID))
 	acceptKey := base64.StdEncoding.EncodeToString(h.Sum(nil))
 
+	// Handle Sec-WebSocket-Protocol (required by V2Ray clients).
+	// V2Ray may send either "binary" or base64-encoded early data (0-RTT).
+	var earlyData []byte
+	subProto := req.Header.Get("Sec-WebSocket-Protocol")
+	respSubProto := ""
+	if subProto != "" {
+		// Try to decode as base64 (V2Ray early data / 0-RTT).
+		// If it decodes and has reasonable length, treat as early data.
+		// Otherwise echo it back as-is (e.g. "binary").
+		if decoded, err := base64.RawURLEncoding.DecodeString(subProto); err == nil && len(decoded) > 0 && len(decoded) <= 2048 {
+			earlyData = decoded
+		}
+		// Always echo the sub-protocol back — V2Ray clients expect this.
+		respSubProto = subProto
+	}
+
 	// Write HTTP 101 response
 	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + acceptKey + "\r\n" +
-		"\r\n"
+		"Sec-WebSocket-Accept: " + acceptKey + "\r\n"
+	if respSubProto != "" {
+		resp += "Sec-WebSocket-Protocol: " + respSubProto + "\r\n"
+	}
+	resp += "\r\n"
+
 	if _, err := conn.Write([]byte(resp)); err != nil {
 		return nil, fmt.Errorf("ws: write response: %w", err)
 	}
 
 	return &WSConn{
-		conn: conn,
-		br:   br,
-		path: req.URL.Path,
+		conn:      conn,
+		br:        br,
+		path:      req.URL.Path,
+		earlyData: earlyData,
 	}, nil
 }
 
 // Path returns the URL path from the upgrade request.
 func (ws *WSConn) Path() string { return ws.path }
 
+// HasEarlyData returns true if 0-RTT data was received during upgrade.
+func (ws *WSConn) HasEarlyData() bool { return len(ws.earlyData) > 0 }
+
 // Read reads the next WebSocket binary message payload.
+// If early data (0-RTT) was received during upgrade, it is returned first.
 // Handles continuation frames, ping/pong, and close frames transparently.
 func (ws *WSConn) Read(p []byte) (int, error) {
+	// Return early data first (V2Ray 0-RTT from Sec-WebSocket-Protocol)
+	if len(ws.earlyData) > 0 {
+		n := copy(p, ws.earlyData)
+		ws.earlyData = ws.earlyData[n:]
+		if len(ws.earlyData) == 0 {
+			ws.earlyData = nil
+		}
+		return n, nil
+	}
+
 	for {
 		fin, opcode, payload, err := ws.readFrame()
 		if err != nil {

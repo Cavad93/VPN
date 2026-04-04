@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
@@ -88,22 +89,39 @@ var vlessActiveConns atomic.Int64
 // destination address. We dial the destination and relay data bidirectionally.
 func (s *Server) handleVLESSConn(ctx context.Context, conn net.Conn, cfg VLESSConfig) {
 	defer conn.Close()
+	remote := conn.RemoteAddr().String()
 
-	// Set a deadline for the handshake phase
+	// Force TLS handshake and log result
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			s.logger.Warn("vless TLS handshake failed", "err", err, "remote", remote)
+			return
+		}
+		state := tlsConn.ConnectionState()
+		s.logger.Info("vless TLS ok", "proto", state.NegotiatedProtocol, "remote", remote)
+	}
+
+	// Set a deadline for the WS upgrade + VLESS header phase
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
 
 	// 1. WebSocket upgrade
 	ws, err := transport.WSUpgrade(conn, cfg.WSPath)
 	if err != nil {
-		s.logger.Warn("vless ws upgrade failed", "err", err, "remote", conn.RemoteAddr())
+		s.logger.Warn("vless ws upgrade failed", "err", err, "remote", remote)
 		return
 	}
 	defer ws.Close()
 
+	s.logger.Info("vless ws upgraded", "remote", remote)
+
 	// 2. Parse VLESS request (contains destination addr:port)
 	req, err := transport.VLESSParseRequest(ws)
 	if err != nil {
-		s.logger.Warn("vless parse request failed", "err", err, "remote", conn.RemoteAddr())
+		if errors.Is(err, io.EOF) {
+			s.logger.Info("vless client closed after upgrade (cert rejected?)", "remote", remote)
+		} else {
+			s.logger.Warn("vless parse request failed", "err", err, "remote", remote)
+		}
 		return
 	}
 
@@ -221,7 +239,22 @@ func ensureTLSCert(certPath, keyPath string, logger *slog.Logger) error {
 		return fmt.Errorf("generate key: %w", err)
 	}
 
-	// Build self-signed X.509 certificate
+	// Gather local IPs for SAN so cert validation can pass
+	var ipAddrs []net.IP
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, iface := range ifaces {
+			if addrs, err := iface.Addrs(); err == nil {
+				for _, addr := range addrs {
+					if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
+						ipAddrs = append(ipAddrs, ipNet.IP)
+					}
+				}
+			}
+		}
+	}
+	ipAddrs = append(ipAddrs, net.IPv4(127, 0, 0, 1))
+
+	// Build self-signed X.509 certificate with IP SANs
 	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
@@ -231,6 +264,7 @@ func ensureTLSCert(certPath, keyPath string, logger *slog.Logger) error {
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{"CavadVPN"},
+		IPAddresses:  ipAddrs,
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
