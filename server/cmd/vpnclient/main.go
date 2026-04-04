@@ -350,6 +350,7 @@ func (vs *vpnSession) connectUDP() (
 	err error,
 ) {
 	// 1. UDP dial with BBR congestion control.
+	log.Info("dialing UDP+BBR", "addr", vs.serverAddr)
 	udpConn, err := transport.DialUDP(vs.serverAddr)
 	if err != nil {
 		return nil, nil, "", "", nil, fmt.Errorf("udp dial: %w", err)
@@ -357,11 +358,13 @@ func (vs *vpnSession) connectUDP() (
 	cleanupConn := func() { udpConn.Close() }
 
 	// 2. TLS obfuscation handshake over UDP.
+	log.Info("starting obfs handshake (UDP)")
 	obfs := transport.NewObfsConn(udpConn)
 	if err := obfs.ClientHandshake(); err != nil {
 		cleanupConn()
 		return nil, nil, "", "", nil, fmt.Errorf("obfs handshake: %w", err)
 	}
+	log.Info("obfs handshake done (UDP)")
 
 	// 3. Noise_XX initiator handshake.
 	hs, err := crypto.NewHandshake(crypto.Initiator, vs.kp)
