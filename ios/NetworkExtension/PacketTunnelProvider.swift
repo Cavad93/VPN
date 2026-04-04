@@ -20,6 +20,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// with device→server (which uses the readPackets callback on tunnelQueue).
     private var serverReadQueue = DispatchQueue(label: "com.cavadvpn.serverRead", qos: .userInitiated)
 
+    /// SideStore compatibility: bypass Apple servers + pause support.
+    private let sideStore = SideStoreController(pauseDuration: 30, pauseCooldown: 300)
+
     // MARK: – Lifecycle
 
     override func startTunnel(
@@ -80,8 +83,26 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         _ messageData: Data,
         completionHandler: ((Data?) -> Void)?
     ) {
-        // Not used in this implementation.
-        completionHandler?(nil)
+        guard let command = String(data: messageData, encoding: .utf8) else {
+            completionHandler?(nil)
+            return
+        }
+
+        switch command {
+        case "pause":
+            // SideStore refresh: pause tunnel for 30 seconds
+            let ok = sideStore.pause()
+            let response = ok ? "paused" : "cooldown"
+            completionHandler?(response.data(using: .utf8))
+        case "resume":
+            sideStore.resume()
+            completionHandler?("resumed".data(using: .utf8))
+        case "status":
+            let status = sideStore.isPaused ? "paused:\(Int(sideStore.remainingPauseTime))" : "active"
+            completionHandler?(status.data(using: .utf8))
+        default:
+            completionHandler?(nil)
+        }
     }
 
     // MARK: – Tunnel configuration
@@ -98,8 +119,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // Route all IPv4 traffic through the tunnel
         ipv4.includedRoutes = [NEIPv4Route.default()]
         // Exclude the VPN server itself to avoid routing loops
-        let serverExclusion = NEIPv4Route(destinationAddress: config.serverHost, subnetMask: "255.255.255.255")
-        ipv4.excludedRoutes = [serverExclusion]
+        var excluded = [NEIPv4Route(destinationAddress: config.serverHost, subnetMask: "255.255.255.255")]
+        // Exclude Apple subnets so SideStore can re-sign the app
+        for route in SideStoreController.excludedRoutePairs {
+            excluded.append(NEIPv4Route(destinationAddress: route.destination, subnetMask: route.mask))
+        }
+        ipv4.excludedRoutes = excluded
         settings.ipv4Settings = ipv4
 
         // DNS — use the VPN gateway to prevent DNS leaks
@@ -137,8 +162,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private func readPacketsFromDevice() {
         packetFlow.readPackets { [weak self] packets, _ in
             guard let self = self, let client = self.vpnClient, client.isConnected else { return }
-            for packet in packets {
-                try? client.sendPacket(packet)
+            // Skip forwarding while paused (SideStore refresh)
+            if !self.sideStore.isPaused {
+                for packet in packets {
+                    try? client.sendPacket(packet)
+                }
             }
             // Re-register for the next batch of packets
             self.readPacketsFromDevice()
@@ -151,6 +179,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         while let client = vpnClient, client.isConnected {
             let packet = client.recvPacket()
             guard !packet.isEmpty else { continue }
+            // Skip forwarding while paused (SideStore refresh)
+            if sideStore.isPaused { continue }
             // AF_INET = 2
             packetFlow.writePackets([packet], withProtocols: [NSNumber(value: AF_INET)])
         }
