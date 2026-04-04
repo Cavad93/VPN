@@ -214,7 +214,7 @@ func (vw *vlessWriter) Close() error {
 // generateVLESSLink builds a vless:// URI for V2Ray clients.
 func generateVLESSLink(uuid [16]byte, host string, port int, wsPath string) string {
 	uuidStr := transport.FormatUUID(uuid)
-	return fmt.Sprintf("vless://%s@%s:%d?type=ws&security=tls&path=%s#CavadVPN",
+	return fmt.Sprintf("vless://%s@%s:%d?type=ws&security=tls&allowInsecure=1&path=%s#CavadVPN",
 		uuidStr, host, port, wsPath)
 }
 

@@ -14,7 +14,7 @@ param(
     [string]$RepoDir = "C:\CavadVPN\repo",
     [string]$BinaryPath = "C:\CavadVPN\cavad-vpn.exe",
     [string]$ServerArgs = "-addr 0.0.0.0:8443 -tun-cidr 10.8.0.1/24 -api-addr 127.0.0.1:8080",
-    [string]$VlessArgs = "",  # e.g. "-vless-addr 0.0.0.0:443 -vless-cert C:\CavadVPN\cert.pem -vless-key C:\CavadVPN\key.pem"
+    [string]$VlessArgs = "",  # e.g. "-vless-addr 0.0.0.0:8444 -vless-cert C:\CavadVPN\cert.pem -vless-key C:\CavadVPN\key.pem"
     [int]$CheckInterval = 10,
     [int]$Port = 8443
 )
