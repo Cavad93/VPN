@@ -293,15 +293,15 @@ func TestDoRetransmitIncreasesCounter(t *testing.T) {
 	c.sendMu.Lock()
 	c.pending[0] = &pendingPacket{
 		pkt:           pkt,
-		sentAt:        now.Add(-RetransmitTimeout * 2), // far in the past
-		deliveredTime: now.Add(-RetransmitTimeout * 3),
+		sentAt:        now.Add(-initialRTO * 2), // far in the past
+		deliveredTime: now.Add(-initialRTO * 3),
 	}
 	// Register in inflight tracker (doRetransmit calls OnLoss then OnSend).
 	c.bbr.inflight.OnSend(&inflightPkt{
 		SeqNum:        0,
 		Size:          5,
-		SentAt:        now.Add(-RetransmitTimeout * 2),
-		DeliveredTime: now.Add(-RetransmitTimeout * 3),
+		SentAt:        now.Add(-initialRTO * 2),
+		DeliveredTime: now.Add(-initialRTO * 3),
 	})
 	c.sendMu.Unlock()
 
@@ -327,16 +327,16 @@ func TestDoRetransmitDropsAfterMaxRetransmits(t *testing.T) {
 	c.sendMu.Lock()
 	c.pending[0] = &pendingPacket{
 		pkt:           &Packet{Type: PacketTypeData, SeqNum: 0, Payload: []byte("x")},
-		sentAt:        now.Add(-RetransmitTimeout * 2),
+		sentAt:        now.Add(-initialRTO * 2),
 		retransmits:   MaxRetransmits, // already at max
-		deliveredTime: now.Add(-RetransmitTimeout * 3),
+		deliveredTime: now.Add(-initialRTO * 3),
 	}
 	// Register in inflight tracker.
 	c.bbr.inflight.OnSend(&inflightPkt{
 		SeqNum:        0,
 		Size:          1,
-		SentAt:        now.Add(-RetransmitTimeout * 2),
-		DeliveredTime: now.Add(-RetransmitTimeout * 3),
+		SentAt:        now.Add(-initialRTO * 2),
+		DeliveredTime: now.Add(-initialRTO * 3),
 	})
 	c.sendMu.Unlock()
 
@@ -365,7 +365,7 @@ func TestDoRetransmitBBRNoHalving(t *testing.T) {
 	c.sendMu.Lock()
 	c.pending[0] = &pendingPacket{
 		pkt:    &Packet{Type: PacketTypeData, SeqNum: 0, Payload: []byte("x")},
-		sentAt: time.Now().Add(-RetransmitTimeout * 2),
+		sentAt: time.Now().Add(-initialRTO * 2),
 	}
 	c.sendMu.Unlock()
 

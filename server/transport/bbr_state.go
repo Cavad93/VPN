@@ -49,8 +49,9 @@ const (
 	// probeBWCwndGain: 2× BDP headroom during ProbeBW.
 	probeBWCwndGain = 2.0
 
-	// probeRTTCwndPackets: minimum cwnd during ProbeRTT (4 packets).
+	// probeRTTCwndPackets: minimum cwnd during ProbeRTT.
 	probeRTTCwndPackets = 4
+	// Note: actual ProbeRTT uses max(probeRTTCwndPackets, minCwndPackets).
 
 	// probeRTTDuration: how long to hold minimum cwnd in ProbeRTT.
 	probeRTTDuration = 200 * time.Millisecond
@@ -61,8 +62,8 @@ const (
 	// fullBwCount: number of rounds without BtlBw growth to exit Startup.
 	fullBwCountMax = 3
 
-	// minCwndPackets: absolute minimum cwnd.
-	minCwndPackets = 4
+	// minCwndPackets: absolute minimum cwnd (Linux IW10).
+	minCwndPackets = 10
 )
 
 // ProbeBW 8-phase pacing gains. Each phase lasts ~1 RTT.

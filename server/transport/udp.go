@@ -31,14 +31,18 @@ const (
 	// MaxWindowSize caps the congestion window.
 	MaxWindowSize = 64
 
-	// RetransmitTimeout is how long to wait before retransmitting an unACKed packet.
-	RetransmitTimeout = 200 * time.Millisecond
+	// initialRTO is the retransmission timeout before any RTT samples.
+	initialRTO = 1 * time.Second
+	// minRTO prevents too-aggressive retransmission on fast paths.
+	minRTO = 200 * time.Millisecond
+	// maxRTO caps the retransmit timeout to prevent excessive waiting.
+	maxRTO = 10 * time.Second
 
 	// MaxRetransmits is the maximum number of retransmission attempts before dropping.
 	MaxRetransmits = 10
 
 	// retransmitTick is how often the retransmit loop wakes up.
-	retransmitTick = RetransmitTimeout / 4
+	retransmitTick = 50 * time.Millisecond
 )
 
 // Packet is a transport-layer PDU carrying reliability metadata.
@@ -136,6 +140,12 @@ type Conn struct {
 	// Congestion control: BBR (user-space).
 	bbr *BBRState
 
+	// Adaptive RTO (RFC 6298): SRTT + 4×RTTVAR, clamped to [minRTO, maxRTO].
+	rtoMu  sync.Mutex
+	srtt   time.Duration // smoothed RTT
+	rttvar time.Duration // RTT variance
+	rto    time.Duration // current retransmission timeout
+
 	readCh    chan []byte
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -165,6 +175,7 @@ func newConn(conn *net.UDPConn, remote *net.UDPAddr, ownConn bool) *Conn {
 		recvBuf: make(map[uint32]*Packet),
 		readCh:  make(chan []byte, 256),
 		bbr:     bbr,
+		rto:     initialRTO,
 		ctx:     ctx,
 		cancel:  cancel,
 		closed:  make(chan struct{}),
@@ -271,6 +282,44 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 	return nil
 }
 
+// updateRTO implements RFC 6298 SRTT/RTTVAR calculation and updates c.rto.
+func (c *Conn) updateRTO(rtt time.Duration) {
+	c.rtoMu.Lock()
+	defer c.rtoMu.Unlock()
+
+	if c.srtt == 0 {
+		// First measurement (RFC 6298 §2.2).
+		c.srtt = rtt
+		c.rttvar = rtt / 2
+	} else {
+		// Subsequent measurements (RFC 6298 §2.3).
+		// RTTVAR = (1 - β) × RTTVAR + β × |SRTT - R|, β = 1/4
+		diff := c.srtt - rtt
+		if diff < 0 {
+			diff = -diff
+		}
+		c.rttvar = (3*c.rttvar + diff) / 4
+		// SRTT = (1 - α) × SRTT + α × R, α = 1/8
+		c.srtt = (7*c.srtt + rtt) / 8
+	}
+
+	// RTO = SRTT + 4 × RTTVAR, clamped to [minRTO, maxRTO].
+	c.rto = c.srtt + 4*c.rttvar
+	if c.rto < minRTO {
+		c.rto = minRTO
+	}
+	if c.rto > maxRTO {
+		c.rto = maxRTO
+	}
+}
+
+// getRTO returns the current adaptive retransmission timeout.
+func (c *Conn) getRTO() time.Duration {
+	c.rtoMu.Lock()
+	defer c.rtoMu.Unlock()
+	return c.rto
+}
+
 // processACK handles an incoming ACK, releasing pending packets up to ackNum
 // and feeding the BBR estimator with per-ACK measurements.
 func (c *Conn) processACK(ackNum uint32) {
@@ -284,10 +333,13 @@ func (c *Conn) processACK(ackNum uint32) {
 			delete(c.pending, seq)
 			cleared++
 
-			// Compute RTT for this packet.
+			// Only use RTT from non-retransmitted packets (Karn's algorithm).
 			rtt := now.Sub(pp.sentAt)
 			if rtt < 0 {
 				rtt = time.Microsecond // safety floor
+			}
+			if pp.retransmits == 0 {
+				c.updateRTO(rtt)
 			}
 
 			// Build inflight metadata for BBR.
@@ -422,8 +474,9 @@ func (c *Conn) doRetransmit() {
 	dropped := 0
 	lostBytes := int64(0)
 	now := time.Now()
+	rto := c.getRTO()
 	for seq, pp := range c.pending {
-		if now.Sub(pp.sentAt) < RetransmitTimeout {
+		if now.Sub(pp.sentAt) < rto {
 			continue
 		}
 		if pp.retransmits >= MaxRetransmits {
