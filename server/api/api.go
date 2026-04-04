@@ -149,6 +149,9 @@ func (a *APIServer) registerRoutes() {
 	// Web dashboard and logs.
 	a.registerDashboardRoutes()
 
+	// Diagnostics: server metrics, speed test, combined view.
+	a.registerDiagnosticsRoutes()
+
 	// Health — no authentication.
 	a.mux.HandleFunc("GET /api/v1/health", a.handleHealth)
 

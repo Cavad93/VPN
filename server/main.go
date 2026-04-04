@@ -1402,6 +1402,19 @@ func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *sl
 	var analyzer *api.TelemetryAnalyzer
 	if anthropicKey != "" {
 		analyzer = api.NewTelemetryAnalyzer(telemetryStore, api.SonnetAnalyze, anthropicKey, time.Hour)
+		// Feed server-side perf data into analysis.
+		if srv.Perf != nil {
+			perfRef := srv.Perf
+			analyzer.GetServerPerf = func() *api.ServerPerfSummary {
+				snap := perfRef.Snapshot()
+				s := api.SummarizePerf(snap)
+				return &s
+			}
+		}
+		analyzer.GetServerMetrics = func() *api.ServerMetrics {
+			m := api.CollectServerMetrics()
+			return &m
+		}
 		analyzer.Start()
 		logger.Info("telemetry AI analysis enabled (hourly)")
 	} else {

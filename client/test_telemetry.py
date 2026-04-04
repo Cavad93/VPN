@@ -16,6 +16,8 @@ from telemetry import (
     _detect_platform,
     _get_local_ip,
     measure_tcp_ping,
+    measure_dns_resolve,
+    estimate_packet_loss,
     create_telemetry_collector,
 )
 
@@ -178,7 +180,20 @@ class TestCollector:
         assert tc._dpi_detected is True
 
 
+def _patch_io(fn):
+    """Decorator to mock all network I/O in telemetry collection."""
+    @patch("telemetry.measure_dns_resolve", return_value=3.0)
+    @patch("telemetry.estimate_packet_loss", return_value=0.0)
+    @patch("telemetry.measure_download_speed", return_value=0.0)
+    @patch("telemetry.measure_upload_speed", return_value=0.0)
+    @patch("telemetry.measure_tcp_ping", return_value=15.0)
+    def wrapper(*args, **kwargs):
+        return fn(args[0])  # pass self only
+    return wrapper
+
+
 class TestCollectorCollect:
+    @_patch_io
     def test_collect_basic(self):
         cfg = TelemetryConfig(
             server_url="http://localhost:8080",
@@ -200,6 +215,7 @@ class TestCollectorCollect:
         assert report.app_version == "2.0.0"
         assert report.timestamp  # non-empty
 
+    @_patch_io
     def test_collect_with_state_callback(self):
         def get_state():
             return {
@@ -216,6 +232,7 @@ class TestCollectorCollect:
         assert report.connection_state == "connected"
         assert report.server_addr == "127.0.0.1:9999"
 
+    @_patch_io
     def test_throughput_calculation(self):
         cfg = TelemetryConfig(
             server_url="http://localhost:8080",
@@ -232,6 +249,7 @@ class TestCollectorCollect:
         assert report.throughput_in_kbps > 0
         assert report.throughput_out_kbps > 0
 
+    @_patch_io
     def test_jitter_calculation(self):
         cfg = TelemetryConfig(
             server_url="http://localhost:8080",
@@ -268,7 +286,12 @@ class _TelemetryHandler(BaseHTTPRequestHandler):
 
 
 class TestCollectorSend:
-    def test_send_to_server(self):
+    @patch("telemetry.measure_dns_resolve", return_value=5.0)
+    @patch("telemetry.estimate_packet_loss", return_value=0.0)
+    @patch("telemetry.measure_download_speed", return_value=0.0)
+    @patch("telemetry.measure_upload_speed", return_value=0.0)
+    @patch("telemetry.measure_tcp_ping", return_value=10.0)
+    def test_send_to_server(self, *_):
         _TelemetryHandler.received = []
         server = HTTPServer(("127.0.0.1", 0), _TelemetryHandler)
         port = server.server_address[1]
@@ -292,7 +315,12 @@ class TestCollectorSend:
         assert data["device_id"] == "sendtest"
         assert data["bytes_in"] == 100
 
-    def test_send_failure(self):
+    @patch("telemetry.measure_dns_resolve", return_value=0.0)
+    @patch("telemetry.estimate_packet_loss", return_value=0.0)
+    @patch("telemetry.measure_download_speed", return_value=0.0)
+    @patch("telemetry.measure_upload_speed", return_value=0.0)
+    @patch("telemetry.measure_tcp_ping", return_value=0.0)
+    def test_send_failure(self, *_):
         cfg = TelemetryConfig(
             server_url="http://127.0.0.1:1",  # unreachable
             device_id="fail",
@@ -308,6 +336,7 @@ class TestCollectorSend:
 # ---------------------------------------------------------------------------
 
 class TestCollectorLifecycle:
+    @_patch_io
     def test_start_stop(self):
         cfg = TelemetryConfig(
             server_url="http://127.0.0.1:1",
@@ -321,6 +350,7 @@ class TestCollectorLifecycle:
         tc.stop()
         assert not tc._thread.is_alive() if tc._thread else True
 
+    @_patch_io
     def test_double_start(self):
         cfg = TelemetryConfig(
             server_url="http://127.0.0.1:1",
@@ -338,6 +368,62 @@ class TestCollectorLifecycle:
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
+
+class TestDNSResolve:
+    def test_measure_dns_resolve(self):
+        ms = measure_dns_resolve("localhost")
+        assert ms >= 0
+
+    @patch("telemetry.socket.getaddrinfo", side_effect=OSError("fail"))
+    def test_dns_resolve_failure(self, _):
+        ms = measure_dns_resolve("nonexistent.invalid")
+        assert ms == 0.0
+
+
+class TestPacketLoss:
+    def test_no_loss_localhost(self):
+        import socket as _s
+        srv = _s.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        port = srv.getsockname()[1]
+
+        loss = estimate_packet_loss("127.0.0.1", port, count=3, timeout=1.0)
+        srv.close()
+        assert loss == 0.0
+
+    def test_full_loss(self):
+        loss = estimate_packet_loss("192.0.2.1", 1, count=2, timeout=0.3)
+        assert loss > 0
+
+    def test_zero_count(self):
+        assert estimate_packet_loss("x", 1, count=0) == 0.0
+
+
+class TestNewReportFields:
+    @_patch_io
+    def test_dns_field_present(self):
+        cfg = TelemetryConfig(server_url="http://localhost:8080", device_id="d1")
+        tc = TelemetryCollector(cfg)
+        report = tc.collect_now()
+        assert hasattr(report, "dns_resolve_ms")
+        assert report.dns_resolve_ms >= 0
+
+    @_patch_io
+    def test_speed_fields_present(self):
+        cfg = TelemetryConfig(server_url="http://localhost:8080", device_id="d1")
+        tc = TelemetryCollector(cfg)
+        report = tc.collect_now()
+        assert hasattr(report, "download_speed_kbps")
+        assert hasattr(report, "upload_speed_kbps")
+
+    @_patch_io
+    def test_packet_loss_field(self):
+        cfg = TelemetryConfig(server_url="http://localhost:8080", device_id="d1")
+        tc = TelemetryCollector(cfg, get_vpn_state=lambda: {"server_addr": "1.2.3.4:443", "state": "connected"})
+        report = tc.collect_now()
+        assert hasattr(report, "packet_loss_percent")
+
 
 class TestFactory:
     def test_create_telemetry_collector(self):

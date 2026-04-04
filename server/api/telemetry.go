@@ -72,6 +72,13 @@ type TelemetryReport struct {
 	DPIDetected   bool    `json:"dpi_detected,omitempty"`    // client suspects DPI interference
 	TLSErrors     int     `json:"tls_errors,omitempty"`      // TLS handshake failures
 
+	// DNS
+	DNSResolveMs float64 `json:"dns_resolve_ms,omitempty"` // DNS resolution time
+
+	// Speed test
+	DownloadSpeedKbps float64 `json:"download_speed_kbps,omitempty"` // measured download speed
+	UploadSpeedKbps   float64 `json:"upload_speed_kbps,omitempty"`   // measured upload speed
+
 	// System
 	CPUPercent    float64 `json:"cpu_percent,omitempty"`     // app CPU usage
 	MemoryMB      float64 `json:"memory_mb,omitempty"`       // app memory usage
@@ -216,8 +223,8 @@ func (ts *TelemetryStore) LastAnalysis() *AnalysisResult {
 // ---------------------------------------------------------------------------
 
 // AnalyzerFunc is a function that analyzes telemetry reports and returns a result.
-// It receives a context, the reports to analyze, and the Anthropic API key.
-type AnalyzerFunc func(ctx context.Context, reports []TelemetryReport, apiKey string) (*AnalysisResult, error)
+// It receives a context, the reports to analyze, the Anthropic API key, and optional server perf data.
+type AnalyzerFunc func(ctx context.Context, reports []TelemetryReport, apiKey string, serverPerf *ServerPerfSummary, serverMetrics *ServerMetrics) (*AnalysisResult, error)
 
 // TelemetryAnalyzer runs periodic AI analysis of telemetry data.
 type TelemetryAnalyzer struct {
@@ -227,6 +234,9 @@ type TelemetryAnalyzer struct {
 	interval time.Duration
 	cancel   context.CancelFunc
 	done     chan struct{}
+	// Optional: callbacks to get server-side data for enriching analysis.
+	GetServerPerf    func() *ServerPerfSummary
+	GetServerMetrics func() *ServerMetrics
 }
 
 // NewTelemetryAnalyzer creates an analyzer that runs every interval.
@@ -288,7 +298,17 @@ func (ta *TelemetryAnalyzer) runOnce(ctx context.Context) *AnalysisResult {
 		return result
 	}
 
-	result, err := ta.analyze(ctx, reports, ta.apiKey)
+	// Gather server-side data.
+	var perfSummary *ServerPerfSummary
+	var srvMetrics *ServerMetrics
+	if ta.GetServerPerf != nil {
+		perfSummary = ta.GetServerPerf()
+	}
+	if ta.GetServerMetrics != nil {
+		srvMetrics = ta.GetServerMetrics()
+	}
+
+	result, err := ta.analyze(ctx, reports, ta.apiKey, perfSummary, srvMetrics)
 	if err != nil {
 		result = &AnalysisResult{
 			Timestamp:   time.Now(),
@@ -306,13 +326,13 @@ func (ta *TelemetryAnalyzer) runOnce(ctx context.Context) *AnalysisResult {
 // ---------------------------------------------------------------------------
 
 // SonnetAnalyze calls Claude Sonnet API to analyze telemetry reports.
-func SonnetAnalyze(ctx context.Context, reports []TelemetryReport, apiKey string) (*AnalysisResult, error) {
+func SonnetAnalyze(ctx context.Context, reports []TelemetryReport, apiKey string, serverPerf *ServerPerfSummary, serverMetrics *ServerMetrics) (*AnalysisResult, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("anthropic API key not configured")
 	}
 
 	// Build analysis prompt.
-	prompt := buildAnalysisPrompt(reports)
+	prompt := buildAnalysisPrompt(reports, serverPerf, serverMetrics)
 
 	// Call Anthropic Messages API.
 	body := map[string]interface{}{
@@ -370,7 +390,7 @@ func SonnetAnalyze(ctx context.Context, reports []TelemetryReport, apiKey string
 }
 
 // buildAnalysisPrompt creates the prompt for Sonnet from telemetry data.
-func buildAnalysisPrompt(reports []TelemetryReport) string {
+func buildAnalysisPrompt(reports []TelemetryReport, serverPerf *ServerPerfSummary, serverMetrics *ServerMetrics) string {
 	// Aggregate per-device stats.
 	type deviceStats struct {
 		Platform       string
@@ -384,6 +404,9 @@ func buildAnalysisPrompt(reports []TelemetryReport) string {
 		Reconnects     int
 		DPIDetected    int
 		TLSErrors      int
+		AvgDNSMs       float64
+		AvgDownloadKbps float64
+		AvgUploadKbps  float64
 		NetworkTypes   map[string]int
 		States         map[string]int
 	}
@@ -415,6 +438,9 @@ func buildAnalysisPrompt(reports []TelemetryReport) string {
 			ds.DPIDetected++
 		}
 		ds.TLSErrors += r.TLSErrors
+		ds.AvgDNSMs += r.DNSResolveMs
+		ds.AvgDownloadKbps += r.DownloadSpeedKbps
+		ds.AvgUploadKbps += r.UploadSpeedKbps
 		ds.NetworkTypes[r.NetworkType]++
 		ds.States[r.ConnectionState]++
 	}
@@ -426,6 +452,27 @@ func buildAnalysisPrompt(reports []TelemetryReport) string {
 			ds.AvgLossPercent /= float64(ds.ReportCount)
 			ds.AvgThroughIn /= float64(ds.ReportCount)
 			ds.AvgThroughOut /= float64(ds.ReportCount)
+			ds.AvgDNSMs /= float64(ds.ReportCount)
+			// Speed tests run less frequently; average only non-zero values.
+			downloadCount := 0.0
+			uploadCount := 0.0
+			for _, r := range reports {
+				if r.DeviceID == "" {
+					continue
+				}
+				if r.DownloadSpeedKbps > 0 {
+					downloadCount++
+				}
+				if r.UploadSpeedKbps > 0 {
+					uploadCount++
+				}
+			}
+			if downloadCount > 0 {
+				ds.AvgDownloadKbps /= downloadCount
+			}
+			if uploadCount > 0 {
+				ds.AvgUploadKbps /= uploadCount
+			}
 		}
 	}
 
@@ -447,23 +494,55 @@ func buildAnalysisPrompt(reports []TelemetryReport) string {
 		prompt += fmt.Sprintf("- Avg packet loss: %.2f%%, Max: %.2f%%\n", ds.AvgLossPercent, ds.MaxLossPercent)
 		prompt += fmt.Sprintf("- Avg throughput: ↓%.1f kbps, ↑%.1f kbps\n", ds.AvgThroughIn, ds.AvgThroughOut)
 		prompt += fmt.Sprintf("- Reconnects: %d, DPI detections: %d, TLS errors: %d\n", ds.Reconnects, ds.DPIDetected, ds.TLSErrors)
+		prompt += fmt.Sprintf("- Avg DNS resolve: %.1f ms\n", ds.AvgDNSMs)
+		if ds.AvgDownloadKbps > 0 || ds.AvgUploadKbps > 0 {
+			prompt += fmt.Sprintf("- Speed test: ↓%.0f kbps, ↑%.0f kbps\n", ds.AvgDownloadKbps, ds.AvgUploadKbps)
+		}
 		prompt += fmt.Sprintf("- Network types: %v\n", ds.NetworkTypes)
 		prompt += fmt.Sprintf("- Connection states: %v\n\n", ds.States)
 	}
 
+	// Server-side performance data.
+	if serverPerf != nil {
+		prompt += "## Server Per-Layer Latency (P95, microseconds)\n\n"
+		prompt += fmt.Sprintf("- TLS obfuscation write: %.0f µs, read: %.0f µs\n", serverPerf.ObfsWriteP95Us, serverPerf.ObfsReadP95Us)
+		prompt += fmt.Sprintf("- Noise encrypt: %.0f µs, decrypt: %.0f µs\n", serverPerf.NoiseEncryptP95Us, serverPerf.NoiseDecryptP95Us)
+		prompt += fmt.Sprintf("- Mux write: %.0f µs, read: %.0f µs\n", serverPerf.MuxWriteP95Us, serverPerf.MuxReadP95Us)
+		prompt += fmt.Sprintf("- TUN write: %.0f µs, read: %.0f µs\n", serverPerf.TunWriteP95Us, serverPerf.TunReadP95Us)
+		prompt += fmt.Sprintf("- Full ingress (socket→TUN): %.0f µs, egress (TUN→socket): %.0f µs\n", serverPerf.FullIngressP95Us, serverPerf.FullEgressP95Us)
+		prompt += fmt.Sprintf("- Handshake mean: %.0f µs\n", serverPerf.HandshakeMeanUs)
+		prompt += fmt.Sprintf("- TCP retransmits: %d, lost segments: %d, cwnd: %d segs\n", serverPerf.RetransmitCount, serverPerf.TCPLostSegs, serverPerf.TCPCwndSegs)
+		if serverPerf.TCPRTTUs > 0 {
+			prompt += fmt.Sprintf("- TCP RTT: %d µs (%.1f ms)\n", serverPerf.TCPRTTUs, float64(serverPerf.TCPRTTUs)/1000)
+		}
+		prompt += "\n"
+	}
+
+	// Server resource usage.
+	if serverMetrics != nil {
+		prompt += "## Server Resources\n\n"
+		prompt += fmt.Sprintf("- CPU: %.1f%%\n", serverMetrics.CPUPercent)
+		prompt += fmt.Sprintf("- Memory (RSS): %.1f MB, Heap: %.1f MB\n", serverMetrics.MemoryMB, serverMetrics.HeapAllocMB)
+		prompt += fmt.Sprintf("- Goroutines: %d\n", serverMetrics.NumGoroutines)
+		prompt += fmt.Sprintf("- GC pauses: %.0f µs, total cycles: %d\n", serverMetrics.GCPauseUs, serverMetrics.NumGC)
+		prompt += fmt.Sprintf("- Uptime: %.0f sec\n\n", serverMetrics.UptimeSec)
+	}
+
 	prompt += `## Instructions
+Analyze the data above and identify the bottleneck causing slow VPN speed.
+Consider: DPI throttling, server CPU/memory, encryption overhead, obfuscation latency, TCP retransmits, packet loss, network jitter, congestion window.
 Respond with EXACTLY this JSON structure (no markdown, no extra text):
 {
-  "summary": "One paragraph overview of the network health",
+  "summary": "One paragraph overview of the network health and bottleneck location",
   "issues": [
     {
       "severity": "critical|warning|info",
-      "category": "latency|packet_loss|throughput|dpi|connection|obfuscation",
-      "description": "Description of the issue",
+      "category": "latency|packet_loss|throughput|dpi|connection|obfuscation|server_resources|tcp",
+      "description": "Description of the issue with specific numbers",
       "affected_devices": ["device_id_prefix"]
     }
   ],
-  "recommendations": ["Action item 1", "Action item 2"]
+  "recommendations": ["Specific action item 1", "Specific action item 2"]
 }
 `
 	return prompt

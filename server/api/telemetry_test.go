@@ -272,7 +272,7 @@ func TestAnalyzerRunOnce(t *testing.T) {
 	})
 
 	// Mock analyzer function.
-	mockFn := func(ctx context.Context, reports []TelemetryReport, apiKey string) (*AnalysisResult, error) {
+	mockFn := func(ctx context.Context, reports []TelemetryReport, apiKey string, _ *ServerPerfSummary, _ *ServerMetrics) (*AnalysisResult, error) {
 		return &AnalysisResult{
 			Timestamp:   time.Now(),
 			ReportCount: len(reports),
@@ -303,7 +303,7 @@ func TestAnalyzerRunOnce(t *testing.T) {
 
 func TestAnalyzerNoReports(t *testing.T) {
 	store := NewTelemetryStore(100)
-	mockFn := func(ctx context.Context, reports []TelemetryReport, apiKey string) (*AnalysisResult, error) {
+	mockFn := func(ctx context.Context, reports []TelemetryReport, apiKey string, _ *ServerPerfSummary, _ *ServerMetrics) (*AnalysisResult, error) {
 		t.Fatal("should not be called with no reports")
 		return nil, nil
 	}
@@ -318,7 +318,7 @@ func TestAnalyzerError(t *testing.T) {
 	store := NewTelemetryStore(100)
 	store.Add(TelemetryReport{DeviceID: "d1", Platform: "ios"})
 
-	mockFn := func(ctx context.Context, reports []TelemetryReport, apiKey string) (*AnalysisResult, error) {
+	mockFn := func(ctx context.Context, reports []TelemetryReport, apiKey string, _ *ServerPerfSummary, _ *ServerMetrics) (*AnalysisResult, error) {
 		return nil, fmt.Errorf("API timeout")
 	}
 	analyzer := NewTelemetryAnalyzer(store, mockFn, "key", time.Hour)
@@ -334,7 +334,7 @@ func TestHandleTriggerAnalysis(t *testing.T) {
 	a := NewAPIServer(cfg, srv, testLogger())
 	store := NewTelemetryStore(1000)
 
-	mockFn := func(ctx context.Context, reports []TelemetryReport, apiKey string) (*AnalysisResult, error) {
+	mockFn := func(ctx context.Context, reports []TelemetryReport, apiKey string, _ *ServerPerfSummary, _ *ServerMetrics) (*AnalysisResult, error) {
 		return &AnalysisResult{Summary: "triggered"}, nil
 	}
 	analyzer := NewTelemetryAnalyzer(store, mockFn, "key", time.Hour)
@@ -368,7 +368,7 @@ func TestBuildAnalysisPrompt(t *testing.T) {
 		{DeviceID: "eeff0011", Platform: "ios", PingMs: 50, NetworkType: "cellular", ConnectionState: "connected"},
 	}
 
-	prompt := buildAnalysisPrompt(reports)
+	prompt := buildAnalysisPrompt(reports, nil, nil)
 	if len(prompt) < 100 {
 		t.Error("prompt too short")
 	}

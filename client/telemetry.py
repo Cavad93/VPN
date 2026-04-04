@@ -84,6 +84,13 @@ class TelemetryReport:
     dpi_detected: bool = False
     tls_errors: int = 0
 
+    # DNS
+    dns_resolve_ms: float = 0.0
+
+    # Speed test
+    download_speed_kbps: float = 0.0
+    upload_speed_kbps: float = 0.0
+
     # System
     cpu_percent: float = 0.0
     memory_mb: float = 0.0
@@ -136,6 +143,69 @@ def measure_tcp_ping(host: str, port: int, timeout: float = 5.0) -> float:
         return round(elapsed, 2)
     except Exception:
         return 0.0
+
+
+def measure_dns_resolve(hostname: str = "google.com") -> float:
+    """Measure DNS resolution time in milliseconds."""
+    try:
+        start = time.monotonic()
+        socket.getaddrinfo(hostname, 443, socket.AF_INET)
+        return round((time.monotonic() - start) * 1000, 2)
+    except Exception:
+        return 0.0
+
+
+def measure_download_speed(url: str, timeout: float = 10.0) -> float:
+    """Measure download speed from a URL in kbit/s."""
+    try:
+        req = urllib.request.Request(url)
+        start = time.monotonic()
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        data = resp.read()
+        elapsed = time.monotonic() - start
+        resp.close()
+        if elapsed > 0:
+            return round((len(data) * 8) / (elapsed * 1000), 2)
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def measure_upload_speed(url: str, size: int = 524288, timeout: float = 10.0) -> float:
+    """Measure upload speed to a URL in kbit/s. Sends `size` random bytes."""
+    try:
+        data = os.urandom(size)
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        start = time.monotonic()
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        resp.read()
+        resp.close()
+        elapsed = time.monotonic() - start
+        if elapsed > 0:
+            return round((size * 8) / (elapsed * 1000), 2)
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def estimate_packet_loss(host: str, port: int, count: int = 5, timeout: float = 2.0) -> float:
+    """Estimate packet loss by attempting multiple TCP connections."""
+    if count <= 0:
+        return 0.0
+    successes = 0
+    for _ in range(count):
+        try:
+            s = socket.create_connection((host, port), timeout=timeout)
+            s.close()
+            successes += 1
+        except Exception:
+            pass
+    loss = ((count - successes) / count) * 100
+    return round(loss, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -289,12 +359,39 @@ class TelemetryCollector:
             except Exception:
                 pass
 
+        host = ""
+        port = 0
         if server_addr:
             try:
                 host, port_str = server_addr.rsplit(":", 1)
-                ping_ms = measure_tcp_ping(host, int(port_str))
+                port = int(port_str)
+                ping_ms = measure_tcp_ping(host, port)
             except Exception:
                 pass
+
+        # DNS resolution time.
+        dns_ms = measure_dns_resolve()
+
+        # Packet loss estimation (3 probes to minimize overhead).
+        packet_loss = 0.0
+        if host and port:
+            packet_loss = estimate_packet_loss(host, port, count=3, timeout=2.0)
+
+        # Speed test (only every 6th collection ~30 min to avoid overhead).
+        download_kbps = 0.0
+        upload_kbps = 0.0
+        if hasattr(self, '_speed_test_counter'):
+            self._speed_test_counter += 1
+        else:
+            self._speed_test_counter = 0
+        if self._speed_test_counter % 6 == 0 and self._config.server_url:
+            base = self._config.server_url.rstrip("/")
+            download_kbps = measure_download_speed(
+                base + "/api/v1/speedtest/download?size=524288", timeout=10.0
+            )
+            upload_kbps = measure_upload_speed(
+                base + "/api/v1/speedtest/upload", size=262144, timeout=10.0
+            )
 
         # Calculate jitter from ping history.
         jitter_ms = 0.0
@@ -352,11 +449,15 @@ class TelemetryCollector:
                 bytes_out=self._bytes_out,
                 throughput_in_kbps=throughput_in,
                 throughput_out_kbps=throughput_out,
+                packet_loss_percent=packet_loss,
                 network_type=_detect_network_type(),
                 local_ip=_get_local_ip(),
                 obfs_latency_ms=0.0,
                 dpi_detected=self._dpi_detected,
                 tls_errors=self._tls_errors,
+                dns_resolve_ms=dns_ms,
+                download_speed_kbps=download_kbps,
+                upload_speed_kbps=upload_kbps,
             )
 
         return report
