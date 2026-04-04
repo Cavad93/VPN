@@ -188,9 +188,11 @@ type bbrEstimator struct {
 
 // newBBREstimator creates a new estimator with empty filters.
 func newBBREstimator() *bbrEstimator {
+	now := time.Now()
 	return &bbrEstimator{
-		rtpropFilter: newWindowedMinFilter(rtpropFilterLen),
-		btlbwFilter:  newWindowedMaxFilter(btlbwFilterLen),
+		rtpropFilter:  newWindowedMinFilter(rtpropFilterLen),
+		btlbwFilter:   newWindowedMaxFilter(btlbwFilterLen),
+		deliveredTime: now, // initialize to now — prevents first ACK from computing zero delivery rate
 	}
 }
 
@@ -221,21 +223,31 @@ func (e *bbrEstimator) OnACK(
 	e.deliveredTime = now
 
 	// 2. Compute delivery rate for this ACK.
-	//    delivery_rate = (delivered_now - delivered_at_send) / (time_now - delivered_time_at_send)
+	//    delivery_rate = (delivered_now - delivered_at_send) / max(ack_elapsed, send_elapsed)
 	//    This is the "per-ACK" delivery rate from the BBR paper §4.1.
+	//    We use max(ack_elapsed, send_elapsed) per the Linux BBR implementation
+	//    to avoid overestimating the rate when ACKs are compressed.
 	var deliveryRate int64
 	deliveredInterval := e.delivered - sendDelivered
-	timeInterval := now.Sub(sendDeliveredTime)
+	ackElapsed := now.Sub(sendDeliveredTime) // time since last delivery at send time
+	sendElapsed := now.Sub(sendTime)          // time since the packet was sent (≈ RTT)
+	timeInterval := ackElapsed
+	if sendElapsed > timeInterval {
+		timeInterval = sendElapsed
+	}
 	if timeInterval > 0 && deliveredInterval > 0 {
 		deliveryRate = deliveredInterval * int64(time.Second) / int64(timeInterval)
 	}
 
 	// 3. Update round-trip counter.
-	//    A "round" completes when we receive an ACK for a packet sent AFTER
-	//    the start of the round. We track this via delivered thresholds.
-	if e.delivered >= e.nextRoundDelivered {
+	//    A "round" completes when we ACK a packet whose sendDelivered >=
+	//    nextRoundDelivered — i.e., a packet sent AFTER the previous round
+	//    started. This matches the Linux BBR round counting logic.
+	e.roundStart = false // reset each ACK
+	if sendDelivered >= e.nextRoundDelivered {
 		e.roundCount++
 		e.roundStart = true
+		// Next round starts when we ACK a packet sent with delivered >= current.
 		e.nextRoundDelivered = e.delivered
 	}
 
@@ -313,6 +325,13 @@ func (e *bbrEstimator) RoundCount() int64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.roundCount
+}
+
+// IsRoundStart returns true if the most recent OnACK call started a new round.
+func (e *bbrEstimator) IsRoundStart() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.roundStart
 }
 
 // RTpropExpired returns true if RTprop hasn't been refreshed within its window.

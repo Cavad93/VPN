@@ -250,7 +250,18 @@ func (s *BBRState) OnLoss(lostBytes int64) {
 func (s *BBRState) onACKStartup() {
 	btlbw := s.estimator.BtlBw()
 
-	// Check if BtlBw is still growing.
+	// Pacing: aggressive probing on every ACK.
+	s.pacingRate = int64(float64(btlbw) * startupPacingGain)
+	s.cwndTarget = s.bdpPackets(startupCwndGain)
+
+	// Check BtlBw growth ONLY at round boundaries (not per-ACK).
+	// The BBR paper specifies: "exit Startup after 3 consecutive *rounds*
+	// without 25% BtlBw growth." Checking per-ACK causes premature exit
+	// because multiple ACKs within the same RTT report similar delivery rates.
+	if !s.estimator.IsRoundStart() {
+		return
+	}
+
 	if float64(btlbw) >= float64(s.fullBw)*fullBwThreshold {
 		// Still growing — reset counter.
 		s.fullBw = btlbw
@@ -259,11 +270,7 @@ func (s *BBRState) onACKStartup() {
 		s.fullBwCount++
 	}
 
-	// Pacing: aggressive probing.
-	s.pacingRate = int64(float64(btlbw) * startupPacingGain)
-	s.cwndTarget = s.bdpPackets(startupCwndGain)
-
-	// Exit Startup if BtlBw hasn't grown for 3 rounds.
+	// Exit Startup if BtlBw hasn't grown for 3 consecutive rounds.
 	if s.fullBwCount >= fullBwCountMax {
 		s.enterDrain()
 	}
