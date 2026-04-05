@@ -278,7 +278,7 @@ func newStream(id uint32, mux *Mux) *Stream {
 	return &Stream{
 		id:           id,
 		mux:          mux,
-		readCh:       make(chan []byte, 8192), // large buffer prevents packet drops under load
+		readCh:       make(chan []byte, 8192), // large buffer avoids drops (non-blocking dispatch)
 		remoteClosed: make(chan struct{}),
 		closed:       make(chan struct{}),
 	}

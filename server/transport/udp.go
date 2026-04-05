@@ -33,9 +33,11 @@ const (
 	MaxPayloadSize = 1460
 
 	// initialRTO is the retransmission timeout before any RTT samples.
-	initialRTO = 1 * time.Second
+	// 300ms is sufficient for most paths; 1s was causing 1-second stalls on first loss.
+	initialRTO = 300 * time.Millisecond
 	// minRTO prevents too-aggressive retransmission on fast paths.
-	minRTO = 200 * time.Millisecond
+	// 50ms is the RFC 6298 recommended minimum; 200ms was adding unnecessary latency.
+	minRTO = 50 * time.Millisecond
 	// maxRTO caps the retransmit timeout to prevent excessive waiting.
 	maxRTO = 10 * time.Second
 
@@ -184,7 +186,7 @@ func newConn(conn *net.UDPConn, remote *net.UDPAddr, ownConn bool) *Conn {
 		remote:  remote,
 		pending: make(map[uint32]*pendingPacket, 128), // pre-allocate for typical cwnd
 		recvBuf: make(map[uint32]*Packet, 32), // pre-allocate for typical reorder window
-		readCh:  make(chan []byte, 8192),
+		readCh:  make(chan []byte, 256), // 256×1460≈370KB; 8192 caused bufferbloat (+1s latency)
 		batch:   newBatchWriter(conn),
 		bbr:     bbr,
 		rto:     initialRTO,

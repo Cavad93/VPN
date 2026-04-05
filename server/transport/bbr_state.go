@@ -63,10 +63,10 @@ const (
 	fullBwCountMax = 3
 
 	// minCwndPackets: absolute minimum cwnd.
-	// Linux default IW10 is too small for user-space BBR where per-packet
-	// overhead is high. IW32 allows faster Startup probing and higher
-	// throughput floor on high-RTT paths.
-	minCwndPackets = 32
+	// 4 packets (5.8 KB) allows adaptive convergence to low-BDP paths
+	// without over-buffering. 32 was causing excessive queuing on links
+	// where the real BDP is only a few KB.
+	minCwndPackets = 4
 )
 
 // ProbeBW 8-phase pacing gains. Each phase lasts ~1 RTT.
