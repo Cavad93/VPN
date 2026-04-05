@@ -2,6 +2,7 @@ package transport
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -168,17 +169,21 @@ type bbrEstimator struct {
 
 	// RTprop — windowed minimum RTT over the last 10 seconds.
 	rtpropFilter windowedMinFilter
-	rtpropUs     int64 // cached RTprop in microseconds for fast access
+	rtpropUs     atomic.Int64 // cached RTprop in microseconds (lock-free reads)
 
 	// BtlBw — windowed maximum delivery rate over the last 10 round-trips.
 	btlbwFilter windowedMaxFilter
-	btlbwBps    int64 // cached BtlBw in bytes/sec for fast access
+	btlbwBps    atomic.Int64 // cached BtlBw in bytes/sec (lock-free reads)
 
 	// Delivery rate tracking.
 	// On each ACK we compute: delivery_rate = delta_delivered / delta_time
 	// where delta is measured from the ACKed packet's send-time snapshot.
 	delivered     int64     // total bytes confirmed delivered (cumulative)
 	deliveredTime time.Time // timestamp of last delivered update
+
+	// Atomic mirrors for lock-free DeliveredSnapshot reads from the send path.
+	deliveredAtomic     atomic.Int64
+	deliveredTimeNano   atomic.Int64
 
 	// Round-trip counting for BtlBw filter.
 	roundCount    int64 // incremented each time a full RTT's worth of data is ACKed
@@ -189,11 +194,13 @@ type bbrEstimator struct {
 // newBBREstimator creates a new estimator with empty filters.
 func newBBREstimator() *bbrEstimator {
 	now := time.Now()
-	return &bbrEstimator{
+	e := &bbrEstimator{
 		rtpropFilter:  newWindowedMinFilter(rtpropFilterLen),
 		btlbwFilter:   newWindowedMaxFilter(btlbwFilterLen),
 		deliveredTime: now, // initialize to now — prevents first ACK from computing zero delivery rate
 	}
+	e.deliveredTimeNano.Store(now.UnixNano())
+	return e
 }
 
 // OnACK processes an ACK event. The caller provides:
@@ -221,6 +228,9 @@ func (e *bbrEstimator) OnACK(
 	// 1. Update delivered counter.
 	e.delivered += ackedBytes
 	e.deliveredTime = now
+	// Publish for lock-free reads.
+	e.deliveredAtomic.Store(e.delivered)
+	e.deliveredTimeNano.Store(now.UnixNano())
 
 	// 2. Compute delivery rate for this ACK.
 	//    delivery_rate = (delivered_now - delivered_at_send) / max(ack_elapsed, send_elapsed)
@@ -253,14 +263,14 @@ func (e *bbrEstimator) OnACK(
 
 	// 4. Update RTprop filter (minimum RTT).
 	e.rtpropFilter.update(rtt, now)
-	e.rtpropUs = e.rtpropFilter.get().Microseconds()
+	e.rtpropUs.Store(e.rtpropFilter.get().Microseconds())
 
 	// 5. Update BtlBw filter (maximum delivery rate).
 	//    Only non-app-limited samples are used for BtlBw — if the sender
 	//    was idle, the delivery rate underestimates the true bottleneck.
 	if !isAppLimited || deliveryRate > e.btlbwFilter.get() {
 		e.btlbwFilter.update(deliveryRate, e.roundCount)
-		e.btlbwBps = e.btlbwFilter.get()
+		e.btlbwBps.Store(e.btlbwFilter.get())
 	}
 
 	return rtSample{
@@ -273,36 +283,34 @@ func (e *bbrEstimator) OnACK(
 	}
 }
 
-// RTprop returns the current propagation delay estimate in microseconds.
+// RTprop returns the current propagation delay estimate in microseconds (lock-free).
 func (e *bbrEstimator) RTprop() int64 {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.rtpropUs
+	return e.rtpropUs.Load()
 }
 
 // RTpropDuration returns the current propagation delay as time.Duration.
 func (e *bbrEstimator) RTpropDuration() time.Duration {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.rtpropFilter.get()
-}
-
-// BtlBw returns the current bottleneck bandwidth estimate in bytes/sec.
-func (e *bbrEstimator) BtlBw() int64 {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.btlbwBps
-}
-
-// BDP returns the estimated bandwidth-delay product in bytes.
-// BDP = BtlBw × RTprop — the optimal amount of data "in flight".
-func (e *bbrEstimator) BDP() int64 {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.rtpropUs <= 0 || e.btlbwBps <= 0 {
+	us := e.rtpropUs.Load()
+	if us <= 0 {
 		return 0
 	}
-	return e.btlbwBps * e.rtpropUs / 1_000_000
+	return time.Duration(us) * time.Microsecond
+}
+
+// BtlBw returns the current bottleneck bandwidth estimate in bytes/sec (lock-free).
+func (e *bbrEstimator) BtlBw() int64 {
+	return e.btlbwBps.Load()
+}
+
+// BDP returns the estimated bandwidth-delay product in bytes (lock-free).
+// BDP = BtlBw × RTprop — the optimal amount of data "in flight".
+func (e *bbrEstimator) BDP() int64 {
+	rtUs := e.rtpropUs.Load()
+	bw := e.btlbwBps.Load()
+	if rtUs <= 0 || bw <= 0 {
+		return 0
+	}
+	return bw * rtUs / 1_000_000
 }
 
 // Delivered returns the total delivered byte count.
@@ -313,11 +321,14 @@ func (e *bbrEstimator) Delivered() int64 {
 }
 
 // DeliveredSnapshot returns a snapshot of (delivered, deliveredTime)
-// for stamping outgoing packets.
+// for stamping outgoing packets. Lock-free via atomic reads.
 func (e *bbrEstimator) DeliveredSnapshot() (int64, time.Time) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.delivered, e.deliveredTime
+	d := e.deliveredAtomic.Load()
+	tNano := e.deliveredTimeNano.Load()
+	if tNano == 0 {
+		return d, time.Time{}
+	}
+	return d, time.Unix(0, tNano)
 }
 
 // RoundCount returns the current round-trip count.
@@ -347,10 +358,12 @@ func (e *bbrEstimator) Reset() {
 	defer e.mu.Unlock()
 	e.rtpropFilter.reset()
 	e.btlbwFilter.reset()
-	e.rtpropUs = 0
-	e.btlbwBps = 0
+	e.rtpropUs.Store(0)
+	e.btlbwBps.Store(0)
 	e.delivered = 0
 	e.deliveredTime = time.Time{}
+	e.deliveredAtomic.Store(0)
+	e.deliveredTimeNano.Store(0)
 	e.roundCount = 0
 	e.roundStart = false
 	e.nextRoundDelivered = 0

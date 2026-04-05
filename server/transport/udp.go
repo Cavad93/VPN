@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,11 +26,11 @@ const (
 	// Layout: type(1) seqNum(4) ackNum(4) payloadLen(2) = 11 bytes.
 	HeaderSize = 11
 
-	// MaxPayloadSize is the maximum payload per packet (fits in typical MTU).
-	MaxPayloadSize = 1400
-
-	// MaxWindowSize caps the congestion window.
-	MaxWindowSize = 64
+	// MaxPayloadSize is the maximum payload per packet.
+	// Ethernet MTU (1500) − IP header (20) − UDP header (8) − our header (11) = 1461.
+	// We use 1460 for alignment; this avoids IP fragmentation on standard networks
+	// and increases throughput by ~4% vs the previous 1400.
+	MaxPayloadSize = 1460
 
 	// initialRTO is the retransmission timeout before any RTT samples.
 	initialRTO = 1 * time.Second
@@ -65,7 +66,13 @@ func (p *Packet) Encode() []byte {
 	return buf
 }
 
+// pktPool reuses Packet structs to avoid one heap allocation per received packet.
+var pktPool = sync.Pool{
+	New: func() interface{} { return new(Packet) },
+}
+
 // DecodePacket parses a packet from raw bytes.
+// The returned Packet's Payload is a fresh copy (safe to hold after data is reused).
 func DecodePacket(data []byte) (*Packet, error) {
 	if len(data) < HeaderSize {
 		return nil, errors.New("transport: packet too short")
@@ -74,14 +81,15 @@ func DecodePacket(data []byte) (*Packet, error) {
 	if len(data) < HeaderSize+int(payloadLen) {
 		return nil, errors.New("transport: packet truncated")
 	}
-	p := &Packet{
-		Type:   data[0],
-		SeqNum: binary.BigEndian.Uint32(data[1:5]),
-		AckNum: binary.BigEndian.Uint32(data[5:9]),
-	}
+	p := pktPool.Get().(*Packet)
+	p.Type = data[0]
+	p.SeqNum = binary.BigEndian.Uint32(data[1:5])
+	p.AckNum = binary.BigEndian.Uint32(data[5:9])
 	if payloadLen > 0 {
 		p.Payload = make([]byte, payloadLen)
 		copy(p.Payload, data[HeaderSize:HeaderSize+int(payloadLen)])
+	} else {
+		p.Payload = nil
 	}
 	return p, nil
 }
@@ -99,10 +107,11 @@ type pendingPacket struct {
 	appLimited    bool
 }
 
-// ackDelay is the maximum time to wait before flushing a coalesced ACK.
-// Mirrors TCP delayed ACK (RFC 1122 §4.2.3.2). 1 ms keeps latency low while
-// halving ACK packet count in sustained streaming scenarios.
-const ackDelay = time.Millisecond
+// pendingPool reuses pendingPacket structs to avoid one heap allocation per
+// sent packet. Returned to pool in processACK when the ACK arrives.
+var pendingPool = sync.Pool{
+	New: func() interface{} { return new(pendingPacket) },
+}
 
 // ackBufPool pools the fixed-size 11-byte slices used to encode pure ACK
 // packets, eliminating one heap allocation per received data packet.
@@ -126,6 +135,7 @@ type Conn struct {
 	sendMu   sync.Mutex
 	sendCond *sync.Cond // signalled when cwnd opens (ACK received or conn closed)
 	sendSeq  uint32
+	sendBase uint32 // lowest unACKed seq (fast-path duplicate ACK detection)
 	pending  map[uint32]*pendingPacket
 
 	// Receive side: ordered delivery buffer.
@@ -133,10 +143,9 @@ type Conn struct {
 	recvSeq uint32
 	recvBuf map[uint32]*Packet // out-of-order packets awaiting delivery
 
-	// Delayed ACK: coalesce multiple received packets into one ACK (RFC 1122).
-	ackMu      sync.Mutex
-	ackPending bool       // true when an ACK needs to be sent
-	ackTimer   *time.Timer
+	// recvSeqAtomic mirrors recvSeq for lock-free reads from writePacket.
+	// Updated atomically by processData after advancing recvSeq under recvMu.
+	recvSeqAtomic atomic.Uint32
 
 	// Congestion control: BBR (user-space).
 	bbr *BBRState
@@ -172,8 +181,8 @@ func newConn(conn *net.UDPConn, remote *net.UDPAddr, ownConn bool) *Conn {
 		conn:    conn,
 		ownConn: ownConn,
 		remote:  remote,
-		pending: make(map[uint32]*pendingPacket),
-		recvBuf: make(map[uint32]*Packet),
+		pending: make(map[uint32]*pendingPacket, 128), // pre-allocate for typical cwnd
+		recvBuf: make(map[uint32]*Packet, 32), // pre-allocate for typical reorder window
 		readCh:  make(chan []byte, 8192),
 		bbr:     bbr,
 		rto:     initialRTO,
@@ -239,18 +248,25 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 	seq := c.sendSeq
 	c.sendSeq++
 
-	c.recvMu.Lock()
-	ackNum := c.recvSeq
-	c.recvMu.Unlock()
+	// Lock-free read of recvSeq for piggybacked ACK number.
+	ackNum := c.recvSeqAtomic.Load()
+
+	// Copy payload once for retransmission storage. The original slice
+	// belongs to the caller and may be reused after Write returns.
+	var payloadCopy []byte
+	if len(payload) > 0 {
+		payloadCopy = make([]byte, len(payload))
+		copy(payloadCopy, payload)
+	}
 
 	// Encode packet using pooled buffer to avoid allocation.
 	bp := sendBufPool.Get().(*[]byte)
-	buf := (*bp)[:HeaderSize+len(payload)]
+	buf := (*bp)[:HeaderSize+len(payloadCopy)]
 	buf[0] = pktType
 	binary.BigEndian.PutUint32(buf[1:5], seq)
 	binary.BigEndian.PutUint32(buf[5:9], ackNum)
-	binary.BigEndian.PutUint16(buf[9:11], uint16(len(payload)))
-	copy(buf[HeaderSize:], payload)
+	binary.BigEndian.PutUint16(buf[9:11], uint16(len(payloadCopy)))
+	copy(buf[HeaderSize:], payloadCopy) // copy from our owned slice
 
 	// Take delivery-rate snapshot for BBR estimator.
 	delivered, deliveredTime := c.bbr.estimator.DeliveredSnapshot()
@@ -264,31 +280,29 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 		return err
 	}
 
-	// Store packet for potential retransmission (need a copy of payload).
-	pkt := &Packet{Type: pktType, SeqNum: seq, AckNum: ackNum}
-	if len(payload) > 0 {
-		pkt.Payload = make([]byte, len(payload))
-		copy(pkt.Payload, payload)
-	}
+	// Reuse the single payloadCopy for the retransmission record.
+	pkt := &Packet{Type: pktType, SeqNum: seq, AckNum: ackNum, Payload: payloadCopy}
 
-	c.pending[seq] = &pendingPacket{
-		pkt:           pkt,
-		firstSentAt:   now,
-		sentAt:        now,
-		delivered:     delivered,
-		deliveredTime: deliveredTime,
-		appLimited:    appLimited,
-	}
+	pp := pendingPool.Get().(*pendingPacket)
+	pp.pkt = pkt
+	pp.firstSentAt = now
+	pp.sentAt = now
+	pp.retransmits = 0
+	pp.delivered = delivered
+	pp.deliveredTime = deliveredTime
+	pp.appLimited = appLimited
+	c.pending[seq] = pp
 
-	// Register with BBR inflight tracker.
-	c.bbr.inflight.OnSend(&inflightPkt{
-		SeqNum:        seq,
-		Size:          len(payload),
-		SentAt:        now,
-		Delivered:     delivered,
-		DeliveredTime: deliveredTime,
-		AppLimited:    appLimited,
-	})
+	// Register with BBR inflight tracker (pooled allocation).
+	ifl := inflightPktPool.Get().(*inflightPkt)
+	ifl.SeqNum = seq
+	ifl.Size = len(payload)
+	ifl.SentAt = now
+	ifl.Retransmitted = false
+	ifl.Delivered = delivered
+	ifl.DeliveredTime = deliveredTime
+	ifl.AppLimited = appLimited
+	c.bbr.inflight.OnSend(ifl)
 
 	return nil
 }
@@ -347,8 +361,16 @@ func (c *Conn) processACK(ackNum uint32) {
 	}
 
 	c.sendMu.Lock()
+
+	// Fast path: duplicate or stale ACK — nothing to do.
+	if ackNum <= c.sendBase {
+		c.sendMu.Unlock()
+		return
+	}
+
 	now := time.Now()
-	var acked []ackedInfo
+	// Pre-allocate for typical burst (avoids slice growth allocations).
+	acked := make([]ackedInfo, 0, 16)
 	for seq := range c.pending {
 		if seq < ackNum {
 			pp := c.pending[seq]
@@ -369,32 +391,38 @@ func (c *Conn) processACK(ackNum uint32) {
 				appLimited:    pp.appLimited,
 				retransmitted: pp.retransmits > 0,
 			})
+
+			// Return pendingPacket to pool.
+			pp.pkt = nil // release payload reference for GC
+			pendingPool.Put(pp)
 		}
 	}
+	// Advance sendBase to the ACK frontier.
+	c.sendBase = ackNum
 	c.sendMu.Unlock()
 
 	if len(acked) == 0 {
 		return
 	}
 
+	// Wake writePacket IMMEDIATELY after releasing sendMu — don't wait for
+	// BBR processing. This lets the sender push new packets while we update
+	// the BBR model, overlapping computation with I/O.
+	c.sendCond.Broadcast()
+
 	// Phase 2: feed BBR outside sendMu (no lock contention with writePacket).
 	for _, a := range acked {
 		if !a.retransmitted {
 			c.updateRTO(a.rtt)
 		}
-		c.bbr.inflight.OnACK(a.seq)
-		c.bbr.OnACK(a.rtt, int64(a.payloadSize), &inflightPkt{
-			SeqNum:        a.seq,
-			Size:          a.payloadSize,
-			SentAt:        a.sentAt,
-			Delivered:     a.delivered,
-			DeliveredTime: a.deliveredTime,
-			AppLimited:    a.appLimited,
-		})
+		// Use the inflightPkt returned by OnACK — it already has all delivery
+		// snapshots, so we avoid allocating a new one.
+		ifl, ok := c.bbr.inflight.OnACK(a.seq)
+		if ok {
+			c.bbr.OnACK(a.rtt, int64(a.payloadSize), ifl)
+			inflightPktPool.Put(ifl)
+		}
 	}
-
-	// Wake any writePacket goroutine blocked on a full window.
-	c.sendCond.Broadcast()
 }
 
 // processData handles an incoming data packet, buffers out-of-order packets,
@@ -402,13 +430,12 @@ func (c *Conn) processACK(ackNum uint32) {
 func (c *Conn) processData(pkt *Packet) {
 	c.recvMu.Lock()
 
-	var toDeliver [][]byte
+	toDeliver := make([][]byte, 0, 4)
 	if pkt.SeqNum == c.recvSeq {
 		// In-order: deliver immediately.
+		// pkt.Payload is already a unique copy from DecodePacket — no need to copy again.
 		if len(pkt.Payload) > 0 {
-			payload := make([]byte, len(pkt.Payload))
-			copy(payload, pkt.Payload)
-			toDeliver = append(toDeliver, payload)
+			toDeliver = append(toDeliver, pkt.Payload)
 		}
 		c.recvSeq++
 
@@ -419,9 +446,7 @@ func (c *Conn) processData(pkt *Packet) {
 				break
 			}
 			if len(buffered.Payload) > 0 {
-				payload := make([]byte, len(buffered.Payload))
-				copy(payload, buffered.Payload)
-				toDeliver = append(toDeliver, payload)
+				toDeliver = append(toDeliver, buffered.Payload)
 			}
 			delete(c.recvBuf, c.recvSeq)
 			c.recvSeq++
@@ -432,7 +457,8 @@ func (c *Conn) processData(pkt *Packet) {
 	}
 	// Duplicate (pkt.SeqNum < c.recvSeq): silently discard.
 
-	ackNum := c.recvSeq
+	// Publish recvSeq for lock-free reads (writePacket, sendACK).
+	c.recvSeqAtomic.Store(c.recvSeq)
 	c.recvMu.Unlock()
 
 	// Deliver payloads OUTSIDE recvMu to avoid deadlock if readCh is full.
@@ -444,35 +470,18 @@ func (c *Conn) processData(pkt *Packet) {
 		}
 	}
 
-	// Schedule a delayed ACK (RFC 1122 §4.2.3.2).
-	// If the timer is already running the existing timer will flush the ACK;
-	// otherwise we start a new ackDelay timer. This coalesces multiple
-	// back-to-back ACKs into one UDP packet, reducing ACK overhead by ~50% in
-	// sustained streaming scenarios while keeping the delay ≤1 ms.
-	c.ackMu.Lock()
-	c.ackPending = true
-	if c.ackTimer == nil {
-		c.ackTimer = time.AfterFunc(ackDelay, func() {
-			c.ackMu.Lock()
-			pending := c.ackPending
-			c.ackPending = false
-			c.ackTimer = nil
-			c.ackMu.Unlock()
-			if pending {
-				c.sendACK()
-			}
-		})
-	}
-	c.ackMu.Unlock()
-	_ = ackNum // ackNum read at flush time from c.recvSeq
+	// Send ACK immediately — no delayed ACK timer.
+	// Delayed ACK (1ms timer) was adding latency to every BBR feedback cycle.
+	// In user-space UDP, fast ACK feedback is critical for cwnd growth.
+	// The slight increase in ACK traffic (~2× more ACKs) is negligible
+	// compared to the throughput gain from faster BBR convergence.
+	c.sendACK()
 }
 
 // sendACK encodes and transmits a pure ACK packet using a pooled buffer to
 // avoid a heap allocation per call.
 func (c *Conn) sendACK() {
-	c.recvMu.Lock()
-	ackNum := c.recvSeq
-	c.recvMu.Unlock()
+	ackNum := c.recvSeqAtomic.Load()
 
 	bp := ackBufPool.Get().(*[]byte)
 	buf := (*bp)[:HeaderSize]
@@ -485,15 +494,27 @@ func (c *Conn) sendACK() {
 }
 
 // retransmitLoop periodically calls doRetransmit until the connection closes.
+// The check interval adapts to the current RTO: max(20ms, RTO/4).
+// This avoids wasting CPU scanning pending packets when RTO is high,
+// while still detecting timeouts quickly on low-latency paths.
 func (c *Conn) retransmitLoop() {
-	ticker := time.NewTicker(retransmitTick)
-	defer ticker.Stop()
+	timer := time.NewTimer(retransmitTick)
+	defer timer.Stop()
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			c.doRetransmit()
+			// Adaptive interval: check more often when RTO is short.
+			interval := c.getRTO() / 4
+			if interval < 20*time.Millisecond {
+				interval = 20 * time.Millisecond
+			}
+			if interval > 200*time.Millisecond {
+				interval = 200 * time.Millisecond
+			}
+			timer.Reset(interval)
 		}
 	}
 }
@@ -517,9 +538,13 @@ func (c *Conn) doRetransmit() {
 			// Give up on this packet — free the window slot.
 			payloadLen := int64(len(pp.pkt.Payload))
 			delete(c.pending, seq)
-			c.bbr.inflight.OnLoss(seq)
+			if ifl, ok := c.bbr.inflight.OnLoss(seq); ok {
+				inflightPktPool.Put(ifl)
+			}
 			lostBytes += payloadLen
 			dropped++
+			pp.pkt = nil
+			pendingPool.Put(pp)
 			continue
 		}
 
@@ -527,23 +552,35 @@ func (c *Conn) doRetransmit() {
 		if pp.retransmits == 0 {
 			// First retransmit — count as a loss event.
 			lostBytes += int64(len(pp.pkt.Payload))
-			c.bbr.inflight.OnLoss(seq)
+			if ifl, ok := c.bbr.inflight.OnLoss(seq); ok {
+				inflightPktPool.Put(ifl)
+			}
 		}
 
-		c.conn.WriteToUDP(pp.pkt.Encode(), c.remote) //nolint:errcheck
+		// Re-encode using pooled buffer to avoid allocation.
+		rbp := sendBufPool.Get().(*[]byte)
+		rbuf := (*rbp)[:HeaderSize+len(pp.pkt.Payload)]
+		rbuf[0] = pp.pkt.Type
+		binary.BigEndian.PutUint32(rbuf[1:5], pp.pkt.SeqNum)
+		binary.BigEndian.PutUint32(rbuf[5:9], pp.pkt.AckNum)
+		binary.BigEndian.PutUint16(rbuf[9:11], uint16(len(pp.pkt.Payload)))
+		copy(rbuf[HeaderSize:], pp.pkt.Payload)
+		c.conn.WriteToUDP(rbuf, c.remote) //nolint:errcheck
+		sendBufPool.Put(rbp)
 		pp.sentAt = now
 		pp.retransmits++
 
-		// Re-register in inflight tracker with fresh delivery snapshot.
+		// Re-register in inflight tracker with fresh delivery snapshot (pooled).
 		delivered, deliveredTime := c.bbr.estimator.DeliveredSnapshot()
-		c.bbr.inflight.OnSend(&inflightPkt{
-			SeqNum:        seq,
-			Size:          len(pp.pkt.Payload),
-			SentAt:        now,
-			Delivered:     delivered,
-			DeliveredTime: deliveredTime,
-			Retransmitted: true,
-		})
+		ifl := inflightPktPool.Get().(*inflightPkt)
+		ifl.SeqNum = seq
+		ifl.Size = len(pp.pkt.Payload)
+		ifl.SentAt = now
+		ifl.Retransmitted = true
+		ifl.Delivered = delivered
+		ifl.DeliveredTime = deliveredTime
+		ifl.AppLimited = false
+		c.bbr.inflight.OnSend(ifl)
 	}
 	c.sendMu.Unlock()
 
@@ -572,23 +609,10 @@ func (c *Conn) Read(ctx context.Context) ([]byte, error) {
 }
 
 // Close shuts down the connection and, for Dial-side conns, the UDP socket.
-// Any pending delayed ACK is flushed synchronously before closing so the remote
-// receives the final cumulative ACK.
 func (c *Conn) Close() {
 	c.closeOnce.Do(func() {
-		// Flush pending delayed ACK before cancelling context.
-		c.ackMu.Lock()
-		if c.ackTimer != nil {
-			c.ackTimer.Stop()
-			c.ackTimer = nil
-		}
-		pending := c.ackPending
-		c.ackPending = false
-		c.ackMu.Unlock()
-		if pending {
-			c.sendACK()
-		}
-
+		// Send final ACK before closing.
+		c.sendACK()
 		c.cancel()
 		// Wake any writePacket goroutine blocked on a full congestion window so
 		// it can observe the cancelled context and return immediately.
@@ -614,6 +638,19 @@ type Listener struct {
 	cancel   context.CancelFunc
 }
 
+// udpSocketBufSize is the target SO_RCVBUF/SO_SNDBUF size for UDP sockets.
+// 4 MB allows the kernel to buffer bursts without dropping packets,
+// which is critical for user-space congestion control where processing
+// latency is higher than in-kernel TCP.
+const udpSocketBufSize = 4 * 1024 * 1024
+
+// setUDPBuffers attempts to increase the UDP socket read/write buffers.
+// Errors are silently ignored — the OS may cap the size.
+func setUDPBuffers(conn *net.UDPConn) {
+	conn.SetReadBuffer(udpSocketBufSize)  //nolint:errcheck
+	conn.SetWriteBuffer(udpSocketBufSize) //nolint:errcheck
+}
+
 // Listen creates a UDP listener bound to addr (e.g. "0.0.0.0:4433").
 func Listen(addr string) (*Listener, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
@@ -624,6 +661,7 @@ func Listen(addr string) (*Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	setUDPBuffers(conn)
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Listener{
 		conn:     conn,
@@ -691,8 +729,11 @@ func (l *Listener) readLoop() {
 		switch pkt.Type {
 		case PacketTypeData, PacketTypeSYN, PacketTypeFIN:
 			c.processData(pkt)
+			// Note: processData may store pkt in recvBuf — don't return to pool.
 		case PacketTypeACK:
 			c.processACK(pkt.AckNum)
+			pkt.Payload = nil
+			pktPool.Put(pkt)
 		}
 	}
 }
@@ -725,6 +766,7 @@ func Dial(addr string) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	setUDPBuffers(conn)
 	c := newConn(conn, udpAddr, true)
 	go dialReadLoop(conn, c)
 	return c, nil
@@ -752,6 +794,8 @@ func dialReadLoop(conn *net.UDPConn, c *Conn) {
 			c.processData(pkt)
 		case PacketTypeACK:
 			c.processACK(pkt.AckNum)
+			pkt.Payload = nil
+			pktPool.Put(pkt)
 		}
 	}
 }

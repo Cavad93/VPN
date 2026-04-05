@@ -62,8 +62,11 @@ const (
 	// fullBwCount: number of rounds without BtlBw growth to exit Startup.
 	fullBwCountMax = 3
 
-	// minCwndPackets: absolute minimum cwnd (Linux IW10).
-	minCwndPackets = 10
+	// minCwndPackets: absolute minimum cwnd.
+	// Linux default IW10 is too small for user-space BBR where per-packet
+	// overhead is high. IW32 allows faster Startup probing and higher
+	// throughput floor on high-RTT paths.
+	minCwndPackets = 32
 )
 
 // ProbeBW 8-phase pacing gains. Each phase lasts ~1 RTT.

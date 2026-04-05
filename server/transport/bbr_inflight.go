@@ -2,8 +2,15 @@ package transport
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// inflightPktPool reuses inflightPkt structs to eliminate one heap allocation
+// per sent packet on the hot path.
+var inflightPktPool = sync.Pool{
+	New: func() interface{} { return new(inflightPkt) },
+}
 
 // inflightPkt is the metadata stored for each packet that has been sent
 // but not yet acknowledged. BBR uses the delivery-rate snapshots to compute
@@ -35,12 +42,17 @@ type inflightTracker struct {
 	count   int                      // number of packets in flight
 	bytes   int64                    // total bytes in flight (payload only)
 	lost    int64                    // cumulative lost bytes (for loss rate calc)
+
+	// Atomic mirrors for lock-free reads from BBR state machine.
+	countAtomic atomic.Int32
+	bytesAtomic atomic.Int64
+	lostAtomic  atomic.Int64
 }
 
 // newInflightTracker creates an empty tracker.
 func newInflightTracker() *inflightTracker {
 	return &inflightTracker{
-		packets: make(map[uint32]*inflightPkt),
+		packets: make(map[uint32]*inflightPkt, 128),
 	}
 }
 
@@ -59,6 +71,8 @@ func (t *inflightTracker) OnSend(pkt *inflightPkt) {
 	t.packets[pkt.SeqNum] = pkt
 	t.count++
 	t.bytes += int64(pkt.Size)
+	t.countAtomic.Store(int32(t.count))
+	t.bytesAtomic.Store(t.bytes)
 }
 
 // OnACK removes a packet from inflight tracking when its ACK arrives.
@@ -78,6 +92,8 @@ func (t *inflightTracker) OnACK(seqNum uint32) (*inflightPkt, bool) {
 	if t.bytes < 0 {
 		t.bytes = 0
 	}
+	t.countAtomic.Store(int32(t.count))
+	t.bytesAtomic.Store(t.bytes)
 	return pkt, true
 }
 
@@ -99,6 +115,8 @@ func (t *inflightTracker) OnACKCumulative(ackNum uint32) []*inflightPkt {
 	if t.bytes < 0 {
 		t.bytes = 0
 	}
+	t.countAtomic.Store(int32(t.count))
+	t.bytesAtomic.Store(t.bytes)
 	return acked
 }
 
@@ -119,28 +137,25 @@ func (t *inflightTracker) OnLoss(seqNum uint32) (*inflightPkt, bool) {
 		t.bytes = 0
 	}
 	t.lost += int64(pkt.Size)
+	t.countAtomic.Store(int32(t.count))
+	t.bytesAtomic.Store(t.bytes)
+	t.lostAtomic.Store(t.lost)
 	return pkt, true
 }
 
-// Count returns the number of packets in flight.
+// Count returns the number of packets in flight (lock-free).
 func (t *inflightTracker) Count() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.count
+	return int(t.countAtomic.Load())
 }
 
-// Bytes returns the total bytes in flight.
+// Bytes returns the total bytes in flight (lock-free).
 func (t *inflightTracker) Bytes() int64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.bytes
+	return t.bytesAtomic.Load()
 }
 
-// LostBytes returns the cumulative lost bytes.
+// LostBytes returns the cumulative lost bytes (lock-free).
 func (t *inflightTracker) LostBytes() int64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.lost
+	return t.lostAtomic.Load()
 }
 
 // Get returns the inflight packet for the given seqNum, or nil.
@@ -158,4 +173,7 @@ func (t *inflightTracker) Reset() {
 	t.count = 0
 	t.bytes = 0
 	t.lost = 0
+	t.countAtomic.Store(0)
+	t.bytesAtomic.Store(0)
+	t.lostAtomic.Store(0)
 }
