@@ -213,7 +213,7 @@ func TestObfsWriteReadLargePayload(t *testing.T) {
 
 func TestObfsReadBuffering(t *testing.T) {
 	t.Parallel()
-	// Send one 10-byte record; read it back in 2-byte chunks to exercise readBuf.
+	// Send one 10-byte record; read it back in 2-byte chunks to exercise partial-record draining.
 	client, server := newObfsPair(t)
 	defer client.Close()
 	defer server.Close()

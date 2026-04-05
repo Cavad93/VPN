@@ -65,10 +65,10 @@ var obfsRecordPool = sync.Pool{
 // records.  Callers must run ClientHandshake (initiator side) or
 // ServerHandshake (responder side) before calling Read/Write.
 type ObfsConn struct {
-	conn        net.Conn
-	bufr        *bufio.Reader // buffered reader reduces read syscalls
-	readBuf     []byte        // unconsumed payload bytes from the last decoded record
-	sniSelector SNISelector   // optional; if set, ClientHandshake embeds an SNI extension
+	conn             net.Conn
+	bufr             *bufio.Reader // buffered reader reduces read syscalls
+	readBufRemaining int           // bytes remaining in the current TLS record not yet returned to caller
+	sniSelector      SNISelector   // optional; if set, ClientHandshake embeds an SNI extension
 	// hdr is a reusable 5-byte scratch buffer for TLS record headers.
 	// Avoids one heap allocation per read in the hot data path.
 	hdr [ObfsHeaderSize]byte
@@ -151,52 +151,39 @@ func (c *ObfsConn) Write(p []byte) (int, error) {
 }
 
 // Read reads data from incoming TLS application_data records.
-// Implements io.Reader.  Bytes that do not fit into p are buffered for the
-// next call.
+// Implements io.Reader.  If the caller's buffer is smaller than the record
+// payload, subsequent calls continue draining the current record before
+// decoding the next header.
 //
-// Optimisation: when the caller's buffer p is large enough to hold the entire
-// TLS record payload, the payload is read directly into p without any
-// intermediate allocation. This eliminates one make([]byte, ~1460) per packet
-// on the hot path (~2500 allocs/s at 30 Mbps). The caller (noiseConn.Read)
-// always passes a 65 KB buffer, so this fast path hits ~100% of the time.
+// Single-buffer design: data flows network → bufio.Reader → p with no
+// intermediate allocations.  readBufRemaining tracks how many payload bytes
+// remain in the current TLS record so that bufio.Reader serves as the sole
+// buffer in the system — eliminating the old separate readBuf allocation.
 func (c *ObfsConn) Read(p []byte) (int, error) {
-	if len(c.readBuf) > 0 {
-		n := copy(p, c.readBuf)
-		c.readBuf = c.readBuf[n:]
-		return n, nil
-	}
-
-	// Read the TLS record header to learn the payload length.
-	if _, err := io.ReadFull(c.bufr, c.hdr[:]); err != nil {
-		return 0, err
-	}
-	if c.hdr[0] != tlsRecordAppData {
-		return 0, errors.New("obfs: unexpected TLS record content type")
-	}
-	length := int(binary.BigEndian.Uint16(c.hdr[3:5]))
-	if length == 0 || length > maxObfsPayload {
-		return 0, errors.New("obfs: invalid TLS record length")
-	}
-
-	if len(p) >= length {
-		// Fast path: caller's buffer is large enough — read directly into p.
-		// Zero allocation, zero copy.
-		if _, err := io.ReadFull(c.bufr, p[:length]); err != nil {
+	if c.readBufRemaining == 0 {
+		// Decode the next TLS record header.
+		if _, err := io.ReadFull(c.bufr, c.hdr[:]); err != nil {
 			return 0, err
 		}
-		return length, nil
+		if c.hdr[0] != tlsRecordAppData {
+			return 0, errors.New("obfs: unexpected TLS record content type")
+		}
+		length := int(binary.BigEndian.Uint16(c.hdr[3:5]))
+		if length == 0 || length > maxObfsPayload {
+			return 0, errors.New("obfs: invalid TLS record length")
+		}
+		c.readBufRemaining = length
 	}
 
-	// Slow path: payload larger than p — allocate, copy what fits, buffer rest.
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(c.bufr, payload); err != nil {
-		return 0, err
+	// Read up to readBufRemaining bytes directly from bufio into p.
+	// Zero allocation regardless of whether p is larger or smaller than the record.
+	toRead := c.readBufRemaining
+	if len(p) < toRead {
+		toRead = len(p)
 	}
-	n := copy(p, payload)
-	if n < len(payload) {
-		c.readBuf = payload[n:]
-	}
-	return n, nil
+	n, err := io.ReadFull(c.bufr, p[:toRead])
+	c.readBufRemaining -= n
+	return n, err
 }
 
 // Close closes the underlying connection.
