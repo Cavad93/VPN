@@ -198,6 +198,13 @@ func newConn(conn *net.UDPConn, remote *net.UDPAddr, ownConn bool) *Conn {
 	return c
 }
 
+// SetInitialBandwidth seeds the BBR model with a known bandwidth and RTT,
+// skipping the slow Startup phase. Call before sending data.
+// Example: conn.SetInitialBandwidth(12_500_000, 65*time.Millisecond) // 100 Mbps
+func (c *Conn) SetInitialBandwidth(bytesPerSec int64, rtt time.Duration) {
+	c.bbr.SetInitialBandwidth(bytesPerSec, rtt)
+}
+
 // batchFlushInterval is how often the flush loop checks for stale batches.
 // 200µs balances latency (unflushed packets sit at most 200µs) vs CPU overhead.
 const batchFlushInterval = 200 * time.Microsecond

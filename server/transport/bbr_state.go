@@ -155,6 +155,50 @@ func (s *BBRState) PacingRate() int64 {
 	return s.pacingRate
 }
 
+// SetInitialBandwidth skips the slow Startup phase entirely by seeding the
+// BBR model with a known bandwidth and RTT estimate. This is critical for
+// high-RTT paths (like SPb→Astana, 65ms) where Startup needs ~10 RTTs
+// (650ms) to discover the bandwidth — during which throughput is very low.
+//
+// After calling this, BBR jumps straight to ProbeBW (steady-state) and
+// begins probing around the given values. If the real bandwidth is higher,
+// BBR will discover it within 1-2 RTTs via ProbeBW's 5/4 gain phase.
+// If the real bandwidth is lower, BBR will quickly converge down via
+// the 3/4 drain phase.
+//
+// Recommended: call with the ISP's advertised bandwidth (e.g. 100 Mbps)
+// and a rough RTT estimate (e.g. 50ms for domestic, 100ms for international).
+//
+//   bbr.SetInitialBandwidth(100_000_000 / 8, 65*time.Millisecond) // 100 Mbps, 65ms RTT
+func (s *BBRState) SetInitialBandwidth(bytesPerSec int64, rtt time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if bytesPerSec <= 0 || rtt <= 0 {
+		return
+	}
+
+	// Seed the estimator with synthetic BtlBw and RTprop.
+	s.estimator.SeedBandwidth(bytesPerSec, rtt)
+
+	// Compute BDP.
+	bdpBytes := bytesPerSec * rtt.Microseconds() / 1_000_000
+	bdpPackets := int(bdpBytes) / s.mss
+	if bdpPackets < minCwndPackets {
+		bdpPackets = minCwndPackets
+	}
+
+	// Jump directly to ProbeBW phase.
+	s.phase = BBRProbeBW
+	s.cwndTarget = int(float64(bdpPackets) * probeBWCwndGain)
+	s.pacingRate = bytesPerSec
+	s.cycleIndex = 2 // start at cruise (skip initial probe/drain)
+	s.cycleStart = time.Now()
+
+	// Update pacer.
+	s.pacer.SetRate(s.pacingRate)
+}
+
 // OnACK is called for each ACK event. It updates the BBR model and
 // transitions between phases as needed.
 //

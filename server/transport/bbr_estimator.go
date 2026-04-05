@@ -368,3 +368,21 @@ func (e *bbrEstimator) Reset() {
 	e.roundStart = false
 	e.nextRoundDelivered = 0
 }
+
+// SeedBandwidth pre-loads the BtlBw and RTprop filters with initial estimates.
+// This allows BBR to skip Startup entirely and begin in ProbeBW with a
+// reasonable starting point.
+func (e *bbrEstimator) SeedBandwidth(bytesPerSec int64, rtt time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	now := time.Now()
+
+	// Seed RTprop filter with the given RTT.
+	e.rtpropFilter.update(rtt, now)
+	e.rtpropUs.Store(rtt.Microseconds())
+
+	// Seed BtlBw filter with the given bandwidth.
+	e.btlbwFilter.update(bytesPerSec, 0)
+	e.btlbwBps.Store(bytesPerSec)
+}
