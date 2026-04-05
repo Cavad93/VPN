@@ -63,10 +63,11 @@ const (
 	fullBwCountMax = 3
 
 	// minCwndPackets: absolute minimum cwnd.
-	// 4 packets (5.8 KB) allows adaptive convergence to low-BDP paths
-	// without over-buffering. 32 was causing excessive queuing on links
-	// where the real BDP is only a few KB.
-	minCwndPackets = 4
+	// 32 packets (46 KB) prevents throughput from collapsing below ~4 Mbps
+	// at 87ms RTT even if BBR's BtlBw estimate is temporarily low.
+	// A floor of 4 (5.8 KB) was too small: at 87ms RTT the throughput
+	// floor was only 0.54 Mbps, making recovery from ACK-delay spirals slow.
+	minCwndPackets = 32
 )
 
 // ProbeBW 8-phase pacing gains. Each phase lasts ~1 RTT.

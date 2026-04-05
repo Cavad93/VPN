@@ -514,6 +514,15 @@ func (c *Conn) processData(pkt *Packet) {
 	c.recvSeqAtomic.Store(c.recvSeq)
 	c.recvMu.Unlock()
 
+	// Send ACK BEFORE delivering to readCh.
+	// Critical for BBR throughput: delivery rate is measured from the time
+	// between packets being sent and their ACKs arriving. If readCh is full
+	// (consumer is slow), the blocking send below can delay ACKs by 100-300ms.
+	// BBR then measures near-zero delivery rate, slashes cwnd, and throughput
+	// collapses to ~1 Mbps in a downward spiral.
+	// Sending ACK first decouples BBR feedback from consumer backpressure.
+	c.sendACK()
+
 	// Deliver payloads OUTSIDE recvMu to avoid deadlock if readCh is full.
 	for _, payload := range toDeliver {
 		select {
@@ -522,13 +531,6 @@ func (c *Conn) processData(pkt *Packet) {
 			return
 		}
 	}
-
-	// Send ACK immediately — no delayed ACK timer.
-	// Delayed ACK (1ms timer) was adding latency to every BBR feedback cycle.
-	// In user-space UDP, fast ACK feedback is critical for cwnd growth.
-	// The slight increase in ACK traffic (~2× more ACKs) is negligible
-	// compared to the throughput gain from faster BBR convergence.
-	c.sendACK()
 }
 
 // sendACK encodes and transmits a pure ACK packet using a pooled buffer to
