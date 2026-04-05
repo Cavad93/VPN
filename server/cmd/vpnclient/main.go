@@ -357,6 +357,9 @@ func (vs *vpnSession) connectUDP() (
 	}
 	cleanupConn := func() { udpConn.Close() }
 
+	// Seed BBR with 100 Mbps @ estimated 65ms RTT — skip slow Startup phase.
+	udpConn.SetInitialBandwidth(100_000_000/8, 65*time.Millisecond)
+
 	// 2. TLS obfuscation handshake over UDP.
 	log.Info("starting obfs handshake (UDP)")
 	obfs := transport.NewObfsConn(udpConn)
@@ -649,7 +652,7 @@ func run() error {
 	keyFile    := flag.String("key", "client_privkey.hex", "path to hex-encoded private key file")
 	serverKeyHex := flag.String("server-key", "", "expected server public key hex (optional, for verification)")
 	bonds := flag.Int("bonds", numBondConns, "number of parallel TCP connections (more = faster on lossy high-RTT paths)")
-	transportFlag := flag.String("transport", "tcp", "transport protocol: tcp or udp (udp uses BBR congestion control)")
+	transportFlag := flag.String("transport", "udp", "transport protocol: tcp or udp (udp uses BBR congestion control)")
 	flag.Parse()
 
 	if *transportFlag != "tcp" && *transportFlag != "udp" {

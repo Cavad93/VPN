@@ -138,5 +138,11 @@ func (u *UDPNetConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
+// SetInitialBandwidth seeds the underlying BBR congestion control with known
+// bandwidth and RTT, skipping the slow Startup phase.
+func (u *UDPNetConn) SetInitialBandwidth(bytesPerSec int64, rtt time.Duration) {
+	u.inner.SetInitialBandwidth(bytesPerSec, rtt)
+}
+
 // Verify UDPNetConn implements net.Conn at compile time.
 var _ net.Conn = (*UDPNetConn)(nil)

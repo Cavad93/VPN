@@ -942,7 +942,9 @@ func TestRouteFromTun(t *testing.T) {
 	serverKP, _ := crypto.GenerateKeyPair()
 	clientKP, _ := crypto.GenerateKeyPair()
 
-	srv, err := NewServer(DefaultConfig(), serverKP, tun, nil, newTestLogger())
+	cfg := DefaultConfig()
+	cfg.Transport = "tcp" // test uses raw TCP dial
+	srv, err := NewServer(cfg, serverKP, tun, nil, newTestLogger())
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}

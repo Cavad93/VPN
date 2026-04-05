@@ -63,7 +63,7 @@ func DefaultConfig() Config {
 		ListenAddr:  "0.0.0.0:443",
 		TunCIDR:     "10.8.0.1/24",
 		PrivKeyFile: "server_privkey.hex",
-		Transport:   "tcp",
+		Transport:   "udp",
 	}
 }
 
@@ -313,7 +313,9 @@ func (s *Server) runUDP(ctx context.Context) error {
 				continue
 			}
 		}
-		go s.handleConn(ctx, conn)
+		// Seed BBR: 100 Mbps @ 65ms RTT — skip slow Startup phase.
+		conn.SetInitialBandwidth(100_000_000/8, 65*time.Millisecond)
+		go s.handleConn(ctx, conn) //nolint:errcheck
 	}
 }
 

@@ -25,7 +25,7 @@ func ListenUDP(addr string) (*UDPListener, error) {
 // Accept waits for the next incoming UDP connection and returns it as net.Conn.
 // The returned connection uses BBR congestion control, reliable delivery,
 // and ordered packets — suitable for ObfsConn → Noise → Mux stack.
-func (l *UDPListener) Accept(ctx context.Context) (net.Conn, error) {
+func (l *UDPListener) Accept(ctx context.Context) (*UDPNetConn, error) {
 	conn, err := l.inner.Accept(ctx)
 	if err != nil {
 		return nil, err
@@ -46,7 +46,7 @@ func (l *UDPListener) Close() {
 // DialUDP creates a reliable UDP connection to addr and returns it as net.Conn.
 // The connection uses BBR congestion control — suitable for the full
 // ObfsConn → Noise → Mux stack.
-func DialUDP(addr string) (net.Conn, error) {
+func DialUDP(addr string) (*UDPNetConn, error) {
 	conn, err := Dial(addr)
 	if err != nil {
 		return nil, err

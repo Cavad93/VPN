@@ -843,7 +843,7 @@ class VPNConfig:
     key_pair: Optional[KeyPair] = None       # or provide directly
     connect_timeout: float = 30.0
     read_timeout: float = 60.0
-    transport: str = "tcp"      # "tcp" or "udp" (user-space BBR on server)
+    transport: str = "udp"      # "tcp" or "udp" (user-space BBR on server)
 
 
 # ---------------------------------------------------------------------------
