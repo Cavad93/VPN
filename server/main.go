@@ -313,8 +313,8 @@ func (s *Server) runUDP(ctx context.Context) error {
 				continue
 			}
 		}
-		// Seed BBR: 100 Mbps @ 65ms RTT — skip slow Startup phase.
-		conn.SetInitialBandwidth(100_000_000/8, 65*time.Millisecond)
+		// Seed BBR: 15 Mbps @ 65ms RTT — skip slow Startup phase.
+		conn.SetInitialBandwidth(15_000_000/8, 65*time.Millisecond)
 		go s.handleConn(ctx, conn) //nolint:errcheck
 	}
 }

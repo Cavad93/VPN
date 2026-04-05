@@ -357,8 +357,8 @@ func (vs *vpnSession) connectUDP() (
 	}
 	cleanupConn := func() { udpConn.Close() }
 
-	// Seed BBR with 100 Mbps @ estimated 65ms RTT — skip slow Startup phase.
-	udpConn.SetInitialBandwidth(100_000_000/8, 65*time.Millisecond)
+	// Seed BBR with 15 Mbps @ estimated 65ms RTT — skip slow Startup phase.
+	udpConn.SetInitialBandwidth(15_000_000/8, 65*time.Millisecond)
 
 	// 2. TLS obfuscation handshake over UDP.
 	log.Info("starting obfs handshake (UDP)")
