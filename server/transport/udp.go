@@ -137,6 +137,7 @@ type Conn struct {
 	sendSeq  uint32
 	sendBase uint32 // lowest unACKed seq (fast-path duplicate ACK detection)
 	pending  map[uint32]*pendingPacket
+	batch    *batchWriter // batched send (amortizes syscall overhead)
 
 	// Receive side: ordered delivery buffer.
 	recvMu  sync.Mutex
@@ -184,6 +185,7 @@ func newConn(conn *net.UDPConn, remote *net.UDPAddr, ownConn bool) *Conn {
 		pending: make(map[uint32]*pendingPacket, 128), // pre-allocate for typical cwnd
 		recvBuf: make(map[uint32]*Packet, 32), // pre-allocate for typical reorder window
 		readCh:  make(chan []byte, 8192),
+		batch:   newBatchWriter(conn),
 		bbr:     bbr,
 		rto:     initialRTO,
 		ctx:     ctx,
@@ -192,7 +194,35 @@ func newConn(conn *net.UDPConn, remote *net.UDPAddr, ownConn bool) *Conn {
 	}
 	c.sendCond = sync.NewCond(&c.sendMu)
 	go c.retransmitLoop()
+	go c.batchFlushLoop()
 	return c
+}
+
+// batchFlushInterval is how often the flush loop checks for stale batches.
+// 200µs balances latency (unflushed packets sit at most 200µs) vs CPU overhead.
+const batchFlushInterval = 200 * time.Microsecond
+
+// batchFlushLoop periodically flushes any pending batch to avoid packets
+// sitting in the buffer when no new Write() arrives to trigger a flush.
+// This is important when multiple Mux streams write concurrently — each
+// stream's Write() flushes its own batch, but packets from OTHER streams'
+// writePacket calls (queued between the last cwnd-trigger and Write's flush)
+// might sit waiting.
+func (c *Conn) batchFlushLoop() {
+	ticker := time.NewTicker(batchFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.sendMu.Lock()
+			if c.batch.Len() > 0 {
+				c.batch.Flush() //nolint:errcheck
+			}
+			c.sendMu.Unlock()
+		}
+	}
 }
 
 // RemoteAddr returns the remote UDP address of this connection.
@@ -202,6 +232,8 @@ func (c *Conn) RemoteAddr() *net.UDPAddr { return c.remote }
 func (c *Conn) LocalAddr() net.Addr { return c.conn.LocalAddr() }
 
 // Write sends data reliably, fragmenting into MaxPayloadSize chunks as needed.
+// After all fragments are queued, any remaining batch is flushed so the data
+// doesn't sit in the buffer waiting for more writes.
 func (c *Conn) Write(data []byte) error {
 	for len(data) > 0 {
 		size := len(data)
@@ -213,7 +245,12 @@ func (c *Conn) Write(data []byte) error {
 		}
 		data = data[size:]
 	}
-	return nil
+	// Flush any remaining packets that didn't trigger a batch flush
+	// (e.g., last fragment didn't fill cwnd or batch).
+	c.sendMu.Lock()
+	err := c.batch.Flush()
+	c.sendMu.Unlock()
+	return err
 }
 
 // sendBufPool pools packet encode buffers to avoid allocation on the hot path.
@@ -274,10 +311,17 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 	appLimited := len(c.pending) == 0
 
 	now := time.Now()
-	_, err := c.conn.WriteToUDP(buf, c.remote)
-	sendBufPool.Put(bp)
-	if err != nil {
-		return err
+
+	// Add to batch instead of sending immediately.
+	// The batch is flushed when: (a) full, or (b) cwnd will be full after this pkt.
+	c.batch.Add(buf, c.remote, bp)
+
+	// Flush batch if full OR if this packet fills the cwnd (next writePacket will block).
+	pendingAfter := len(c.pending) + 1 // +1 for this packet we're about to register
+	if c.batch.Len() >= maxBatchSize || pendingAfter >= cwndTarget {
+		if err := c.batch.Flush(); err != nil {
+			return err
+		}
 	}
 
 	// Reuse the single payloadCopy for the retransmission record.
@@ -611,6 +655,10 @@ func (c *Conn) Read(ctx context.Context) ([]byte, error) {
 // Close shuts down the connection and, for Dial-side conns, the UDP socket.
 func (c *Conn) Close() {
 	c.closeOnce.Do(func() {
+		// Flush any pending batch before closing.
+		c.sendMu.Lock()
+		c.batch.Flush() //nolint:errcheck
+		c.sendMu.Unlock()
 		// Send final ACK before closing.
 		c.sendACK()
 		c.cancel()
@@ -691,10 +739,11 @@ func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
 
 // readLoop is the listener's receive goroutine. It demultiplexes incoming UDP
 // datagrams to per-remote-address Conn objects, creating new ones as needed.
+// Uses batchReader to amortize syscall overhead when the platform supports it.
 func (l *Listener) readLoop() {
-	buf := make([]byte, 65535)
+	reader := newBatchReader(l.conn, maxBatchSize)
 	for {
-		n, remote, err := l.conn.ReadFromUDP(buf)
+		results, count, err := reader.Read()
 		if err != nil {
 			select {
 			case <-l.ctx.Done():
@@ -704,36 +753,38 @@ func (l *Listener) readLoop() {
 			}
 		}
 
-		pkt, err := DecodePacket(buf[:n])
-		if err != nil {
-			continue
-		}
-
-		key := remote.String()
-		l.connsMu.RLock()
-		c, exists := l.conns[key]
-		l.connsMu.RUnlock()
-
-		if !exists {
-			// New remote — create a Conn sharing the listener's socket.
-			c = newConn(l.conn, remote, false)
-			l.connsMu.Lock()
-			l.conns[key] = c
-			l.connsMu.Unlock()
-			select {
-			case l.acceptCh <- c:
-			default:
+		for i := 0; i < count; i++ {
+			pkt, err := DecodePacket(results[i].buf)
+			if err != nil {
+				continue
 			}
-		}
 
-		switch pkt.Type {
-		case PacketTypeData, PacketTypeSYN, PacketTypeFIN:
-			c.processData(pkt)
-			// Note: processData may store pkt in recvBuf — don't return to pool.
-		case PacketTypeACK:
-			c.processACK(pkt.AckNum)
-			pkt.Payload = nil
-			pktPool.Put(pkt)
+			remote := results[i].addr
+			key := remote.String()
+			l.connsMu.RLock()
+			c, exists := l.conns[key]
+			l.connsMu.RUnlock()
+
+			if !exists {
+				// New remote — create a Conn sharing the listener's socket.
+				c = newConn(l.conn, remote, false)
+				l.connsMu.Lock()
+				l.conns[key] = c
+				l.connsMu.Unlock()
+				select {
+				case l.acceptCh <- c:
+				default:
+				}
+			}
+
+			switch pkt.Type {
+			case PacketTypeData, PacketTypeSYN, PacketTypeFIN:
+				c.processData(pkt)
+			case PacketTypeACK:
+				c.processACK(pkt.AckNum)
+				pkt.Payload = nil
+				pktPool.Put(pkt)
+			}
 		}
 	}
 }
@@ -773,10 +824,11 @@ func Dial(addr string) (*Conn, error) {
 }
 
 // dialReadLoop is the receive goroutine for a Dial-side Conn.
+// Uses batchReader to amortize syscall overhead when the platform supports it.
 func dialReadLoop(conn *net.UDPConn, c *Conn) {
-	buf := make([]byte, 65535)
+	reader := newBatchReader(conn, maxBatchSize)
 	for {
-		n, _, err := conn.ReadFromUDP(buf)
+		results, count, err := reader.Read()
 		if err != nil {
 			select {
 			case <-c.ctx.Done():
@@ -785,17 +837,19 @@ func dialReadLoop(conn *net.UDPConn, c *Conn) {
 				continue
 			}
 		}
-		pkt, err := DecodePacket(buf[:n])
-		if err != nil {
-			continue
-		}
-		switch pkt.Type {
-		case PacketTypeData, PacketTypeSYN, PacketTypeFIN:
-			c.processData(pkt)
-		case PacketTypeACK:
-			c.processACK(pkt.AckNum)
-			pkt.Payload = nil
-			pktPool.Put(pkt)
+		for i := 0; i < count; i++ {
+			pkt, err := DecodePacket(results[i].buf)
+			if err != nil {
+				continue
+			}
+			switch pkt.Type {
+			case PacketTypeData, PacketTypeSYN, PacketTypeFIN:
+				c.processData(pkt)
+			case PacketTypeACK:
+				c.processACK(pkt.AckNum)
+				pkt.Payload = nil
+				pktPool.Put(pkt)
+			}
 		}
 	}
 }
