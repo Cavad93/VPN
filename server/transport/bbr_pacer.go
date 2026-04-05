@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -85,15 +86,32 @@ func (p *pacer) timeToSend(packetSize int) time.Duration {
 
 // WaitForSlot blocks until the pacer allows sending a packet of the given size.
 // Returns immediately if tokens are available.
+// Uses a timer channel instead of time.Sleep so the wait can be cancelled
+// externally via WaitForSlotCtx.
 func (p *pacer) WaitForSlot(packetSize int) {
+	p.WaitForSlotCtx(context.Background(), packetSize) //nolint:errcheck
+}
+
+// WaitForSlotCtx is the context-aware version of WaitForSlot.
+// Returns ctx.Err() if the context is cancelled before the slot opens.
+func (p *pacer) WaitForSlotCtx(ctx context.Context, packetSize int) error {
 	wait := p.timeToSend(packetSize)
 	if wait <= 0 {
-		return
+		return nil
 	}
 
-	time.Sleep(wait)
+	// Use a timer channel instead of time.Sleep: the timer can be stopped
+	// immediately on context cancellation, avoiding goroutine leaks and
+	// allowing the caller to abort on shutdown.
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
-	// After sleeping, consume the tokens.
+	// After waiting, consume the tokens.
 	p.mu.Lock()
 	p.fillTokens()
 	p.tokens -= float64(packetSize)
@@ -103,6 +121,7 @@ func (p *pacer) WaitForSlot(packetSize int) {
 	p.totalWait += wait
 	p.waitCount++
 	p.mu.Unlock()
+	return nil
 }
 
 // TokensAvailable returns true if a packet of the given size can be sent

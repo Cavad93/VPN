@@ -22,9 +22,9 @@ import (
 // Default coalescing parameters.
 const (
 	// coalesceDelay is the maximum time to hold data before flushing.
-	// 1 ms adds negligible latency but allows batching burst writes
-	// (e.g. multiple mux streams writing concurrently).
-	coalesceDelay = time.Millisecond
+	// 200µs is enough to coalesce burst writes within one scheduler round
+	// while keeping per-packet latency impact under 0.2ms (vs 1ms before).
+	coalesceDelay = 200 * time.Microsecond
 
 	// coalesceMaxSize triggers an immediate flush when the buffer reaches
 	// this size. Aligned to typical MSS (1460) × 10 to fill ~10 TCP segments.

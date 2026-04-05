@@ -234,13 +234,17 @@ func (m *Mux) readLoop() {
 
 		case FrameData:
 			if exists {
-				// payload is a fresh allocation from readLoop — pass it directly,
-				// no extra copy needed.
+				// Blocking dispatch: backpressure propagates to the TCP sender.
+				// Previously used non-blocking + drop, which silently lost frames
+				// and caused throughput collapse. Blocking here is safe because:
+				//  - the consumer (Stream.Read) always drains readCh;
+				//  - m.ctx.Done() unblocks when the mux is closing;
+				//  - s.closed unblocks when the stream is explicitly closed.
 				select {
 				case s.readCh <- payload:
-				default:
-					// Receive buffer full — drop the frame.
-					// The upper layer is responsible for flow control.
+				case <-s.closed:
+				case <-m.ctx.Done():
+					return
 				}
 			}
 
@@ -278,7 +282,7 @@ func newStream(id uint32, mux *Mux) *Stream {
 	return &Stream{
 		id:           id,
 		mux:          mux,
-		readCh:       make(chan []byte, 8192), // large buffer avoids drops (non-blocking dispatch)
+		readCh:       make(chan []byte, 256), // 256×1460≈370KB; blocking dispatch prevents drops
 		remoteClosed: make(chan struct{}),
 		closed:       make(chan struct{}),
 	}
