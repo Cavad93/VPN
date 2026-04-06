@@ -33,6 +33,28 @@ var muxFramePool = sync.Pool{
 	},
 }
 
+// muxReadPoolMaxSize is the largest payload (bytes) that readLoop will
+// allocate from muxReadPool. Frames larger than this are allocated directly.
+// 1500 covers the maximum VPN inner packet (tunMTU=1430 + mux/noise/obfs overhead).
+const muxReadPoolMaxSize = 1500
+
+// muxReadPool recycles payload buffers in readLoop, eliminating ~2630 heap
+// allocations per second at 30 Mbps (one per incoming mux frame).
+var muxReadPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, muxReadPoolMaxSize)
+		return &buf
+	},
+}
+
+// muxPayload carries a received mux frame payload through the readCh channel.
+// If backing is non-nil the slice was borrowed from muxReadPool and must be
+// returned to the pool once the payload has been fully consumed.
+type muxPayload struct {
+	data    []byte
+	backing *[]byte // non-nil ⟹ return to muxReadPool after consumption
+}
+
 // Frame types carried in the mux header.
 const (
 	FrameSYN  uint8 = 0x01 // open a new stream
@@ -201,10 +223,24 @@ func (m *Mux) readLoop() {
 		fType := hdr[4]
 		length := binary.BigEndian.Uint16(hdr[5:7])
 
-		var payload []byte
+		// Build the payload for this frame.
+		// Frames ≤ muxReadPoolMaxSize bytes are read into a pooled buffer to
+		// avoid a heap allocation per frame (~2630/sec at 30 Mbps).  Larger
+		// frames (rare; never occur in normal VPN traffic) fall back to a
+		// direct allocation.
+		var mp muxPayload
 		if length > 0 {
-			payload = make([]byte, length)
-			if _, err := io.ReadFull(m.conn, payload); err != nil {
+			if int(length) <= muxReadPoolMaxSize {
+				pb := muxReadPool.Get().(*[]byte)
+				mp = muxPayload{data: (*pb)[:length], backing: pb}
+			} else {
+				buf := make([]byte, length)
+				mp = muxPayload{data: buf}
+			}
+			if _, err := io.ReadFull(m.conn, mp.data); err != nil {
+				if mp.backing != nil {
+					muxReadPool.Put(mp.backing)
+				}
 				m.Close() //nolint:errcheck
 				return
 			}
@@ -216,6 +252,9 @@ func (m *Mux) readLoop() {
 
 		switch fType {
 		case FrameSYN:
+			if mp.backing != nil {
+				muxReadPool.Put(mp.backing)
+			}
 			if !exists {
 				s = newStream(streamID, m)
 				m.streamsMu.Lock()
@@ -241,14 +280,25 @@ func (m *Mux) readLoop() {
 				//  - m.ctx.Done() unblocks when the mux is closing;
 				//  - s.closed unblocks when the stream is explicitly closed.
 				select {
-				case s.readCh <- payload:
+				case s.readCh <- mp:
 				case <-s.closed:
+					if mp.backing != nil {
+						muxReadPool.Put(mp.backing)
+					}
 				case <-m.ctx.Done():
+					if mp.backing != nil {
+						muxReadPool.Put(mp.backing)
+					}
 					return
 				}
+			} else if mp.backing != nil {
+				muxReadPool.Put(mp.backing)
 			}
 
 		case FrameFIN:
+			if mp.backing != nil {
+				muxReadPool.Put(mp.backing)
+			}
 			if exists {
 				s.remoteOnce.Do(func() {
 					close(s.remoteClosed)
@@ -270,9 +320,9 @@ func (m *Mux) readLoop() {
 type Stream struct {
 	id           uint32
 	mux          *Mux
-	readCh       chan []byte   // inbound payloads queued by readLoop
-	readBuf      []byte       // leftover bytes from the last readCh entry
-	remoteClosed chan struct{} // closed when the remote sends FIN
+	readCh       chan muxPayload // inbound payloads queued by readLoop
+	readBuf      []byte         // leftover bytes from the last readCh entry (always a fresh alloc)
+	remoteClosed chan struct{}   // closed when the remote sends FIN
 	remoteOnce   sync.Once
 	closed       chan struct{} // closed when Close/closeLocal is called
 	closeOnce    sync.Once
@@ -282,7 +332,7 @@ func newStream(id uint32, mux *Mux) *Stream {
 	return &Stream{
 		id:           id,
 		mux:          mux,
-		readCh:       make(chan []byte, 256), // 256×1460≈370KB; blocking dispatch prevents drops
+		readCh:       make(chan muxPayload, 256), // 256×1460≈370KB; blocking dispatch prevents drops
 		remoteClosed: make(chan struct{}),
 		closed:       make(chan struct{}),
 	}
@@ -327,19 +377,19 @@ func (s *Stream) Read(p []byte) (int, error) {
 	}
 	// Non-blocking drain: prioritise already-queued data.
 	select {
-	case data := <-s.readCh:
-		return s.consumeData(p, data), nil
+	case mp := <-s.readCh:
+		return s.consumeData(p, mp), nil
 	default:
 	}
 	// Block until data arrives, remote closes, or local close.
 	select {
-	case data := <-s.readCh:
-		return s.consumeData(p, data), nil
+	case mp := <-s.readCh:
+		return s.consumeData(p, mp), nil
 	case <-s.remoteClosed:
 		// One final drain to deliver any frames that arrived before FIN.
 		select {
-		case data := <-s.readCh:
-			return s.consumeData(p, data), nil
+		case mp := <-s.readCh:
+			return s.consumeData(p, mp), nil
 		default:
 			return 0, io.EOF
 		}
@@ -348,13 +398,26 @@ func (s *Stream) Read(p []byte) (int, error) {
 	}
 }
 
-// consumeData copies data into p and saves the overflow for the next Read.
-// Optimisation: the overflow tail is kept as a sub-slice of data (zero-copy)
-// since each data slice is a fresh allocation from readLoop and is not reused.
-func (s *Stream) consumeData(p, data []byte) int {
-	n := copy(p, data)
-	if n < len(data) {
-		s.readBuf = data[n:]
+// consumeData copies the payload into p, returns the pooled backing buffer to
+// muxReadPool if present, and stashes any overflow as a fresh allocation so
+// that the pool buffer can be released immediately.
+//
+// In practice overflow never occurs: handleDataStream reads with a 65536-byte
+// buffer, which is larger than the maximum mux payload (1430 bytes for VPN
+// traffic).  The overflow path is kept for correctness only.
+func (s *Stream) consumeData(p []byte, mp muxPayload) int {
+	n := copy(p, mp.data)
+	if n < len(mp.data) {
+		// Overflow: copy the remainder into a fresh allocation so we can
+		// safely return the pool buffer.  This branch is never hit in
+		// normal VPN operation (see comment above).
+		tail := make([]byte, len(mp.data)-n)
+		copy(tail, mp.data[n:])
+		s.readBuf = tail
+	}
+	// Return the pooled buffer now that we are done reading from it.
+	if mp.backing != nil {
+		muxReadPool.Put(mp.backing)
 	}
 	return n
 }
