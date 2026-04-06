@@ -340,8 +340,15 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 
 	// Take delivery-rate snapshot for BBR estimator.
 	delivered, deliveredTime := c.bbr.estimator.DeliveredSnapshot()
-	// Check if sender is app-limited (no data queued beyond this packet).
-	appLimited := len(c.pending) == 0
+	// Check if sender is app-limited (pipe not full at send time).
+	// A packet is app-limited if inflight < cwnd at send time — meaning the
+	// application, not the network, is constraining throughput. Only when the
+	// pipe is full can we trust the measured delivery rate as a BtlBw sample.
+	// Using len(c.pending) < cwndTarget (already computed above, no extra lock)
+	// matches the Linux BBR definition. The previous check (== 0) only caught
+	// the very first packet after idle; subsequent burst packets were incorrectly
+	// marked non-app-limited, causing BtlBw to be underestimated after idle.
+	appLimited := len(c.pending) < cwndTarget
 
 	now := time.Now()
 
