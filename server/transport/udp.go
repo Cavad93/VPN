@@ -115,6 +115,30 @@ var pendingPool = sync.Pool{
 	New: func() interface{} { return new(pendingPacket) },
 }
 
+// ackedPktInfo carries per-packet measurements collected under sendMu in
+// processACK, then consumed outside sendMu to feed the BBR estimator.
+type ackedPktInfo struct {
+	seq           uint32
+	rtt           time.Duration
+	payloadSize   int
+	delivered     int64
+	deliveredTime time.Time
+	sentAt        time.Time
+	appLimited    bool
+	retransmitted bool
+}
+
+// ackedSlicePool pools the backing arrays of the acked-packets slice used
+// in processACK. At 30 Mbps with 1460-byte payloads, processACK is called
+// ~2500 times/sec; reusing the backing array eliminates that many heap
+// allocations and reduces GC pressure by ~3 MB/sec.
+var ackedSlicePool = sync.Pool{
+	New: func() interface{} {
+		s := make([]ackedPktInfo, 0, 16)
+		return &s
+	},
+}
+
 // ackBufPool pools the fixed-size 11-byte slices used to encode pure ACK
 // packets, eliminating one heap allocation per received data packet.
 var ackBufPool = sync.Pool{
@@ -401,18 +425,6 @@ func (c *Conn) getRTO() time.Duration {
 // processACK handles an incoming ACK, releasing pending packets up to ackNum
 // and feeding the BBR estimator with per-ACK measurements.
 func (c *Conn) processACK(ackNum uint32) {
-	// Phase 1: collect ACKed packets under sendMu (fast — just map lookups).
-	type ackedInfo struct {
-		seq           uint32
-		rtt           time.Duration
-		payloadSize   int
-		delivered     int64
-		deliveredTime time.Time
-		sentAt        time.Time
-		appLimited    bool
-		retransmitted bool
-	}
-
 	c.sendMu.Lock()
 
 	// Fast path: duplicate or stale ACK — nothing to do.
@@ -422,8 +434,12 @@ func (c *Conn) processACK(ackNum uint32) {
 	}
 
 	now := time.Now()
-	// Pre-allocate for typical burst (avoids slice growth allocations).
-	acked := make([]ackedInfo, 0, 16)
+
+	// Phase 1: collect ACKed packets under sendMu (fast — just map lookups).
+	// Reuse a pooled backing array to avoid a heap allocation on every ACK.
+	// At 30 Mbps / 1460-byte payloads this eliminates ~2500 allocs/sec.
+	ackedPtr := ackedSlicePool.Get().(*[]ackedPktInfo)
+	acked := (*ackedPtr)[:0]
 	for seq := range c.pending {
 		if seq < ackNum {
 			pp := c.pending[seq]
@@ -434,7 +450,7 @@ func (c *Conn) processACK(ackNum uint32) {
 				rtt = time.Microsecond
 			}
 
-			acked = append(acked, ackedInfo{
+			acked = append(acked, ackedPktInfo{
 				seq:           seq,
 				rtt:           rtt,
 				payloadSize:   len(pp.pkt.Payload),
@@ -455,6 +471,9 @@ func (c *Conn) processACK(ackNum uint32) {
 	c.sendMu.Unlock()
 
 	if len(acked) == 0 {
+		// Nothing was ACKed — return the pooled slice immediately.
+		*ackedPtr = acked[:0]
+		ackedSlicePool.Put(ackedPtr)
 		return
 	}
 
@@ -476,6 +495,15 @@ func (c *Conn) processACK(ackNum uint32) {
 			inflightPktPool.Put(ifl)
 		}
 	}
+
+	// Return pooled slice. Zero elements first so pooled backing array does not
+	// retain references to time.Time locations or large payload data past their
+	// useful lifetime.
+	for i := range acked {
+		acked[i] = ackedPktInfo{}
+	}
+	*ackedPtr = acked[:0]
+	ackedSlicePool.Put(ackedPtr)
 }
 
 // processData handles an incoming data packet, buffers out-of-order packets,
