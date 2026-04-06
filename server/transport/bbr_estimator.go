@@ -320,15 +320,33 @@ func (e *bbrEstimator) Delivered() int64 {
 	return e.delivered
 }
 
+// idleRestartThreshold is the maximum age of deliveredTime before it is
+// considered stale (sender was idle). After this threshold DeliveredSnapshot
+// returns time.Now() so that delivery-rate calculations don't span the idle
+// gap and produce garbage bandwidth samples.
+var idleRestartThreshold = time.Second
+
 // DeliveredSnapshot returns a snapshot of (delivered, deliveredTime)
 // for stamping outgoing packets. Lock-free via atomic reads.
+//
+// Idle-gap protection: if deliveredTime is older than idleRestartThreshold
+// the sender has been idle and the timestamp is stale. Returning time.Now()
+// prevents the first burst of post-idle ACKs from computing an artificially
+// tiny delivery rate (bytes / idle_seconds) that would poison the BtlBw
+// filter when those packets are later ACKed with isAppLimited=false.
 func (e *bbrEstimator) DeliveredSnapshot() (int64, time.Time) {
 	d := e.deliveredAtomic.Load()
 	tNano := e.deliveredTimeNano.Load()
 	if tNano == 0 {
-		return d, time.Time{}
+		return d, time.Now()
 	}
-	return d, time.Unix(0, tNano)
+	t := time.Unix(0, tNano)
+	if time.Since(t) > idleRestartThreshold {
+		// Sender was idle — cap the stale timestamp so delivery rates are
+		// computed over the actual transmission interval, not the idle gap.
+		return d, time.Now()
+	}
+	return d, t
 }
 
 // RoundCount returns the current round-trip count.

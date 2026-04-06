@@ -176,6 +176,53 @@ appLimited := len(c.pending) < cwndTarget
 
 ---
 
+## Запуск 6 — 2026-04-06
+
+### Выполнено: BBR idle restart — устранение отравления BtlBw через stale deliveredTime
+
+**Файлы:** `server/transport/bbr_estimator.go`, `server/transport/bbr_estimator_test.go`
+
+**Проблема (дополнение к Запуску 4):**
+
+Запуск 4 исправил метку `appLimited` (пакеты, пока cwnd не заполнен, помечаются как app-limited). Однако оставалась вторая проблема: все пакеты burst'а после idle получали одинаковый `sendDeliveredTime` из `DeliveredSnapshot()` — время последнего ACK **до** простоя (например, 60 секунд назад).
+
+Когда ACK для этих пакетов возвращался:
+```
+deliveredInterval = 1400 bytes
+ackElapsed = RTT + idle_duration  (например, 90 мс + 60 с = 60.09 с!)
+deliveryRate = 1400 / 60.09 ≈ 23 bytes/s  ← мусор
+```
+
+Если пакет был помечен `appLimited=false` (например, когда cwnd был заполнен до idle), BBR обновлял BtlBw мусорным значением → throughput коллапсировал.
+
+**Исправление: `DeliveredSnapshot()` капирует устаревший timestamp**
+
+```go
+var idleRestartThreshold = time.Second
+
+func (e *bbrEstimator) DeliveredSnapshot() (int64, time.Time) {
+    ...
+    if time.Since(t) > idleRestartThreshold {
+        return d, time.Now()  // cap stale timestamp
+    }
+    return d, t
+}
+```
+
+**Эффект:**
+- Все пакеты burst'а после idle получают `sendDeliveredTime ≈ now`
+- Delivery rate для их ACK = `bytes / RTT` — корректное значение
+- BtlBw обновляется корректными сэмплами, а не мусорными
+- `idleRestartThreshold = 1s` — переопределяемая переменная для тестов
+
+**Тесты добавлены:**
+- `TestDeliveredSnapshotCapsStaleTime` — stale timestamp (5s ago) → returned time ≈ now
+- `TestBtlBwNotPoisonedAfterIdle` — e2e: BtlBw > 100 KB/s после 3-секундного idle
+
+**Результат:** все тесты прошли (`go test ./transport/ -count=1`)
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **Double CC** — Наш user-space BBR (UDP) + TCP CC ОС (CUBIC/BBR). Два независимых CC на одном пути.

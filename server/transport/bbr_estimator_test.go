@@ -293,6 +293,66 @@ func TestEstimatorAppLimitedSamplesIgnored(t *testing.T) {
 	}
 }
 
+// TestDeliveredSnapshotCapsStaleTime verifies that DeliveredSnapshot returns
+// time.Now() (not the stale stored time) when the sender has been idle longer
+// than idleRestartThreshold. This prevents post-idle ACKs from computing a
+// delivery rate that spans the idle gap (bytes / idle_seconds → garbage).
+func TestDeliveredSnapshotCapsStaleTime(t *testing.T) {
+	e := newBBREstimator()
+
+	// Inject a deliveredTime that is 5 seconds in the past.
+	staleTime := time.Now().Add(-5 * time.Second)
+	e.deliveredTimeNano.Store(staleTime.UnixNano())
+	e.deliveredAtomic.Store(10000)
+
+	_, dt := e.DeliveredSnapshot()
+
+	// The returned time must be close to now, not 5 seconds ago.
+	age := time.Since(dt)
+	if age > 200*time.Millisecond {
+		t.Fatalf("DeliveredSnapshot should cap stale deliveredTime: got %v ago (want <200ms)", age)
+	}
+}
+
+// TestBtlBwNotPoisonedAfterIdle verifies that BtlBw is not contaminated when
+// the sender resumes after a long idle. During idle the stored deliveredTime
+// goes stale; without the fix, post-idle packets' ACKs compute
+// delivery_rate ≈ bytes/idle_seconds, which poisons the BtlBw filter.
+func TestBtlBwNotPoisonedAfterIdle(t *testing.T) {
+	e := newBBREstimator()
+	now := time.Now()
+
+	// Phase 1: establish a healthy BtlBw (≈ 1 MB/s).
+	for i := 0; i < 5; i++ {
+		e.OnACK(50*time.Millisecond, 50_000, int64(i)*50_000, now.Add(-50*time.Millisecond), now.Add(-50*time.Millisecond), false)
+	}
+	bwBefore := e.BtlBw()
+	if bwBefore == 0 {
+		t.Fatal("BtlBw should be non-zero after phase-1 ACKs")
+	}
+
+	// Phase 2: simulate idle — inject a deliveredTime 3 seconds in the past.
+	// This mimics the sender having no data to send for 3 seconds.
+	e.deliveredTimeNano.Store(now.Add(-3 * time.Second).UnixNano())
+
+	// Phase 3: simulate a burst of post-idle ACKs with isAppLimited=false.
+	// With the fix, DeliveredSnapshot() caps the stale time to now, so the
+	// delivery rate is computed over the actual transmission interval, not 3s.
+	postIdleDelivered, postIdleTime := e.DeliveredSnapshot()
+	for i := 0; i < 10; i++ {
+		// ACK arrives ~RTT after the snapshot was taken.
+		e.OnACK(50*time.Millisecond, 1400, postIdleDelivered, postIdleTime, postIdleTime, false)
+	}
+	bwAfter := e.BtlBw()
+
+	// BtlBw must not collapse. Accept any value ≥ 100 KB/s (well above the
+	// ≈23 bytes/s garbage rate that the bug produced before the fix).
+	const minAcceptableBW = 100_000 // 100 KB/s
+	if bwAfter < minAcceptableBW {
+		t.Fatalf("BtlBw poisoned after idle restart: got %d bytes/s (want >=%d)", bwAfter, minAcceptableBW)
+	}
+}
+
 func TestEstimatorReset(t *testing.T) {
 	e := newBBREstimator()
 	now := time.Now()
