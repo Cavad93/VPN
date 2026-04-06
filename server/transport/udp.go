@@ -152,6 +152,17 @@ var ackedSlicePool = sync.Pool{
 	},
 }
 
+// toDeliverPool pools the [][]byte backing arrays used in processData to
+// collect in-order payloads before delivering them to readCh.
+// At 30 Mbps with 1430-byte packets, processData is called ~2630 times/sec;
+// reusing the backing array eliminates that many heap allocations (~83 KB/sec).
+var toDeliverPool = sync.Pool{
+	New: func() interface{} {
+		s := make([][]byte, 0, 4)
+		return &s
+	},
+}
+
 // ackBufPool pools the fixed-size 11-byte slices used to encode pure ACK
 // packets, eliminating one heap allocation per received data packet.
 var ackBufPool = sync.Pool{
@@ -555,7 +566,11 @@ func (c *Conn) processACK(ackNum uint32) {
 func (c *Conn) processData(pkt *Packet) {
 	c.recvMu.Lock()
 
-	toDeliver := make([][]byte, 0, 4)
+	// Borrow a [][]byte slice from the pool to collect in-order payloads.
+	// The pool eliminates ~2630 make([][]byte, 0, 4) allocations/sec at 30 Mbps.
+	tdPtr := toDeliverPool.Get().(*[][]byte)
+	toDeliver := (*tdPtr)[:0]
+
 	if pkt.SeqNum == c.recvSeq {
 		// In-order: deliver immediately.
 		// pkt.Payload is already a unique copy from DecodePacket — no need to copy again.
@@ -600,9 +615,24 @@ func (c *Conn) processData(pkt *Packet) {
 		select {
 		case c.readCh <- payload:
 		case <-c.closed:
+			// Nil out references before returning slice to pool so the pooled
+			// backing array does not retain payload pointers past their lifetime.
+			for i := range toDeliver {
+				toDeliver[i] = nil
+			}
+			*tdPtr = toDeliver[:0]
+			toDeliverPool.Put(tdPtr)
 			return
 		}
 	}
+
+	// Nil out payload references before returning the slice to the pool so the
+	// pooled backing array does not retain pointers past their useful lifetime.
+	for i := range toDeliver {
+		toDeliver[i] = nil
+	}
+	*tdPtr = toDeliver[:0]
+	toDeliverPool.Put(tdPtr)
 }
 
 // sendACK encodes and transmits a pure ACK packet using a pooled buffer to

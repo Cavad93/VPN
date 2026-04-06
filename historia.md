@@ -556,12 +556,47 @@ Payload-копия нужна для возможности ретрансмит
 
 ---
 
+---
+
+## Запуск 13 — 2026-04-06
+
+### Выполнено: toDeliverPool — пул для [][]byte в processData
+
+**Файл:** `server/transport/udp.go`
+
+**Проблема:**  
+`processData` вызывается на каждый входящий DATA пакет и создавала `make([][]byte, 0, 4)` при каждом вызове:
+- При 30 Mbps / 1430-байт пакетах: ~2630 аллокаций/сек = ~83 KB/сек heap pressure.
+- Каждый backing array (4 элемента × 8 байт = 32 байта) жил до GC.
+
+**Решение:**  
+Добавлен `toDeliverPool = sync.Pool{New: func() any { s := make([][]byte, 0, 4); return &s }}`.
+
+В `processData`:
+1. `tdPtr := toDeliverPool.Get().(*[][]byte)` → `toDeliver := (*tdPtr)[:0]` — берём из пула.
+2. Заполнение `toDeliver` как прежде.
+3. Перед возвратом в пул (как по нормальному пути, так и по `c.closed`) — нуллируем элементы (`toDeliver[i] = nil`) чтобы pooled backing array не удерживал payload-ссылки сверх их полезного времени жизни.
+4. `*tdPtr = toDeliver[:0]; toDeliverPool.Put(tdPtr)` — возврат в пул.
+
+**Почему нуллирование элементов важно:**  
+`toDeliver[i]` — это `[]byte` слайс, указывающий на mux-буфер (из `muxReadPool`). Если не обнулять — pooled backing array удерживал бы ссылки на старые буферы после их возврата в `muxReadPool`, создавая dangling pseudo-references и мешая GC собрать старые буферы.
+
+**Эффект:**  
+- Устранена `make([][]byte, 0, 4)` аллокация ~2630 раз/сек → 0 в steady-state.
+- `processData` теперь имеет нулевых heap-аллокаций в нормальном пути (in-order пакеты, нет drain очереди).
+
+**Тесты:** `go test ./...` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **ObfsConn write path** — ~~`Write` нет батчинга~~ РЕШЕНО: `BufConn` (200µs timer, 14600 byte threshold) уже стоит между TCP socket и ObfsConn — все `ObfsConn.Write` вызовы батчатся внутри BufConn. Эта задача закрыта.
 
-2. **processData alloc** — `toDeliver := make([][]byte, 0, 4)` на каждый входящий пакет (~83 KB/сек при 30 Mbps). Малое влияние; можно poolить `[][]byte` с sync.Pool.
+2. **processData alloc** — ~~РЕШЕНО~~ (Запуск 13): `toDeliverPool` устраняет аллокацию.
 
 3. **IPv6 inner tunnel support** — `markECNCE` пока обрабатывает только IPv4. Если туннель расширится до IPv6, нужен аналогичный путь для Traffic Class field (нет checksum → проще).
 
 4. **firstSentAt vs sentAt** — документировано; не баг.
+
+5. **Диагностика новых узких мест** — все известные hot-path аллокации устранены. Следующий шаг: профилирование `pprof` под нагрузкой для поиска скрытых узких мест (candidate: `recvBuf` map insertions/deletions при out-of-order трафике).
