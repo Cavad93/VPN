@@ -165,6 +165,13 @@ type Conn struct {
 	pending  map[uint32]*pendingPacket
 	batch    *batchWriter // batched send (amortizes syscall overhead)
 
+	// hasBatchData is set to true when batch.Add() is called and cleared when
+	// batch.Flush() drains the queue. batchFlushLoop reads it without sendMu to
+	// skip lock acquisition on the idle path (no queued packets). Written under
+	// sendMu; read without lock — a stale false causes a missed 200µs tick at
+	// most; a stale true causes one unnecessary lock + Len() == 0 check.
+	hasBatchData atomic.Bool
+
 	// Receive side: ordered delivery buffer.
 	recvMu  sync.Mutex
 	recvSeq uint32
@@ -249,9 +256,21 @@ func (c *Conn) batchFlushLoop() {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
+			// Fast path: skip lock acquisition when batch is known empty.
+			// hasBatchData is set under sendMu when batch.Add() is called and
+			// cleared under sendMu when batch.Flush() drains the queue.
+			// Reading it here without the lock is intentionally racy: a stale
+			// false skips one 200µs tick (packet delivered slightly late); a
+			// stale true causes one unnecessary lock + Len() == 0 check. Both
+			// outcomes are harmless. This eliminates ~5000 lock/unlock/sec on
+			// idle connections.
+			if !c.hasBatchData.Load() {
+				continue
+			}
 			c.sendMu.Lock()
 			if c.batch.Len() > 0 {
 				c.batch.Flush() //nolint:errcheck
+				c.hasBatchData.Store(false)
 			}
 			c.sendMu.Unlock()
 		}
@@ -282,6 +301,7 @@ func (c *Conn) Write(data []byte) error {
 	// (e.g., last fragment didn't fill cwnd or batch).
 	c.sendMu.Lock()
 	err := c.batch.Flush()
+	c.hasBatchData.Store(false)
 	c.sendMu.Unlock()
 	return err
 }
@@ -355,6 +375,7 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 	// Add to batch instead of sending immediately.
 	// The batch is flushed when: (a) full, or (b) cwnd will be full after this pkt.
 	c.batch.Add(buf, c.remote, bp)
+	c.hasBatchData.Store(true) // signal batchFlushLoop that there is work to do
 
 	// Flush batch if full OR if this packet fills the cwnd (next writePacket will block).
 	pendingAfter := len(c.pending) + 1 // +1 for this packet we're about to register
@@ -362,6 +383,7 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 		if err := c.batch.Flush(); err != nil {
 			return err
 		}
+		c.hasBatchData.Store(false)
 	}
 
 	// Reuse the single payloadCopy for the retransmission record.
@@ -728,6 +750,7 @@ func (c *Conn) Close() {
 		// Flush any pending batch before closing.
 		c.sendMu.Lock()
 		c.batch.Flush() //nolint:errcheck
+		c.hasBatchData.Store(false)
 		c.sendMu.Unlock()
 		// Send final ACK before closing.
 		c.sendACK()

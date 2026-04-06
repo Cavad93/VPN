@@ -147,19 +147,44 @@ appLimited := len(c.pending) < cwndTarget
 
 ---
 
+---
+
+## Запуск 5 — 2026-04-06
+
+### Выполнено: batchFlushLoop — atomic fast-path для пустого batch
+
+**Файл:** `server/transport/udp.go`
+
+**Проблема:**  
+`batchFlushLoop` просыпается каждые 200 мкс и **всегда** берёт `sendMu` — даже когда batch пуст (нет активных write). Это создавало ~5000 lock/unlock в секунду на idle-соединениях, вызывая CPU spinning и конкуренцию с `writePacket` (который держит `sendMu` во время обработки cwnd + batch.Add).
+
+**Решение:**  
+Добавлен `hasBatchData atomic.Bool` в struct `Conn`:
+- Устанавливается в `true` (под `sendMu`) в `writePacket` после `batch.Add()`
+- Сбрасывается в `false` (под `sendMu`) в `writePacket`, `Write` и `Close` после `batch.Flush()`
+- В `batchFlushLoop`: `if !c.hasBatchData.Load() { continue }` — пропускает `sendMu.Lock()` на idle-пути
+
+**Raciness design (намеренная):**  
+Флаг читается без `sendMu` — это допустимо:
+- Stale `false` → пропустим один 200 мкс тик, пакет доставится на 200 мкс позже — безвредно.
+- Stale `true` → приобретём lock, проверим `Len() == 0`, отпустим — один лишний lock/unlock — дешевле текущего.
+
+**Эффект:**  
+На idle-соединениях (batch пуст): ~5000 lock/unlock/сек → 0. `writePacket` больше не конкурирует с пустым flush-тиком за `sendMu`. CPU overhead `batchFlushLoop` на idle снижается до стоимости одного atomic load каждые 200 мкс.
+
+**Тесты:** `go test ./...` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
-1. **Mutex contention (sendMu)** — `batchFlushLoop` просыпается каждые 200 мкс и всегда берёт
-   `sendMu`, даже если `batch.Len() == 0`. При 3000+ lock/unlock в секунду это создаёт CPU spinning.
-   Варианты: atomic-флаг «есть данные в batch», или deadline-flush внутри `writePacket`.
+1. **Double CC** — Наш user-space BBR (UDP) + TCP CC ОС (CUBIC/BBR). Два независимых CC на одном пути.
+   Архитектурная проблема; требует отдельного исследования. Решение: вынести VPN-транспорт на raw sockets или отключить Nagle/CC для inner TCP потоков.
 
-2. **ObfsConn двойная буферизация** — `bufio.Reader (64 KB) + readBuf` — два буфера на соединение.
-   Нужно оценить: можно ли убрать `bufio.Reader` и читать напрямую через `io.ReadFull(c.conn, ...)`.
-
-3. **Double CC** — Наш user-space BBR (UDP) + TCP CC ОС (CUBIC/BBR). Два независимых CC на одном пути.
-   Архитектурная проблема; требует отдельного исследования.
-
-4. **Диагностика** — pprof-профилирование под нагрузкой для поиска других узких мест:
+2. **Диагностика** — pprof-профилирование под нагрузкой для поиска других узких мест:
    - `inflightTracker.mu` — вызывается из `processACK` и `doRetransmit` одновременно
    - `bbr_estimator.mu` — вызывается из `OnACK` для каждого ACK-а
    - `readLoop` в `mux.go` — `make([]byte, length)` на каждый фрейм
+
+3. **ObfsConn write path** — `Write` нет батчинга: каждый `Write(p)` → один TLS record → один syscall.
+   При малых write (< MTU) это значительно снижает пропускную способность. Рассмотреть bufio.Writer с Flush по таймеру.
