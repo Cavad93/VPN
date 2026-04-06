@@ -222,12 +222,7 @@ func TestProcessACKClearsWindow(t *testing.T) {
 			sentAt:        now.Add(-50 * time.Millisecond),
 			deliveredTime: now.Add(-100 * time.Millisecond),
 		}
-		c.bbr.inflight.OnSend(&inflightPkt{
-			SeqNum:        i,
-			Size:          4,
-			SentAt:        now.Add(-50 * time.Millisecond),
-			DeliveredTime: now.Add(-100 * time.Millisecond),
-		})
+		c.bbr.inflight.OnSend(4)
 	}
 	c.sendSeq = 5
 	c.sendMu.Unlock()
@@ -261,12 +256,7 @@ func TestProcessACKCongestionAvoidance(t *testing.T) {
 			sentAt:        now.Add(-50 * time.Millisecond),
 			deliveredTime: now.Add(-100 * time.Millisecond),
 		}
-		c.bbr.inflight.OnSend(&inflightPkt{
-			SeqNum:        i,
-			Size:          4,
-			SentAt:        now.Add(-50 * time.Millisecond),
-			DeliveredTime: now.Add(-100 * time.Millisecond),
-		})
+		c.bbr.inflight.OnSend(4)
 	}
 	c.sendMu.Unlock()
 
@@ -296,13 +286,8 @@ func TestDoRetransmitIncreasesCounter(t *testing.T) {
 		sentAt:        now.Add(-initialRTO * 2), // far in the past
 		deliveredTime: now.Add(-initialRTO * 3),
 	}
-	// Register in inflight tracker (doRetransmit calls OnLoss then OnSend).
-	c.bbr.inflight.OnSend(&inflightPkt{
-		SeqNum:        0,
-		Size:          5,
-		SentAt:        now.Add(-initialRTO * 2),
-		DeliveredTime: now.Add(-initialRTO * 3),
-	})
+	// Register in inflight tracker (doRetransmit calls OnLoss then OnSend on first retransmit).
+	c.bbr.inflight.OnSend(5)
 	c.sendMu.Unlock()
 
 	c.doRetransmit()
@@ -332,12 +317,7 @@ func TestDoRetransmitDropsAfterMaxRetransmits(t *testing.T) {
 		deliveredTime: now.Add(-initialRTO * 3),
 	}
 	// Register in inflight tracker.
-	c.bbr.inflight.OnSend(&inflightPkt{
-		SeqNum:        0,
-		Size:          1,
-		SentAt:        now.Add(-initialRTO * 2),
-		DeliveredTime: now.Add(-initialRTO * 3),
-	})
+	c.bbr.inflight.OnSend(1)
 	c.sendMu.Unlock()
 
 	c.doRetransmit()

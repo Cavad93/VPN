@@ -399,16 +399,9 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 	pp.appLimited = appLimited
 	c.pending[seq] = pp
 
-	// Register with BBR inflight tracker (pooled allocation).
-	ifl := inflightPktPool.Get().(*inflightPkt)
-	ifl.SeqNum = seq
-	ifl.Size = len(payload)
-	ifl.SentAt = now
-	ifl.Retransmitted = false
-	ifl.Delivered = delivered
-	ifl.DeliveredTime = deliveredTime
-	ifl.AppLimited = appLimited
-	c.bbr.inflight.OnSend(ifl)
+	// Register with BBR inflight tracker. Delivery-rate snapshots are stored
+	// in pp (pendingPacket) above; inflightTracker tracks only count/bytes/lost.
+	c.bbr.inflight.OnSend(len(payload))
 
 	return nil
 }
@@ -512,17 +505,14 @@ func (c *Conn) processACK(ackNum uint32) {
 	c.sendCond.Broadcast()
 
 	// Phase 2: feed BBR outside sendMu (no lock contention with writePacket).
+	// Delivery-rate snapshots come directly from ackedPktInfo (copied from
+	// pendingPacket under sendMu), eliminating the second inflightTracker map lookup.
 	for _, a := range acked {
 		if !a.retransmitted {
 			c.updateRTO(a.rtt)
 		}
-		// Use the inflightPkt returned by OnACK — it already has all delivery
-		// snapshots, so we avoid allocating a new one.
-		ifl, ok := c.bbr.inflight.OnACK(a.seq)
-		if ok {
-			c.bbr.OnACK(a.rtt, int64(a.payloadSize), ifl)
-			inflightPktPool.Put(ifl)
-		}
+		c.bbr.inflight.OnACK(a.payloadSize)
+		c.bbr.OnACK(a.rtt, int64(a.payloadSize), a.delivered, a.deliveredTime, a.sentAt, a.appLimited)
 	}
 
 	// Return pooled slice. Zero elements first so pooled backing array does not
@@ -665,9 +655,9 @@ func (c *Conn) doRetransmit() {
 			// Give up on this packet — free the window slot.
 			payloadLen := int64(len(pp.pkt.Payload))
 			delete(c.pending, seq)
-			if ifl, ok := c.bbr.inflight.OnLoss(seq); ok {
-				inflightPktPool.Put(ifl)
-			}
+			// The packet was re-entered into inflight on its first retransmit
+			// (OnLoss + OnSend). Remove it now.
+			c.bbr.inflight.OnLoss(int(payloadLen))
 			lostBytes += payloadLen
 			dropped++
 			pp.pkt = nil
@@ -675,12 +665,13 @@ func (c *Conn) doRetransmit() {
 			continue
 		}
 
-		// Mark as loss in BBR inflight tracker on first retransmit.
+		// On the first retransmit: inform BBR the original was lost, then
+		// re-enter it as a fresh in-flight send. Subsequent retransmits don't
+		// change the in-flight count (the packet is still one packet in flight).
 		if pp.retransmits == 0 {
 			lostBytes += int64(len(pp.pkt.Payload))
-			if ifl, ok := c.bbr.inflight.OnLoss(seq); ok {
-				inflightPktPool.Put(ifl)
-			}
+			c.bbr.inflight.OnLoss(len(pp.pkt.Payload))
+			c.bbr.inflight.OnSend(len(pp.pkt.Payload))
 		}
 
 		// Pre-encode frame into a pooled buffer (pure memory ops — no syscall).
@@ -693,21 +684,14 @@ func (c *Conn) doRetransmit() {
 		copy(rbuf[HeaderSize:], pp.pkt.Payload)
 		toSend = append(toSend, rtxItem{bp: rbp, buf: rbuf})
 
-		// Update retransmit state under lock so next tick won't re-queue.
+		// Update delivery-rate snapshots in pendingPacket so that when the ACK
+		// arrives, processACK feeds BBR with current (not stale) measurements.
+		delivered, deliveredTime := c.bbr.estimator.DeliveredSnapshot()
+		pp.delivered = delivered
+		pp.deliveredTime = deliveredTime
+		pp.appLimited = false
 		pp.sentAt = now
 		pp.retransmits++
-
-		// Re-register in inflight tracker with fresh delivery snapshot (pooled).
-		delivered, deliveredTime := c.bbr.estimator.DeliveredSnapshot()
-		ifl := inflightPktPool.Get().(*inflightPkt)
-		ifl.SeqNum = seq
-		ifl.Size = len(pp.pkt.Payload)
-		ifl.SentAt = now
-		ifl.Retransmitted = true
-		ifl.Delivered = delivered
-		ifl.DeliveredTime = deliveredTime
-		ifl.AppLimited = false
-		c.bbr.inflight.OnSend(ifl)
 	}
 	c.sendMu.Unlock()
 

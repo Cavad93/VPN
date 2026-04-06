@@ -39,6 +39,16 @@ func setupRawUDPPair(t *testing.T) (client, server *Conn) {
 	return clientConn, serverConn
 }
 
+// diagPktMeta holds per-packet delivery-rate snapshots for diagnostic tests.
+// Replaces inflightPkt (which no longer stores per-packet data).
+type diagPktMeta struct {
+	size          int
+	sentAt        time.Time
+	delivered     int64
+	deliveredTime time.Time
+	appLimited    bool
+}
+
 // TestBBRDiagnoseSlowThroughput simulates realistic VPN conditions and
 // traces BBR state to find the root cause of 5-6x speed drop.
 func TestBBRDiagnoseSlowThroughput(t *testing.T) {
@@ -54,7 +64,9 @@ func TestBBRDiagnoseSlowThroughput(t *testing.T) {
 	p := newPacer(0, bbrMaxBurst)
 	bbr := NewBBRState(est, ifl, p, mss)
 
-	// Simulate sending + receiving ACKs for 5 seconds of traffic.
+	// Per-packet metadata (delivery-rate snapshots) stored locally.
+	pktMeta := make(map[uint32]*diagPktMeta, 64)
+
 	var seq uint32
 	sentBytes := int64(0)
 	ackedBytes := int64(0)
@@ -63,13 +75,11 @@ func TestBBRDiagnoseSlowThroughput(t *testing.T) {
 	for i := 0; i < minCwndPackets; i++ {
 		delivered, deliveredTime := est.DeliveredSnapshot()
 		now := time.Now()
-		ifl.OnSend(&inflightPkt{
-			SeqNum:        seq,
-			Size:          mss,
-			SentAt:        now,
-			Delivered:     delivered,
-			DeliveredTime: deliveredTime,
-		})
+		pktMeta[seq] = &diagPktMeta{
+			size: mss, sentAt: now,
+			delivered: delivered, deliveredTime: deliveredTime,
+		}
+		ifl.OnSend(mss)
 		seq++
 		sentBytes += int64(mss)
 	}
@@ -84,14 +94,15 @@ func TestBBRDiagnoseSlowThroughput(t *testing.T) {
 		// ACK all inflight packets (simulate perfect delivery).
 		acksThisRound := 0
 		for ackSeq := uint32(0); ackSeq < seq; ackSeq++ {
-			pktMeta := ifl.Get(ackSeq)
-			if pktMeta == nil {
+			m, ok := pktMeta[ackSeq]
+			if !ok {
 				continue
 			}
-			ifl.OnACK(ackSeq)
+			delete(pktMeta, ackSeq)
+			ifl.OnACK(m.size)
 			ackedBytes += int64(mss)
 			acksThisRound++
-			bbr.OnACK(rtt, int64(mss), pktMeta)
+			bbr.OnACK(rtt, int64(mss), m.delivered, m.deliveredTime, m.sentAt, m.appLimited)
 		}
 
 		newCwnd := bbr.CwndTarget()
@@ -117,13 +128,11 @@ func TestBBRDiagnoseSlowThroughput(t *testing.T) {
 		for i := 0; i < canSend; i++ {
 			delivered, deliveredTime := est.DeliveredSnapshot()
 			now := time.Now()
-			ifl.OnSend(&inflightPkt{
-				SeqNum:        seq,
-				Size:          mss,
-				SentAt:        now,
-				Delivered:     delivered,
-				DeliveredTime: deliveredTime,
-			})
+			pktMeta[seq] = &diagPktMeta{
+				size: mss, sentAt: now,
+				delivered: delivered, deliveredTime: deliveredTime,
+			}
+			ifl.OnSend(mss)
 			seq++
 			sentBytes += int64(mss)
 		}
@@ -173,7 +182,7 @@ func TestBBRDeliveryRateComputation(t *testing.T) {
 		1400,                // ackedBytes
 		sendDelivered,
 		sendDeliveredTime,
-		t0,   // sendTime
+		t0,    // sendTime
 		false, // not app-limited
 	)
 
@@ -225,32 +234,21 @@ func TestBBRAppLimitedSamples(t *testing.T) {
 
 	// First ACK: non-app-limited, good delivery rate.
 	t0 := time.Now()
-	ifl.OnSend(&inflightPkt{
-		SeqNum:        0,
-		Size:          1400,
-		SentAt:        t0,
-		Delivered:     0,
-		DeliveredTime: t0,
-		AppLimited:    false,
-	})
+	delivered0, deliveredTime0 := est.DeliveredSnapshot()
+	ifl.OnSend(1400)
 	time.Sleep(5 * time.Millisecond)
-	pkt, _ := ifl.OnACK(0)
-	bbr.OnACK(80*time.Millisecond, 1400, pkt)
+	ifl.OnACK(1400)
+	bbr.OnACK(80*time.Millisecond, 1400, delivered0, deliveredTime0, t0, false)
 	btlbw1 := est.BtlBw()
 	t.Logf("After non-app-limited ACK: BtlBw=%d", btlbw1)
 
 	// Second ACK: app-limited (sender was idle). Lower delivery rate.
-	ifl.OnSend(&inflightPkt{
-		SeqNum:        1,
-		Size:          1400,
-		SentAt:        time.Now(),
-		Delivered:     est.Delivered(),
-		DeliveredTime: time.Now(),
-		AppLimited:    true, // <-- idle sender
-	})
+	t1 := time.Now()
+	delivered1, deliveredTime1 := est.DeliveredSnapshot()
+	ifl.OnSend(1400)
 	time.Sleep(50 * time.Millisecond) // longer gap = lower delivery rate
-	pkt2, _ := ifl.OnACK(1)
-	bbr.OnACK(80*time.Millisecond, 1400, pkt2)
+	ifl.OnACK(1400)
+	bbr.OnACK(80*time.Millisecond, 1400, delivered1, deliveredTime1, t1, true /* app-limited */)
 	btlbw2 := est.BtlBw()
 	t.Logf("After app-limited ACK: BtlBw=%d", btlbw2)
 
@@ -369,20 +367,23 @@ func TestBBRRealisticDeliveryRate(t *testing.T) {
 	p := newPacer(0, bbrMaxBurst)
 	bbr := NewBBRState(est, ifl, p, 1400)
 
-	// Simulate: send 10 packets at T=0, ACKs arrive 80ms later.
 	const rtt = 80 * time.Millisecond
 	sendTime := time.Now()
+
+	// Per-packet metadata stored locally.
+	type pktInfo struct {
+		delivered     int64
+		deliveredTime time.Time
+		appLimited    bool
+	}
+	pktMeta := make(map[uint32]*pktInfo, 20)
 
 	// Send 10 packets.
 	for i := 0; i < 10; i++ {
 		delivered, deliveredTime := est.DeliveredSnapshot()
-		ifl.OnSend(&inflightPkt{
-			SeqNum:        uint32(i),
-			Size:          1400,
-			SentAt:        sendTime,
-			Delivered:     delivered,
-			DeliveredTime: deliveredTime,
-		})
+		pktMeta[uint32(i)] = &pktInfo{delivered: delivered, deliveredTime: deliveredTime}
+		ifl.OnSend(1400)
+		_ = sendTime
 	}
 
 	// Wait simulated RTT.
@@ -390,11 +391,12 @@ func TestBBRRealisticDeliveryRate(t *testing.T) {
 
 	// ACK all 10 packets.
 	for i := 0; i < 10; i++ {
-		pkt, _ := ifl.OnACK(uint32(i))
-		if pkt == nil {
-			t.Fatalf("packet %d not in inflight", i)
+		m, ok := pktMeta[uint32(i)]
+		if !ok {
+			t.Fatalf("packet %d not in meta", i)
 		}
-		bbr.OnACK(rtt, 1400, pkt)
+		ifl.OnACK(1400)
+		bbr.OnACK(rtt, 1400, m.delivered, m.deliveredTime, sendTime, m.appLimited)
 	}
 
 	btlbw := est.BtlBw()
@@ -419,25 +421,22 @@ func TestBBRRealisticDeliveryRate(t *testing.T) {
 	cwnd := bbr.CwndTarget()
 	t.Logf("Sending 2nd burst: cwnd=%d", cwnd)
 	sendTime2 := time.Now()
+	pktMeta2 := make(map[uint32]*pktInfo, cwnd)
 	for i := 0; i < cwnd && i < 200; i++ {
 		delivered, deliveredTime := est.DeliveredSnapshot()
-		ifl.OnSend(&inflightPkt{
-			SeqNum:        uint32(10 + i),
-			Size:          1400,
-			SentAt:        sendTime2,
-			Delivered:     delivered,
-			DeliveredTime: deliveredTime,
-		})
+		pktMeta2[uint32(10+i)] = &pktInfo{delivered: delivered, deliveredTime: deliveredTime}
+		ifl.OnSend(1400)
 	}
 
 	time.Sleep(rtt)
 
 	for i := 0; i < cwnd && i < 200; i++ {
-		pkt, _ := ifl.OnACK(uint32(10 + i))
-		if pkt == nil {
+		m, ok := pktMeta2[uint32(10+i)]
+		if !ok {
 			continue
 		}
-		bbr.OnACK(rtt, 1400, pkt)
+		ifl.OnACK(1400)
+		bbr.OnACK(rtt, 1400, m.delivered, m.deliveredTime, sendTime2, m.appLimited)
 	}
 
 	btlbw2 := est.BtlBw()
@@ -466,21 +465,23 @@ func TestBBRHighRTTSimulation(t *testing.T) {
 	p := newPacer(0, bbrMaxBurst)
 	bbr := NewBBRState(est, ifl, p, mss)
 
-	// Simulate 20 round-trips of traffic.
+	type pktInfo struct {
+		sentAt        time.Time
+		delivered     int64
+		deliveredTime time.Time
+	}
+	pktMeta := make(map[uint32]*pktInfo, 128)
 	var seq uint32
+
+	// Simulate 20 round-trips of traffic.
 	for round := 0; round < 20; round++ {
 		// Send cwnd packets.
 		cwnd := bbr.CwndTarget()
 		for i := 0; i < cwnd; i++ {
 			delivered, deliveredTime := est.DeliveredSnapshot()
 			now := time.Now()
-			ifl.OnSend(&inflightPkt{
-				SeqNum:        seq,
-				Size:          mss,
-				SentAt:        now,
-				Delivered:     delivered,
-				DeliveredTime: deliveredTime,
-			})
+			pktMeta[seq] = &pktInfo{sentAt: now, delivered: delivered, deliveredTime: deliveredTime}
+			ifl.OnSend(mss)
 			seq++
 		}
 
@@ -489,12 +490,13 @@ func TestBBRHighRTTSimulation(t *testing.T) {
 
 		// ACK all.
 		for ackSeq := uint32(0); ackSeq < seq; ackSeq++ {
-			pktMeta := ifl.Get(ackSeq)
-			if pktMeta == nil {
+			m, ok := pktMeta[ackSeq]
+			if !ok {
 				continue
 			}
-			ifl.OnACK(ackSeq)
-			bbr.OnACK(rtt, int64(mss), pktMeta)
+			delete(pktMeta, ackSeq)
+			ifl.OnACK(mss)
+			bbr.OnACK(rtt, int64(mss), m.delivered, m.deliveredTime, m.sentAt, false)
 		}
 
 		t.Logf("Round %2d: phase=%-8s cwnd=%4d pacing=%.1f Mbps BtlBw=%d BDP=%d",

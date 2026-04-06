@@ -224,8 +224,11 @@ func (s *BBRState) SetInitialBandwidth(bytesPerSec int64, rtt time.Duration) {
 // Parameters:
 //   - rtt: round-trip time measured for this ACK
 //   - ackedBytes: bytes confirmed by this ACK
-//   - pkt: the inflight metadata of the ACKed packet (delivery snapshots)
-func (s *BBRState) OnACK(rtt time.Duration, ackedBytes int64, pkt *inflightPkt) {
+//   - delivered: estimator.delivered snapshot taken at send time
+//   - deliveredTime: estimator.deliveredTime snapshot taken at send time
+//   - sentAt: time the packet was originally sent (for delivery rate)
+//   - appLimited: whether the sender was app-limited when this packet was sent
+func (s *BBRState) OnACK(rtt time.Duration, ackedBytes int64, delivered int64, deliveredTime, sentAt time.Time, appLimited bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -236,8 +239,8 @@ func (s *BBRState) OnACK(rtt time.Duration, ackedBytes int64, pkt *inflightPkt) 
 	// Feed the estimator.
 	s.estimator.OnACK(
 		rtt, ackedBytes,
-		pkt.Delivered, pkt.DeliveredTime,
-		pkt.SentAt, pkt.AppLimited,
+		delivered, deliveredTime,
+		sentAt, appLimited,
 	)
 
 	// Phase-specific logic.

@@ -388,6 +388,58 @@ s.readCh <- payload
 
 ---
 
+---
+
+## Запуск 10 — 2026-04-06
+
+### Выполнено: inflightTracker дублирование — устранение второй параллельной map
+
+**Файлы:** `server/transport/bbr_inflight.go`, `server/transport/bbr_state.go`, `server/transport/udp.go`, `server/transport/bbr_inflight_test.go`, `server/transport/bbr_diag_test.go`, `server/transport/bbr_integration_test.go`, `server/transport/bbr_state_test.go`, `server/transport/udp_test.go`
+
+**Проблема:**
+
+В UDP транспорте существовали две параллельные структуры данных, хранящие информацию об одних и тех же пакетах:
+1. `c.pending map[uint32]*pendingPacket` — хранит данные для ретрансмита + delivery-rate снапшоты
+2. `bbr.inflight.packets map[uint32]*inflightPkt` — хранит те же delivery-rate снапшоты для BBR
+
+На каждый отправленный пакет:
+- `inflightPktPool.Get()` — выделение объекта из пула
+- `bbr.inflight.OnSend(ifl)` — вставка в карту с захватом `inflightTracker.mu`
+- При ACK: `bbr.inflight.OnACK(seq)` — удаление из карты с захватом `inflightTracker.mu` + возврат в пул
+- При ретрансмите: OnLoss(seq) + OnSend(fresh_ifl) — два map-операции с захватом mu
+
+Итого: ~2 heap-аллокации/деаллокации + 2 mutex lock/unlock на каждый пакет на обоих путях (send + ACK).
+
+**Решение:**
+
+1. **Удалён `inflightPkt` struct и `inflightPktPool`** — не нужны.
+
+2. **`inflightTracker` упрощён до чисто атомарных счётчиков** — только `countAtomic`, `bytesAtomic`, `lostAtomic`. Без mutex, без packets map. Методы:
+   - `OnSend(size int)` — атомарно: count++, bytes+=size
+   - `OnACK(size int)` — атомарно: count--, bytes-=size  
+   - `OnLoss(size int)` — атомарно: count--, bytes-=size, lost+=size
+   - Count/Bytes/LostBytes — lock-free чтение (как и раньше)
+
+3. **Delivery-rate снапшоты перенесены в `pendingPacket`** — `pp.delivered`, `pp.deliveredTime`, `pp.appLimited` уже хранились в pendingPacket. Теперь они также обновляются в `doRetransmit` (раньше только inflightPkt обновлялся, pendingPacket оставался со старыми данными).
+
+4. **`BBRState.OnACK` изменил сигнатуру**: `(rtt, ackedBytes, pkt *inflightPkt)` → `(rtt, ackedBytes int64, delivered int64, deliveredTime, sentAt time.Time, appLimited bool)`. Данные берутся прямо из `ackedPktInfo` (скопированного из pendingPacket под sendMu) — без второго map lookup.
+
+5. **`doRetransmit` логика ретрансмитов:**
+   - Первый ретрансмит (retransmits==0): `OnLoss(size)` + `OnSend(size)` (net 0 изменение count/bytes) + обновление pp.delivered/deliveredTime/appLimited свежими значениями
+   - Последующие ретрансмиты: только обновление pp snapshot, без OnSend/OnLoss
+   - MaxRetransmits exceeded: `OnLoss(size)` (убирает из учёта)
+
+**Эффект:**
+- Устранена `inflightTracker.mu` (RWMutex → нет) — убраны 2+ mutex op/пакет на send+ACK путях
+- Устранена `inflightTracker.packets` map — убраны 2 map lookup/пакет на send+ACK путях
+- Устранены `inflightPktPool` операции — убраны 2 pool Get/Put/пакет
+- Путь данных ACK стал: pendingPacket → ackedPktInfo → BBRState.OnACK (один data flow, ноль extra allocations)
+- При 30 Mbps (~2500 пакетов/сек): экономия ~5000 mutex операций/сек + ~5000 map операций/сек + ~5000 pool операций/сек
+
+**Тесты:** `go test ./...` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **Double CC (proper)** — Внутренний TCP пользователя (CUBIC/BBR в ОС) + наш BBR на UDP.
@@ -395,10 +447,7 @@ s.readCh <- payload
    - **ECN propagation**: когда наш BBR перегружен (pending → cwnd), установить ECN CE в заголовке inner IP → inner TCP снизит cwnd в синхронизации с нашим BBR.
    - Требует: парсинг IP-заголовка в `routeFromTun`, установка ECN-бита, пересчёт IP-checksum.
 
-2. **inflightTracker дублирование** — `c.pending` и `bbr.inflight.packets` — две параллельные карты
-   по одним и тем же seqNum. Устранение дублирования: сохранить BBR delivery-rate снапшоты
-   прямо в `pendingPacket` вместо отдельного `inflightPkt`, убрать `inflightTracker.packets`.
-   Это устранит вторую map insertion/deletion на каждый пакет.
-
-3. **ObfsConn write path** — `Write` нет батчинга: каждый `Write(p)` → один TLS record → один syscall.
+2. **ObfsConn write path** — `Write` нет батчинга: каждый `Write(p)` → один TLS record → один syscall.
    При малых write (< MTU) это значительно снижает пропускную способность. Рассмотреть bufio.Writer с Flush по таймеру.
+
+3. **firstSentAt vs sentAt** — `ackedPktInfo.sentAt` = `pp.firstSentAt` (оригинальное время отправки, не обновляется при ретрансмите). Передаётся в `BBRState.OnACK` как `sentAt`. Это корректно для вычисления delivery rate (мы хотим именно время original send для сравнения с ack-arrived time). Документировано для ясности.

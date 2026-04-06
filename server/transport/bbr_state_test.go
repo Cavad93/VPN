@@ -24,15 +24,7 @@ func simulateACK(s *BBRState, rtt time.Duration, payloadSize int) {
 		deliveredTime = now.Add(-rtt)
 	}
 
-	pkt := &inflightPkt{
-		SeqNum:        0,
-		Size:          payloadSize,
-		SentAt:        now.Add(-rtt),
-		Delivered:     delivered,
-		DeliveredTime: deliveredTime,
-	}
-
-	s.OnACK(rtt, int64(payloadSize), pkt)
+	s.OnACK(rtt, int64(payloadSize), delivered, deliveredTime, now.Add(-rtt), false)
 }
 
 // helper: simulate N ACKs in quick succession.
@@ -257,12 +249,11 @@ func TestBBROnLossHighRate(t *testing.T) {
 	s.mu.Unlock()
 
 	// Simulate heavy loss: send 100 packets, lose 80 (80% loss).
-	for i := uint32(0); i < 100; i++ {
-		pkt := makeTestPkt(i, 1400)
-		ifl.OnSend(pkt)
+	for i := 0; i < 100; i++ {
+		ifl.OnSend(1400)
 	}
-	for i := uint32(0); i < 80; i++ {
-		ifl.OnLoss(i)
+	for i := 0; i < 80; i++ {
+		ifl.OnLoss(1400)
 	}
 	// lostBytes=112000, windowBytes=50*1400=70000, total=182000
 	// lossRate = 112000/182000 ≈ 0.615 → triggers reduction.

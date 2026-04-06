@@ -207,33 +207,23 @@ func TestBBRCwndDoesNotCollapseUnderLowLoss(t *testing.T) {
 	rtt := 80 * time.Millisecond
 
 	// Warm up: simulate 50 ACKs to build BtlBw and get out of Startup.
+	sentAt := now.Add(-rtt)
 	for i := 0; i < 50; i++ {
 		delivered, deliveredTime := est.DeliveredSnapshot()
 		if deliveredTime.IsZero() {
 			deliveredTime = now.Add(-rtt)
 		}
-		pkt := &inflightPkt{
-			SeqNum:        uint32(i),
-			Size:          1400,
-			SentAt:        now.Add(-rtt),
-			Delivered:     delivered,
-			DeliveredTime: deliveredTime,
-		}
-		bbr.OnACK(rtt, 1400, pkt)
+		bbr.OnACK(rtt, 1400, delivered, deliveredTime, sentAt, false)
 	}
 
 	cwndBefore := bbr.CwndTarget()
 
 	// Simulate 0.7% loss: send 1000 packets, lose 7.
 	for i := 50; i < 1050; i++ {
-		ifl.OnSend(&inflightPkt{
-			SeqNum: uint32(i),
-			Size:   1400,
-			SentAt: now,
-		})
+		ifl.OnSend(1400)
 	}
 	for i := 50; i < 57; i++ {
-		ifl.OnLoss(uint32(i))
+		ifl.OnLoss(1400)
 	}
 
 	bbr.OnLoss(7 * 1400)
