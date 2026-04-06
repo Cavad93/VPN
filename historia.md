@@ -440,14 +440,86 @@ s.readCh <- payload
 
 ---
 
+## Запуск 11 — 2026-04-06
+
+### Выполнено: Double CC — ECN CE propagation (inner TCP ↔ outer BBR синхронизация)
+
+**Файлы:** `server/transport/udp.go`, `server/transport/udp_netconn.go`, `server/main.go`, `server/main_test.go`
+
+**Проблема:**
+
+В UDP+BBR режиме существовали два независимых congestion controller:
+1. **Наш BBR** (application-level) — управляет outer UDP link между VPN-клиентом и сервером.
+2. **Inner TCP CC** (kernel — CUBIC или BBR) — управляет соединениями внутри туннеля (браузер, curl и т.д.).
+
+При 1% потере на внешнем линке:
+- Наш BBR обнаруживает congestion, снижает cwnd, ретрансмитирует потерянные пакеты.
+- Inner TCP НЕ знает о congestion во внешнем линке (для него весь туннель выглядит как один hop с RTT).
+- Inner TCP продолжает подавать данные с полной скоростью → они накапливаются в очереди BBR → latency растёт.
+- Когда inner TCP наконец замечает рост RTT и снижает rate — BBR уже прошёл несколько window halving.
+- Итог: оба CC реагируют независимо, с задержкой → throughput падает резче, чем при одном CC.
+
+**Решение: ECN CE propagation (RFC 3168 §9.3.1)**
+
+Когда наш BBR pipe заполнен на 75%+ (inflight ≥ cwnd × 75%), проставляем ECN CE bit (11) в TOS-поле inner IPv4 пакета перед отправкой клиенту. Клиент получает этот пакет, доставляет в TCP-стек, который:
+- Видит CE → устанавливает ECE (ECN-Echo) в следующем TCP ACK к внешнему серверу.
+- Внешний сервер (TCP-отправитель) видит ECE → снижает cwnd через CWR.
+- Inner TCP снижает rate **синхронно** с нашим BBR — без независимого двойного CC.
+
+**Детали реализации:**
+
+1. **`transport.Conn.Congested() bool`** — lock-free atomic: `inflight×4 >= cwnd×3` (75% порог).  
+   75% выбрано так, чтобы inner TCP успел отреагировать ДО полного заполнения cwnd.
+
+2. **`transport.UDPNetConn.Congested() bool`** — делегирует к `inner.Congested()`.  
+   `UDPNetConn` (возвращаемый `ListenUDP.Accept`) реализует интерфейс `congestionProber`.
+
+3. **`congestionProber` interface** в `main.go` — `{ Congested() bool }`.  
+   `clientSession.congestion congestionProber` — non-nil только в UDP+BBR mode.  
+   В `runPrimaryConn`: `if c, ok := rawConn.(congestionProber)` → сохраняется в сессии.
+
+4. **`markECNCE(buf []byte, n int)`** — помечает inner IPv4 пакет CE=11:
+   - Только ECT-capable пакеты (ECN=01 или 10); Not-ECT (00) и уже CE (11) — без изменений.
+   - DSCP биты (bits 7-2 TOS) сохраняются нетронутыми.
+   - IPv4 header checksum пересчитывается полностью (max 30 итераций, ≤60 байт).
+   - IPv6 — не трогает (туннель IPv4-only; future work).
+
+5. **В `routeFromTun`** — перед `ds.Write(buf[:n])`:
+   ```go
+   if target.congestion != nil && target.congestion.Congested() {
+       markECNCE(buf, n)
+   }
+   ```
+   Ноль аллокаций, ноль syscall — два atomic load + max 30 арифметических операций.
+
+**Производительность hot-path:**
+- При отсутствии congestion (`Congested()==false`): 2 atomic load, ветка не взята.
+- При congestion, Non-ECT пакет: 2 atomic load + 3 байта чтения + ранний return.
+- При congestion, ECT пакет: 2 atomic load + loop 10 uint16 additions + write checksum.
+- Ни одной аллокации во всех путях.
+
+**TCP mode:** `congestion == nil` (rawConn — `*net.TCPConn`, не реализует `congestionProber`) → markECNCE не вызывается. В TCP режиме kernel CC управляет outer link самостоятельно.
+
+**Тесты (9 новых):**
+- `TestMarkECNCE_NonECT` — Non-ECT пакет не изменён
+- `TestMarkECNCE_AlreadyCE` — CE пакет не изменён
+- `TestMarkECNCE_ECT0` — ECT(0)=10 → CE=11, checksum валиден
+- `TestMarkECNCE_ECT1` — ECT(1)=01 → CE=11, checksum валиден
+- `TestMarkECNCE_PreservesDSCP` — DSCP биты сохранены
+- `TestMarkECNCE_TooShort` — короткий буфер не паникует
+- `TestMarkECNCE_IPv6Ignored` — IPv6 пакет не изменён
+- `TestConnCongested` — `*Conn.Congested()` == false на idle
+- `TestUDPNetConnCongested` — `*UDPNetConn` реализует `congestionProber`
+
+**Результат:** `go test ./...` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
-1. **Double CC (proper)** — Внутренний TCP пользователя (CUBIC/BBR в ОС) + наш BBR на UDP.
-   После исправления MTU (Запуск 7) эффект двойного CC уменьшился. Но при высокой потере (>1%) оба CC всё ещё реагируют независимо. Возможное решение:
-   - **ECN propagation**: когда наш BBR перегружен (pending → cwnd), установить ECN CE в заголовке inner IP → inner TCP снизит cwnd в синхронизации с нашим BBR.
-   - Требует: парсинг IP-заголовка в `routeFromTun`, установка ECN-бита, пересчёт IP-checksum.
-
-2. **ObfsConn write path** — `Write` нет батчинга: каждый `Write(p)` → один TLS record → один syscall.
+1. **ObfsConn write path** — `Write` нет батчинга: каждый `Write(p)` → один TLS record → один syscall.
    При малых write (< MTU) это значительно снижает пропускную способность. Рассмотреть bufio.Writer с Flush по таймеру.
 
-3. **firstSentAt vs sentAt** — `ackedPktInfo.sentAt` = `pp.firstSentAt` (оригинальное время отправки, не обновляется при ретрансмите). Передаётся в `BBRState.OnACK` как `sentAt`. Это корректно для вычисления delivery rate (мы хотим именно время original send для сравнения с ack-arrived time). Документировано для ясности.
+2. **firstSentAt vs sentAt** — `ackedPktInfo.sentAt` = `pp.firstSentAt` (оригинальное время отправки, не обновляется при ретрансмите). Передаётся в `BBRState.OnACK` как `sentAt`. Это корректно для вычисления delivery rate (мы хотим именно время original send для сравнения с ack-arrived time). Документировано для ясности.
+
+3. **IPv6 inner tunnel support** — `markECNCE` пока обрабатывает только IPv4. Если туннель расширится до IPv6, нужен аналогичный путь для Traffic Class field (нет checksum → проще).

@@ -715,6 +715,22 @@ func (c *Conn) doRetransmit() {
 	}
 }
 
+// Congested reports whether the connection's send pipe is near capacity.
+// Returns true when in-flight packet count reaches 75 % of BBR's cwnd target,
+// meaning new writes will soon block in writePacket.
+//
+// The check is lock-free (two atomic loads) and safe to call from any goroutine,
+// including the hot routeFromTun path. A false negative (stale atomic) at most
+// delays ECN marking by one packet burst — acceptable given ECN's advisory nature.
+func (c *Conn) Congested() bool {
+	cwnd := int64(c.bbr.CwndTarget()) // atomic
+	if cwnd == 0 {
+		return false
+	}
+	inflight := int64(c.bbr.inflight.Count()) // atomic
+	return inflight*4 >= cwnd*3               // inflight ≥ 75% of cwnd
+}
+
 // Read blocks until a data payload is available, the context is cancelled,
 // or the connection is closed.
 func (c *Conn) Read(ctx context.Context) ([]byte, error) {

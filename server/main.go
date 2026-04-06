@@ -126,13 +126,21 @@ func (sb *streamBond) count() int {
 	return n
 }
 
+// congestionProber is implemented by transport.Conn (UDP+BBR mode).
+// routeFromTun checks it before forwarding inner IP packets so that
+// ECN CE can be marked proactively, synchronising the inner TCP CC.
+type congestionProber interface {
+	Congested() bool
+}
+
 // clientSession holds per-client runtime state.
 type clientSession struct {
 	id           uint64
 	remoteKey    [32]byte
 	noiseSession *crypto.Session
 	mux          *transport.Mux
-	rawConn      net.Conn // underlying TCP connection for TCP_INFO polling
+	rawConn      net.Conn       // underlying TCP/UDP connection
+	congestion   congestionProber // non-nil in UDP+BBR mode only
 	assignedIP   net.IP
 	bond         streamBond // round-robin across parallel download connections
 	bytesIn      atomic.Uint64
@@ -461,12 +469,20 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 // assigns an IP, and runs the data stream loop.
 func (s *Server) runPrimaryConn(ctx context.Context, rawConn net.Conn, session *crypto.Session, ctlStream *transport.Stream, mux *transport.Mux) {
 	connCtx, cancel := context.WithCancel(ctx)
+	// In UDP+BBR mode rawConn is a *transport.Conn which implements congestionProber.
+	// This lets routeFromTun mark ECN CE in inner IP packets when the pipe is near full,
+	// synchronising the inner TCP's CC with our BBR — avoiding independent double-CC reactions.
+	var cp congestionProber
+	if c, ok := rawConn.(congestionProber); ok {
+		cp = c
+	}
 	cs := &clientSession{
 		id:           s.nextSessionID(),
 		remoteKey:    session.RemoteStatic,
 		noiseSession: session,
 		mux:          mux,
-		rawConn:      rawConn, // underlying TCP connection for TCP_INFO polling
+		rawConn:      rawConn,
+		congestion:   cp,
 		connectedAt:  time.Now(),
 		cancel:       cancel,
 	}
@@ -696,6 +712,54 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 	}
 }
 
+// markECNCE marks the ECN field of an IPv4 packet as Congestion Experienced (CE=11).
+// It only modifies packets that advertise ECN-capable transport (ECT(0)=10 or ECT(1)=01);
+// Non-ECT packets (00) and already-CE packets (11) are left unchanged.
+//
+// After marking, the IPv4 header checksum is recomputed over the (variable-length) header
+// so that downstream stacks accept the packet without dropping it as corrupt.
+//
+// Purpose: Double-CC mitigation — when our BBR pipe is near-full (Congested()==true),
+// marking CE in the inner IP header signals the inner TCP sender to reduce its rate via
+// RFC 3168 ECN-Echo, synchronising it with our BBR instead of reacting independently.
+//
+// IPv4 header byte layout relevant here:
+//
+//	byte[0]   — version(4b) + IHL(4b)
+//	byte[1]   — DSCP(6b) + ECN(2b): ECN bits 1-0; CE = 11
+//	bytes[10-11] — header checksum (ones-complement)
+func markECNCE(buf []byte, n int) {
+	if n < 20 || buf[0]>>4 != 4 {
+		return // not a valid IPv4 packet
+	}
+	ecn := buf[1] & 0x03
+	if ecn == 0x00 || ecn == 0x03 {
+		return // Not-ECT or already CE: nothing to do
+	}
+	// ECT(0)=0x02 or ECT(1)=0x01 → set CE=0x03
+	buf[1] = (buf[1] &^ 0x03) | 0x03
+
+	// Recompute IPv4 header checksum over the variable-length header (IHL×4 bytes).
+	// Full recomputation is simpler and safer than incremental RFC 1624 here:
+	// the header is ≤60 bytes (≤15 16-bit words) so the loop is cheap.
+	ihl := int(buf[0]&0x0F) * 4
+	if ihl < 20 || ihl > n {
+		return
+	}
+	buf[10] = 0
+	buf[11] = 0
+	var sum uint32
+	for i := 0; i+1 < ihl; i += 2 {
+		sum += uint32(buf[i])<<8 | uint32(buf[i+1])
+	}
+	for sum > 0xFFFF {
+		sum = (sum >> 16) + (sum & 0xFFFF)
+	}
+	csum := ^uint16(sum)
+	buf[10] = byte(csum >> 8)
+	buf[11] = byte(csum)
+}
+
 // tunReadBufPool pools the 64 KB TUN read buffers used in routeFromTun.
 // Consistent with streamReadBufPool pattern — avoids a 64 KB heap allocation
 // that lives for the lifetime of the server. When routeFromTun restarts
@@ -753,6 +817,14 @@ func (s *Server) routeFromTun(ctx context.Context) {
 			continue
 		}
 		target := val.(*clientSession)
+
+		// Double-CC mitigation: if the outer VPN pipe is near-full (UDP+BBR mode),
+		// mark ECN CE in the inner IP header so that the inner TCP sender reduces its
+		// rate through RFC 3168 ECN-Echo instead of waiting for packet loss detection.
+		// Only affects ECT-capable packets; Non-ECT and already-CE are unchanged.
+		if target.congestion != nil && target.congestion.Congested() {
+			markECNCE(buf, n)
+		}
 
 		// Round-robin across bonded streams (multiple TCP connections).
 		bond := &target.bond

@@ -144,5 +144,12 @@ func (u *UDPNetConn) SetInitialBandwidth(bytesPerSec int64, rtt time.Duration) {
 	u.inner.SetInitialBandwidth(bytesPerSec, rtt)
 }
 
+// Congested reports whether the underlying BBR connection's send pipe is near
+// capacity (≥75% of cwnd in flight).  Delegates to Conn.Congested.
+// Implements the congestionProber interface used by routeFromTun for ECN CE marking.
+func (u *UDPNetConn) Congested() bool {
+	return u.inner.Congested()
+}
+
 // Verify UDPNetConn implements net.Conn at compile time.
 var _ net.Conn = (*UDPNetConn)(nil)

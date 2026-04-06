@@ -1964,3 +1964,182 @@ func BenchmarkNoiseConnThroughput(b *testing.B) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// markECNCE tests
+// ---------------------------------------------------------------------------
+
+// buildIPv4 constructs a minimal IPv4 header with the given TOS byte and computes
+// the header checksum.  Payload bytes are appended after the header.
+func buildIPv4(tos byte, payloadLen int) []byte {
+	buf := make([]byte, 20+payloadLen)
+	buf[0] = 0x45           // version=4, IHL=5 (20 bytes)
+	buf[1] = tos            // DSCP + ECN
+	buf[2] = byte((20 + payloadLen) >> 8)
+	buf[3] = byte(20 + payloadLen)
+	buf[8] = 64             // TTL
+	buf[9] = 6              // protocol TCP
+	buf[12] = 192; buf[13] = 168; buf[14] = 1; buf[15] = 1 // src
+	buf[16] = 10; buf[17] = 8; buf[18] = 0; buf[19] = 2    // dst
+	// compute checksum
+	buf[10] = 0; buf[11] = 0
+	var sum uint32
+	for i := 0; i < 20; i += 2 {
+		sum += uint32(buf[i])<<8 | uint32(buf[i+1])
+	}
+	for sum > 0xFFFF {
+		sum = (sum >> 16) + (sum & 0xFFFF)
+	}
+	cs := ^uint16(sum)
+	buf[10] = byte(cs >> 8)
+	buf[11] = byte(cs)
+	return buf
+}
+
+// ipv4ChecksumValid verifies the header checksum of a 20-byte IPv4 header.
+func ipv4ChecksumValid(buf []byte) bool {
+	var sum uint32
+	for i := 0; i < 20; i += 2 {
+		sum += uint32(buf[i])<<8 | uint32(buf[i+1])
+	}
+	for sum > 0xFFFF {
+		sum = (sum >> 16) + (sum & 0xFFFF)
+	}
+	return uint16(sum) == 0xFFFF
+}
+
+func TestMarkECNCE_NonECT(t *testing.T) {
+	// Non-ECT (ECN=00): must not be modified.
+	pkt := buildIPv4(0x00, 10) // TOS=0x00, ECN=00
+	original := make([]byte, len(pkt))
+	copy(original, pkt)
+	markECNCE(pkt, len(pkt))
+	if !bytes.Equal(pkt, original) {
+		t.Error("markECNCE modified a Non-ECT packet")
+	}
+}
+
+func TestMarkECNCE_AlreadyCE(t *testing.T) {
+	// Already CE (ECN=11): must not change.
+	pkt := buildIPv4(0x03, 10) // TOS=0x03 (DSCP=0, ECN=11=CE)
+	original := make([]byte, len(pkt))
+	copy(original, pkt)
+	markECNCE(pkt, len(pkt))
+	if !bytes.Equal(pkt, original) {
+		t.Error("markECNCE modified an already-CE packet")
+	}
+}
+
+func TestMarkECNCE_ECT0(t *testing.T) {
+	// ECT(0)=10: must become CE=11 and checksum must be valid.
+	pkt := buildIPv4(0x02, 10)
+	markECNCE(pkt, len(pkt))
+	if pkt[1]&0x03 != 0x03 {
+		t.Errorf("ECT(0) not marked CE: got ECN=%02x", pkt[1]&0x03)
+	}
+	if !ipv4ChecksumValid(pkt) {
+		t.Error("header checksum invalid after marking ECT(0) → CE")
+	}
+}
+
+func TestMarkECNCE_ECT1(t *testing.T) {
+	// ECT(1)=01: must become CE=11 and checksum must be valid.
+	pkt := buildIPv4(0x01, 10)
+	markECNCE(pkt, len(pkt))
+	if pkt[1]&0x03 != 0x03 {
+		t.Errorf("ECT(1) not marked CE: got ECN=%02x", pkt[1]&0x03)
+	}
+	if !ipv4ChecksumValid(pkt) {
+		t.Error("header checksum invalid after marking ECT(1) → CE")
+	}
+}
+
+func TestMarkECNCE_PreservesDSCP(t *testing.T) {
+	// DSCP bits (bits 7-2 of TOS) must not be touched.
+	const dscp = 0x28 // CS5 in bits 7-2 → TOS high nibble 0x28
+	pkt := buildIPv4(dscp|0x02, 10) // ECT(0)
+	markECNCE(pkt, len(pkt))
+	if pkt[1]&0xFC != dscp {
+		t.Errorf("markECNCE altered DSCP: want %02x got %02x", dscp, pkt[1]&0xFC)
+	}
+}
+
+func TestMarkECNCE_TooShort(t *testing.T) {
+	// Buffers shorter than 20 bytes must be ignored without panic.
+	short := make([]byte, 10)
+	markECNCE(short, len(short)) // must not panic
+}
+
+func TestMarkECNCE_IPv6Ignored(t *testing.T) {
+	// IPv6 packet (version=6) must be left unchanged (we only handle IPv4).
+	pkt := make([]byte, 40)
+	pkt[0] = 0x60 // version=6
+	pkt[1] = 0x02 // Traffic Class ECT(0) in lower nibble (approx)
+	original := make([]byte, len(pkt))
+	copy(original, pkt)
+	markECNCE(pkt, len(pkt))
+	if !bytes.Equal(pkt, original) {
+		t.Error("markECNCE modified an IPv6 packet")
+	}
+}
+
+// TestConnCongested verifies that Congested() returns false when idle.
+// It uses the low-level transport.Conn directly (no UDP round-trip needed
+// for this check — inflight==0 is the initial state).
+func TestConnCongested(t *testing.T) {
+	t.Parallel()
+
+	ln, err := transport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	cConn, err := transport.Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer cConn.Close()
+
+	// Trigger Accept by sending one packet from client → server.
+	if err := cConn.Write([]byte("ping")); err != nil {
+		t.Fatalf("client Write: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	sConn, err := ln.Accept(ctx)
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	defer sConn.Close()
+
+	// After one small packet, inflight should be ≤ 1, cwnd starts at default (4).
+	// 1 < 75% of 4 → not congested.
+	if cConn.Congested() {
+		t.Error("new connection with one packet in flight reports congested (want false)")
+	}
+}
+
+// TestUDPNetConnCongested verifies that congestionProber is satisfied by *UDPNetConn.
+func TestUDPNetConnCongested(t *testing.T) {
+	ln, err := transport.ListenUDP("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer ln.Close()
+
+	cConn, err := transport.DialUDP(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer cConn.Close()
+
+	// *UDPNetConn must satisfy congestionProber at runtime.
+	var _ congestionProber = cConn
+
+	// No packets sent: not congested.
+	if cConn.Congested() {
+		t.Error("new UDPNetConn reports congested (want false)")
+	}
+}
