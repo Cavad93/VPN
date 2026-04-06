@@ -589,14 +589,70 @@ Payload-копия нужна для возможности ретрансмит
 
 ---
 
+---
+
+## Запуск 14 — 2026-04-06
+
+### Выполнено: udpAddrKey — устранение string-аллокации на каждый входящий UDP-пакет
+
+**Файл:** `server/transport/udp.go`
+
+**Проблема:**
+
+В `Listener.readLoop()` для каждого входящего пакета вычислялся строковый ключ:
+```go
+key := remote.String()
+l.conns[key]
+```
+
+`net.UDPAddr.String()` форматирует строку вида `"1.2.3.4:51000"` — heap-аллокация на каждый пакет. Это касается как DATA (с payload), так и чистых ACK пакетов. При 30 Mbps и 1430-байтных пакетах:
+- DATA пакетов: ~2630/сек
+- ACK пакетов: ~2630/сек (один ACK на каждый DATA)
+- Итого: ~5260 string-аллокаций/сек, каждая ~20 байт = ~105 KB/сек heap pressure.
+
+**Решение: `udpAddrKey` — сравнимая struct без аллокаций**
+
+```go
+type udpAddrKey struct {
+    ip   [16]byte // IPv4-in-IPv6 или IPv6; нет внутренних указателей → нет аллокации
+    port int
+    zone string   // IPv6 link-local zone; для IPv4 всегда "" (нет аллокации)
+}
+```
+
+`makeUDPAddrKey(addr *net.UDPAddr) udpAddrKey` — чистая stack-операция:
+- 4-байтный IPv4: нормализуется в IPv4-in-IPv6 форму (`::ffff:x.x.x.x`)
+- 16-байтный IPv4-mapped или IPv6: копируется напрямую
+- Нет аллокаций на hot path
+
+`l.conns` изменён с `map[string]*Conn` → `map[udpAddrKey]*Conn`.
+
+**Нормализация IPv4:**
+4-байтный `"1.2.3.4"` → `key.ip = [0,0,0,0,0,0,0,0,0,0,0xff,0xff,1,2,3,4]`
+16-байтный `"::ffff:1.2.3.4"` → `copy(key.ip[:], addr.IP)` = те же байты.
+Оба варианта дают одинаковый ключ — корректная работа на dual-stack сокетах.
+
+**Эффект:**
+- Устранено ~5260 string-аллокаций/сек при 30 Mbps → 0
+- Снижено GC-давление: ~105 KB/сек heap pressure → 0 от этого источника
+- `makeUDPAddrKey` — 32-байтная struct-копия (полностью stack-allocated, быстрее любого string interning)
+
+**Тесты:** `go test ./...` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **ObfsConn write path** — ~~`Write` нет батчинга~~ РЕШЕНО: `BufConn` (200µs timer, 14600 byte threshold) уже стоит между TCP socket и ObfsConn — все `ObfsConn.Write` вызовы батчатся внутри BufConn. Эта задача закрыта.
 
 2. **processData alloc** — ~~РЕШЕНО~~ (Запуск 13): `toDeliverPool` устраняет аллокацию.
 
-3. **IPv6 inner tunnel support** — `markECNCE` пока обрабатывает только IPv4. Если туннель расширится до IPv6, нужен аналогичный путь для Traffic Class field (нет checksum → проще).
+3. **udpAddrKey** — ~~РЕШЕНО~~ (Запуск 14): `map[udpAddrKey]*Conn` устраняет ~5260 string-аллокаций/сек.
 
-4. **firstSentAt vs sentAt** — документировано; не баг.
+4. **IPv6 inner tunnel support** — `markECNCE` пока обрабатывает только IPv4. Если туннель расширится до IPv6, нужен аналогичный путь для Traffic Class field (нет checksum → проще).
 
-5. **Диагностика новых узких мест** — все известные hot-path аллокации устранены. Следующий шаг: профилирование `pprof` под нагрузкой для поиска скрытых узких мест (candidate: `recvBuf` map insertions/deletions при out-of-order трафике).
+5. **firstSentAt vs sentAt** — документировано; не баг.
+
+6. **DecodePacket payload alloc** — `make([]byte, payloadLen)` в DecodePacket ~2630 раз/сек = ~3.7 MB/сек. Пулинг сложен (payload живёт до UDPNetConn.Read → copy → discard). Требует возврата пула в UDPNetConn.Read после копирования — реализуемо, но добавляет сложность. Candidate для следующего запуска.
+
+7. **pprof профилирование под нагрузкой** — для поиска скрытых узких мест после всех pool/atomic оптимизаций.
