@@ -287,6 +287,68 @@ inner_IP ≤ 1430
 
 ---
 
+---
+
+## Запуск 8 — 2026-04-06
+
+### Выполнено: BBR CwndTarget + IsRoundStart + RTpropExpired — устранение mutex contention на горячем пути
+
+**Файлы:** `server/transport/bbr_state.go`, `server/transport/bbr_estimator.go`, `server/transport/bbr_state_test.go`
+
+**Обнаруженные проблемы (диагностика mutex contention):**
+
+Профилирование горячего пути показало три точки mutex contention:
+
+1. **`CwndTarget()` → `bbr.mu` (~2620 lock/unlock в сек при 30 Mbps)**
+   - `writePacket` вызывает `c.bbr.CwndTarget()` на каждый отправленный пакет
+   - В loop backpressure (`for len(c.pending) >= cwndTarget`) — дополнительные вызовы при насыщении cwnd
+   - Каждый вызов: `s.mu.Lock()` + чтение `int` + `s.mu.Unlock()`
+   - Конкуренция с `BBRState.OnACK()` (который также держит `bbr.mu`)
+
+2. **`IsRoundStart()` → вложенный `estimator.mu` внутри `bbr.mu`**
+   - `BBRState.onACKStartup()` вызывает `s.estimator.IsRoundStart()` пока держит `bbr.mu`
+   - `IsRoundStart()` захватывала `estimator.mu` → вложенная блокировка bbr.mu → estimator.mu
+   - Contention: горутина processACK держит bbr.mu, пытается взять estimator.mu
+
+3. **`RTpropExpired()` → вложенный `estimator.mu` внутри `bbr.mu`**
+   - `BBRState.OnACK()` вызывает `s.estimator.RTpropExpired()` пока держит `bbr.mu`
+   - Та же схема вложенного захвата bbr.mu → estimator.mu
+
+**Решения:**
+
+1. **`CwndTarget()` — lock-free через `atomic.Int32`**
+   - Добавлен `cwndAtomic atomic.Int32` в `BBRState`
+   - Введён `setCwndTarget(n int)` — приватный хелпер, обновляет оба поля под `mu`
+   - Все присваивания `s.cwndTarget = X` заменены на `s.setCwndTarget(X)`
+   - `CwndTarget()` читает `cwndAtomic.Load()` без захвата mutex
+   - Безопасность: расхождение на 1 пакет неотличимо от scheduler jitter
+
+2. **`IsRoundStart()` — lock-free через `atomic.Bool`**
+   - Добавлен `roundStartAtomic atomic.Bool` в `bbrEstimator`
+   - `OnACK()` обновляет оба: `e.roundStart` (под `mu`) + `e.roundStartAtomic.Store()`
+   - `IsRoundStart()` читает `roundStartAtomic.Load()` без захвата mutex
+   - Устранён вложенный захват `bbr.mu → estimator.mu`
+
+3. **`RTpropExpired()` — lock-free через `atomic.Int64` (UnixNano stamp)**
+   - Добавлен `rtpropStampNano atomic.Int64` в `bbrEstimator`
+   - `OnACK()` обновляет после каждого обновления RTprop-фильтра: `e.rtpropStampNano.Store(stamp.UnixNano())`
+   - `SeedBandwidth()` и `Reset()` обновляют atomic
+   - `RTpropExpired()` читает `rtpropStampNano.Load()` без захвата mutex
+   - Устранён вложенный захват `bbr.mu → estimator.mu`
+
+**Фикс тестов:**
+Два теста напрямую манипулировали `s.estimator.rtpropFilter.stamp` для имитации истёкшего RTprop. После рефакторинга `RTpropExpired()` читает только атомарный зеркальный счётчик, поэтому тесты обновлены для синхронного обновления `rtpropStampNano`.
+
+**Суммарный эффект:**
+- Устранён `bbr.mu` захват на горячем send-пути (`writePacket`): 2620 lock/unlock/сек → 0 для CwndTarget
+- Устранены две вложенных блокировки (`bbr.mu → estimator.mu`) на ACK-пути
+- При 30 Mbps: экономия ~5240 mutex операций/сек на send+ACK путях
+- Меньше contention → меньше CPU spinning → ниже задержка отправки при высокой нагрузке
+
+**Тесты:** `go test ./...` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **Double CC (proper)** — Внутренний TCP пользователя (CUBIC/BBR в ОС) + наш BBR на UDP.
@@ -294,13 +356,15 @@ inner_IP ≤ 1430
    - **ECN propagation**: когда наш BBR перегружен (pending → cwnd), установить ECN CE в заголовке inner IP → inner TCP снизит cwnd в синхронизации с нашим BBR.
    - Требует: парсинг IP-заголовка в `routeFromTun`, установка ECN-бита, пересчёт IP-checksum.
 
-2. **Диагностика** — pprof-профилирование под нагрузкой для поиска других узких мест:
-   - `inflightTracker.mu` — вызывается из `processACK` и `doRetransmit` одновременно
-   - `bbr_estimator.mu` — вызывается из `OnACK` для каждого ACK-а
-   - `readLoop` в `mux.go` — `make([]byte, length)` на каждый фрейм
+2. **readLoop alloc** — `mux.go` делает `make([]byte, length)` на каждый фрейм (~2620/сек при 30 Mbps).
+   Можно пулировать буферы. Сложность: payload передаётся через channel, владелец буфера непонятен.
+   Проще: пул + копирование overflow вместо zero-copy sub-slice в `consumeData`.
+   На практике overflow никогда не происходит (handleDataStream читает 65536-байт буфером > 1430).
 
-3. **ObfsConn write path** — для TCP-транспорта: нет батчинга, каждый Write → один syscall.
-   Для UDP-пути: BufConn уже коалесцирует, поэтому менее критично.
+3. **inflightTracker дублирование** — `c.pending` и `bbr.inflight.packets` — две параллельные карты
+   по одним и тем же seqNum. Устранение дублирования: сохранить BBR delivery-rate снапшоты
+   прямо в `pendingPacket` вместо отдельного `inflightPkt`, убрать `inflightTracker.packets`.
+   Это устранит вторую map insertion/deletion на каждый пакет.
 
-3. **ObfsConn write path** — `Write` нет батчинга: каждый `Write(p)` → один TLS record → один syscall.
+4. **ObfsConn write path** — `Write` нет батчинга: каждый `Write(p)` → один TLS record → один syscall.
    При малых write (< MTU) это значительно снижает пропускную способность. Рассмотреть bufio.Writer с Flush по таймеру.

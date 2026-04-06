@@ -164,12 +164,18 @@ func (f *windowedMaxFilter) reset() {
 //   - BtlBw:  maximum delivery rate (bottleneck bandwidth)
 //
 // Thread-safe: all public methods acquire mu.
+// Hot-path reads (IsRoundStart, RTpropExpired) are lock-free via atomics.
 type bbrEstimator struct {
 	mu sync.Mutex
 
 	// RTprop — windowed minimum RTT over the last 10 seconds.
 	rtpropFilter windowedMinFilter
 	rtpropUs     atomic.Int64 // cached RTprop in microseconds (lock-free reads)
+
+	// Atomic mirror of rtpropFilter.stamp for lock-free RTpropExpired checks.
+	// BBRState.OnACK calls RTpropExpired() while holding bbr.mu; making it
+	// lock-free eliminates the nested bbr.mu → estimator.mu acquisition.
+	rtpropStampNano atomic.Int64
 
 	// BtlBw — windowed maximum delivery rate over the last 10 round-trips.
 	btlbwFilter windowedMaxFilter
@@ -182,12 +188,13 @@ type bbrEstimator struct {
 	deliveredTime time.Time // timestamp of last delivered update
 
 	// Atomic mirrors for lock-free DeliveredSnapshot reads from the send path.
-	deliveredAtomic     atomic.Int64
-	deliveredTimeNano   atomic.Int64
+	deliveredAtomic   atomic.Int64
+	deliveredTimeNano atomic.Int64
 
 	// Round-trip counting for BtlBw filter.
-	roundCount    int64 // incremented each time a full RTT's worth of data is ACKed
-	roundStart    bool  // set when a new round begins
+	roundCount         int64 // incremented each time a full RTT's worth of data is ACKed
+	roundStart         bool  // set when a new round begins (write under mu)
+	roundStartAtomic   atomic.Bool  // lock-free mirror of roundStart for IsRoundStart()
 	nextRoundDelivered int64 // delivered count at which next round starts
 }
 
@@ -254,9 +261,11 @@ func (e *bbrEstimator) OnACK(
 	//    nextRoundDelivered — i.e., a packet sent AFTER the previous round
 	//    started. This matches the Linux BBR round counting logic.
 	e.roundStart = false // reset each ACK
+	e.roundStartAtomic.Store(false)
 	if sendDelivered >= e.nextRoundDelivered {
 		e.roundCount++
 		e.roundStart = true
+		e.roundStartAtomic.Store(true)
 		// Next round starts when we ACK a packet sent with delivered >= current.
 		e.nextRoundDelivered = e.delivered
 	}
@@ -264,6 +273,7 @@ func (e *bbrEstimator) OnACK(
 	// 4. Update RTprop filter (minimum RTT).
 	e.rtpropFilter.update(rtt, now)
 	e.rtpropUs.Store(e.rtpropFilter.get().Microseconds())
+	e.rtpropStampNano.Store(e.rtpropFilter.stamp.UnixNano())
 
 	// 5. Update BtlBw filter (maximum delivery rate).
 	//    Only non-app-limited samples are used for BtlBw — if the sender
@@ -357,17 +367,24 @@ func (e *bbrEstimator) RoundCount() int64 {
 }
 
 // IsRoundStart returns true if the most recent OnACK call started a new round.
+// Lock-free: reads roundStartAtomic which is updated in OnACK under mu.
+// Called from BBRState.onACKStartup which holds bbr.mu — lock-free here
+// eliminates the nested bbr.mu → estimator.mu acquisition.
 func (e *bbrEstimator) IsRoundStart() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.roundStart
+	return e.roundStartAtomic.Load()
 }
 
 // RTpropExpired returns true if RTprop hasn't been refreshed within its window.
+// Lock-free: reads rtpropStampNano which is updated atomically in OnACK.
+// Called from BBRState.OnACK which holds bbr.mu — lock-free here eliminates
+// the nested bbr.mu → estimator.mu acquisition.
 func (e *bbrEstimator) RTpropExpired() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.rtpropFilter.expired(time.Now())
+	nano := e.rtpropStampNano.Load()
+	if nano == 0 {
+		return false // no sample yet
+	}
+	stamp := time.Unix(0, nano)
+	return time.Since(stamp) > rtpropFilterLen
 }
 
 // Reset clears all estimator state.
@@ -377,6 +394,7 @@ func (e *bbrEstimator) Reset() {
 	e.rtpropFilter.reset()
 	e.btlbwFilter.reset()
 	e.rtpropUs.Store(0)
+	e.rtpropStampNano.Store(0)
 	e.btlbwBps.Store(0)
 	e.delivered = 0
 	e.deliveredTime = time.Time{}
@@ -384,6 +402,7 @@ func (e *bbrEstimator) Reset() {
 	e.deliveredTimeNano.Store(0)
 	e.roundCount = 0
 	e.roundStart = false
+	e.roundStartAtomic.Store(false)
 	e.nextRoundDelivered = 0
 }
 
@@ -399,6 +418,7 @@ func (e *bbrEstimator) SeedBandwidth(bytesPerSec int64, rtt time.Duration) {
 	// Seed RTprop filter with the given RTT.
 	e.rtpropFilter.update(rtt, now)
 	e.rtpropUs.Store(rtt.Microseconds())
+	e.rtpropStampNano.Store(now.UnixNano())
 
 	// Seed BtlBw filter with the given bandwidth.
 	e.btlbwFilter.update(bytesPerSec, 0)

@@ -2,6 +2,7 @@ package transport
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -85,6 +86,7 @@ var probeBWGains = [8]float64{
 // that the transport layer uses to control sending.
 //
 // Thread-safe: all public methods acquire mu.
+// Hot-path reads (CwndTarget) are lock-free via atomic mirrors.
 type BBRState struct {
 	mu sync.Mutex
 
@@ -107,8 +109,16 @@ type BBRState struct {
 	priorCwnd        int       // cwnd to restore after ProbeRTT
 
 	// --- Outputs (read by transport layer) ---
-	cwndTarget int   // target congestion window in packets
+	cwndTarget int   // target congestion window in packets (write under mu)
 	pacingRate int64 // target pacing rate in bytes/sec
+
+	// Atomic mirror of cwndTarget for lock-free reads from the send hot path.
+	// writePacket calls CwndTarget() on every sent packet (~2620/sec at 30 Mbps).
+	// Using an atomic avoids acquiring mu on each call, eliminating lock contention
+	// between the ACK-processing goroutine (which updates cwndTarget under mu) and
+	// the send goroutine (which reads it). A stale value is safe: a one-packet
+	// difference in cwnd is indistinguishable from normal scheduling jitter.
+	cwndAtomic atomic.Int32
 
 	// --- Configuration ---
 	mss int // maximum segment size (= MaxPayloadSize)
@@ -118,7 +128,7 @@ type BBRState struct {
 // tracker, and pacer must be pre-created. mss is the maximum segment size
 // (typically MaxPayloadSize = 1400).
 func NewBBRState(est *bbrEstimator, ifl *inflightTracker, p *pacer, mss int) *BBRState {
-	return &BBRState{
+	s := &BBRState{
 		phase:      BBRStartup,
 		estimator:  est,
 		inflight:   ifl,
@@ -126,6 +136,14 @@ func NewBBRState(est *bbrEstimator, ifl *inflightTracker, p *pacer, mss int) *BB
 		mss:        mss,
 		cwndTarget: minCwndPackets,
 	}
+	s.cwndAtomic.Store(minCwndPackets)
+	return s
+}
+
+// setCwndTarget writes cwndTarget and its atomic mirror. Must be called with mu held.
+func (s *BBRState) setCwndTarget(n int) {
+	s.cwndTarget = n
+	s.cwndAtomic.Store(int32(n))
 }
 
 // Phase returns the current BBR phase.
@@ -136,10 +154,10 @@ func (s *BBRState) Phase() bbrPhase {
 }
 
 // CwndTarget returns the current congestion window target in packets.
+// Lock-free: reads cwndAtomic which is updated atomically whenever cwndTarget changes.
+// A one-packet stale read is safe — it is indistinguishable from normal scheduling jitter.
 func (s *BBRState) CwndTarget() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.cwndTarget
+	return int(s.cwndAtomic.Load())
 }
 
 // CwndTargetBytes returns the current congestion window target in bytes.
@@ -191,7 +209,7 @@ func (s *BBRState) SetInitialBandwidth(bytesPerSec int64, rtt time.Duration) {
 
 	// Jump directly to ProbeBW phase.
 	s.phase = BBRProbeBW
-	s.cwndTarget = int(float64(bdpPackets) * probeBWCwndGain)
+	s.setCwndTarget(int(float64(bdpPackets) * probeBWCwndGain))
 	s.pacingRate = bytesPerSec
 	s.cycleIndex = 2 // start at cruise (skip initial probe/drain)
 	s.cycleStart = time.Now()
@@ -277,7 +295,7 @@ func (s *BBRState) OnLoss(lostBytes int64) {
 				cwndNew = minCwndPackets
 			}
 			if cwndNew < s.cwndTarget {
-				s.cwndTarget = cwndNew
+				s.setCwndTarget(cwndNew)
 			}
 		} else {
 			// No BDP estimate yet — scale cwnd by (1 - lossRate).
@@ -286,7 +304,7 @@ func (s *BBRState) OnLoss(lostBytes int64) {
 				cwndNew = minCwndPackets
 			}
 			if cwndNew < s.cwndTarget {
-				s.cwndTarget = cwndNew
+				s.setCwndTarget(cwndNew)
 			}
 		}
 	}
@@ -300,7 +318,7 @@ func (s *BBRState) onACKStartup() {
 
 	// Pacing: aggressive probing on every ACK.
 	s.pacingRate = int64(float64(btlbw) * startupPacingGain)
-	s.cwndTarget = s.bdpPackets(startupCwndGain)
+	s.setCwndTarget(s.bdpPackets(startupCwndGain))
 
 	// Check BtlBw growth ONLY at round boundaries (not per-ACK).
 	// The BBR paper specifies: "exit Startup after 3 consecutive *rounds*
@@ -329,7 +347,7 @@ func (s *BBRState) onACKStartup() {
 func (s *BBRState) enterDrain() {
 	s.phase = BBRDrain
 	s.pacingRate = int64(float64(s.estimator.BtlBw()) * drainPacingGain)
-	s.cwndTarget = s.bdpPackets(startupCwndGain) // keep Startup cwnd during Drain
+	s.setCwndTarget(s.bdpPackets(startupCwndGain)) // keep Startup cwnd during Drain
 }
 
 func (s *BBRState) onACKDrain() {
@@ -370,7 +388,7 @@ func (s *BBRState) updateProbeBW() {
 	gain := probeBWGains[s.cycleIndex]
 	btlbw := s.estimator.BtlBw()
 	s.pacingRate = int64(float64(btlbw) * gain)
-	s.cwndTarget = s.bdpPackets(probeBWCwndGain)
+	s.setCwndTarget(s.bdpPackets(probeBWCwndGain))
 }
 
 // --- ProbeRTT phase ---
@@ -378,7 +396,7 @@ func (s *BBRState) updateProbeBW() {
 func (s *BBRState) enterProbeRTT() {
 	s.priorCwnd = s.cwndTarget
 	s.phase = BBRProbeRTT
-	s.cwndTarget = probeRTTCwndPackets
+	s.setCwndTarget(probeRTTCwndPackets)
 	s.probeRTTDoneTime = time.Time{} // will be set when inflight drops
 	s.probeRTTRoundDone = false
 }
@@ -396,10 +414,11 @@ func (s *BBRState) onACKProbeRTT() {
 	if time.Since(s.probeRTTDoneTime) >= probeRTTDuration {
 		s.probeRTTRoundDone = true
 		// Restore cwnd and return to ProbeBW.
-		s.cwndTarget = s.priorCwnd
-		if s.cwndTarget < minCwndPackets {
-			s.cwndTarget = minCwndPackets
+		restored := s.priorCwnd
+		if restored < minCwndPackets {
+			restored = minCwndPackets
 		}
+		s.setCwndTarget(restored)
 		s.enterProbeBW()
 	}
 }
@@ -427,7 +446,7 @@ func (s *BBRState) Reset() {
 	s.fullBwCount = 0
 	s.fullBw = 0
 	s.cycleIndex = 0
-	s.cwndTarget = minCwndPackets
+	s.setCwndTarget(minCwndPackets)
 	s.pacingRate = 0
 	s.estimator.Reset()
 	s.inflight.Reset()

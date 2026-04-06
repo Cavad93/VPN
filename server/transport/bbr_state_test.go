@@ -167,10 +167,12 @@ func TestBBRProbeRTT(t *testing.T) {
 	// Seed estimator.
 	simulateNACKs(s, 5, 50*time.Millisecond, 14000)
 
-	// Force RTprop to expire by manipulating the filter.
+	// Force RTprop to expire by manipulating the filter and its atomic mirror.
 	s.mu.Lock()
 	s.estimator.mu.Lock()
-	s.estimator.rtpropFilter.stamp = time.Now().Add(-15 * time.Second) // expired
+	expiredStamp := time.Now().Add(-15 * time.Second)
+	s.estimator.rtpropFilter.stamp = expiredStamp // expired
+	s.estimator.rtpropStampNano.Store(expiredStamp.UnixNano())
 	s.estimator.mu.Unlock()
 	s.mu.Unlock()
 
@@ -198,7 +200,9 @@ func TestBBRProbeRTTRestoresCwnd(t *testing.T) {
 
 	s.mu.Lock()
 	s.estimator.mu.Lock()
-	s.estimator.rtpropFilter.stamp = time.Now().Add(-15 * time.Second)
+	expiredStamp2 := time.Now().Add(-15 * time.Second)
+	s.estimator.rtpropFilter.stamp = expiredStamp2
+	s.estimator.rtpropStampNano.Store(expiredStamp2.UnixNano())
 	s.estimator.mu.Unlock()
 	s.mu.Unlock()
 
