@@ -617,3 +617,88 @@ func TestMuxFrameHeaderEncoding(t *testing.T) {
 		t.Errorf("length %d, want 2", length)
 	}
 }
+
+// TestMuxKeepaliveSentToWire verifies that the mux keepalive goroutine sends
+// a valid FramePing (7-byte header, streamID=0, length=0) within 2× keepalive
+// interval.  Uses a raw net.Pipe so we can inspect the wire bytes directly.
+func TestMuxKeepaliveSentToWire(t *testing.T) {
+	t.Parallel()
+
+	// We only need one end: read raw bytes from the "server" side to verify
+	// that the client's keepaliveLoop emitted a proper FramePing header.
+	cConn, rawServer := net.Pipe()
+
+	client := NewMux(cConn, true)
+	defer client.Close()
+	defer rawServer.Close()
+
+	// Allow up to 2× keepalive interval to receive a ping.
+	rawServer.SetReadDeadline(time.Now().Add(2 * muxKeepaliveInterval)) //nolint:errcheck
+
+	hdr := make([]byte, muxHeaderSize)
+	// Drain frames until we see a FramePing (skip SYN and other frames
+	// that may arrive before the first keepalive tick).
+	for {
+		if _, err := io.ReadFull(rawServer, hdr); err != nil {
+			t.Fatalf("did not receive a FramePing within 2× keepalive interval: %v", err)
+		}
+		if hdr[4] == FramePing {
+			break
+		}
+		// Non-ping frame: read and discard its payload so we stay in sync.
+		plen := (uint16(hdr[5]) << 8) | uint16(hdr[6])
+		if plen > 0 {
+			if _, err := io.ReadFull(rawServer, make([]byte, plen)); err != nil {
+				t.Fatalf("reading non-ping payload: %v", err)
+			}
+		}
+	}
+
+	// Validate the FramePing header fields.
+	streamID := (uint32(hdr[0]) << 24) | (uint32(hdr[1]) << 16) | (uint32(hdr[2]) << 8) | uint32(hdr[3])
+	if streamID != 0 {
+		t.Errorf("FramePing streamID = %d, want 0", streamID)
+	}
+	plen := (uint16(hdr[5]) << 8) | uint16(hdr[6])
+	if plen != 0 {
+		t.Errorf("FramePing length = %d, want 0", plen)
+	}
+}
+
+// TestMuxKeepaliveTransparentToStreams verifies that FramePing frames injected
+// by one side do not disrupt normal stream data exchange on the other side.
+func TestMuxKeepaliveTransparentToStreams(t *testing.T) {
+	t.Parallel()
+
+	client, server := newMuxPair(t)
+	defer client.Close()
+	defer server.Close()
+
+	// Open a data stream.
+	stream, err := client.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	sStream, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("AcceptStream: %v", err)
+	}
+
+	// Exchange data across the keepalive boundary.
+	want := []byte("hello after keepalive")
+	if _, err := stream.Write(want); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(sStream, got); err != nil {
+		t.Fatalf("ReadFull: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}

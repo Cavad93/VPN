@@ -1099,12 +1099,13 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 	// (inner) starts SECOND. This prevents the timer inversion bug where
 	// the subtimer could exceed its container.
 	//
-	// Read deadline: cap the maximum blocking time at 30 seconds. Without
-	// this, ObfsConn.Read (io.ReadFull) can stall for 166+ seconds when the
-	// remote peer silently disappears (e.g. mobile network switch, NAT
-	// timeout). The 30s cap ensures timely detection of dead connections
-	// and prevents TCP congestion window collapse from stale ACK state.
-	nc.conn.SetReadDeadline(time.Now().Add(30 * time.Second)) //nolint:errcheck
+	// Read deadline: cap the maximum blocking time at 60 seconds.
+	// The mux keepalive (transport.muxKeepaliveInterval = 15s) sends a
+	// FramePing every 15s, resetting this deadline on each receive.
+	// 60s = 4× keepalive interval → tolerates up to 3 dropped/delayed pings
+	// before declaring the connection dead. Without keepalives a 30s cap would
+	// disconnect idle but valid connections (e.g. user not browsing for 30s).
+	nc.conn.SetReadDeadline(time.Now().Add(60 * time.Second)) //nolint:errcheck
 	var obfsReadStart, afterRead time.Time
 	if nc.perf != nil {
 		obfsReadStart = time.Now()

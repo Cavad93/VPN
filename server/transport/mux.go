@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 // muxFramePool holds pre-allocated frame buffers sized for typical MTU traffic
@@ -60,7 +61,13 @@ const (
 	FrameSYN  uint8 = 0x01 // open a new stream
 	FrameData uint8 = 0x02 // data payload
 	FrameFIN  uint8 = 0x03 // half-close stream from sender
+	FramePing uint8 = 0x04 // keepalive ping; streamID=0, length=0, no payload
 )
+
+// muxKeepaliveInterval is how often each side proactively sends a FramePing.
+// The peer's noiseConn.Read deadline must be > 2× this value so that one
+// delayed/dropped ping does not cause a false disconnect.
+const muxKeepaliveInterval = 15 * time.Second
 
 // muxHeaderSize is the fixed size of the mux frame header in bytes.
 // Layout: streamID(4) + type(1) + length(2) = 7 bytes.
@@ -104,7 +111,40 @@ func NewMux(conn net.Conn, isClient bool) *Mux {
 		m.nextID = 1
 	}
 	go m.readLoop()
+	go m.keepaliveLoop()
 	return m
+}
+
+// keepaliveLoop sends a FramePing every muxKeepaliveInterval.
+// This prevents the peer's noiseConn.Read deadline from firing on idle
+// connections and keeps NAT/firewall state tables alive.
+// The goroutine exits when the Mux is closed (ctx cancelled) or the write fails.
+func (m *Mux) keepaliveLoop() {
+	ticker := time.NewTicker(muxKeepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := m.sendPing(); err != nil {
+				// Write failed: connection is dead. readLoop will call Close.
+				return
+			}
+		case <-m.ctx.Done():
+			return
+		}
+	}
+}
+
+// sendPing writes a FramePing frame (7-byte header, no payload, streamID=0).
+// Thread-safe; uses writeMu to serialise with writeFrame.
+func (m *Mux) sendPing() error {
+	var hdr [muxHeaderSize]byte
+	// streamID=0 (not a real stream), type=FramePing, length=0
+	hdr[4] = FramePing
+	m.writeMu.Lock()
+	_, err := m.conn.Write(hdr[:])
+	m.writeMu.Unlock()
+	return err
 }
 
 // OpenStream creates a new outbound Stream and sends a SYN frame to the peer.
@@ -222,6 +262,12 @@ func (m *Mux) readLoop() {
 		streamID := binary.BigEndian.Uint32(hdr[0:4])
 		fType := hdr[4]
 		length := binary.BigEndian.Uint16(hdr[5:7])
+
+		// Keepalive ping: no payload, no stream. Receiving this frame is enough
+		// to reset the noiseConn.Read deadline (the Read already happened above).
+		if fType == FramePing {
+			continue
+		}
 
 		// Build the payload for this frame.
 		// Frames ≤ muxReadPoolMaxSize bytes are read into a pooled buffer to

@@ -48,10 +48,15 @@ TLS_HELLO_SERVER = 0x02
 MAX_OBFS_PAYLOAD = 16383
 
 # Mux frame types
-FRAME_SYN = 0x01
+FRAME_SYN  = 0x01
 FRAME_DATA = 0x02
-FRAME_FIN = 0x03
+FRAME_FIN  = 0x03
+FRAME_PING = 0x04  # keepalive; streamID=0, length=0, no payload
 MUX_HEADER_SIZE = 7  # streamID(4) + type(1) + payloadLen(2)
+
+# How often the mux sends a keepalive ping.
+# Must be < noiseConn read deadline on server (60s) divided by 2.
+MUX_KEEPALIVE_INTERVAL: float = 15.0  # seconds
 
 # Control stream message types
 CTL_HELLO = 0x01
@@ -719,6 +724,12 @@ class ClientMux:
             target=self._read_loop, daemon=True, name="mux-reader"
         )
         self._reader_thread.start()
+        # Start the keepalive loop — prevents server's noiseConn.Read deadline
+        # from firing and keeps NAT/firewall state tables alive.
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop, daemon=True, name="mux-keepalive"
+        )
+        self._keepalive_thread.start()
 
     def open_stream(self) -> MuxStream:
         """Open a new outbound stream and send SYN."""
@@ -758,6 +769,20 @@ class ClientMux:
         with self._streams_lock:
             self._streams.pop(stream_id, None)
 
+    def _keepalive_loop(self) -> None:
+        """Background thread: send a FramePing every MUX_KEEPALIVE_INTERVAL seconds.
+
+        This prevents the server's noiseConn.Read deadline (60 s) from triggering
+        on idle connections (e.g. user not browsing) and keeps NAT/firewall UDP/TCP
+        state tables alive.  The thread exits when the mux is closed.
+        """
+        while not self._closed.wait(timeout=MUX_KEEPALIVE_INTERVAL):
+            try:
+                # streamID=0 is the sentinel for keepalive (no real stream).
+                self._write_frame(0, FRAME_PING, b"")
+            except Exception:
+                return  # connection dead; _read_loop will do the cleanup
+
     def _read_loop(self) -> None:
         """Background thread: read mux frames and dispatch to streams."""
         import socket as _socket
@@ -786,6 +811,11 @@ class ClientMux:
             frame_type = frame_data[4]
             payload_len = int.from_bytes(frame_data[5:7], "big")
             payload = frame_data[7:7 + payload_len]
+
+            # Keepalive ping from server: just continue.  Receiving this frame
+            # is sufficient — it proves the connection is alive.
+            if frame_type == FRAME_PING:
+                continue
 
             with self._streams_lock:
                 stream = self._streams.get(stream_id)
