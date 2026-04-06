@@ -98,10 +98,11 @@ func DecodePacket(data []byte) (*Packet, error) {
 
 // pendingPacket tracks a sent but unACKed packet for retransmission.
 type pendingPacket struct {
-	pkt         *Packet
-	firstSentAt time.Time // original send time (for RTT measurement — never updated)
-	sentAt      time.Time // last send time (updated on retransmit — for RTO timeout)
-	retransmits int
+	pkt            *Packet
+	payloadBacking *[]byte   // non-nil → payload was borrowed from payloadPool; return on release
+	firstSentAt    time.Time // original send time (for RTT measurement — never updated)
+	sentAt         time.Time // last send time (updated on retransmit — for RTO timeout)
+	retransmits    int
 
 	// BBR delivery-rate snapshots taken at send time.
 	delivered     int64
@@ -113,6 +114,18 @@ type pendingPacket struct {
 // sent packet. Returned to pool in processACK when the ACK arrives.
 var pendingPool = sync.Pool{
 	New: func() interface{} { return new(pendingPacket) },
+}
+
+// payloadPool pools the MaxPayloadSize-byte buffers used to hold a copy of the
+// caller's data in writePacket. The copy must outlive the Write call (for
+// retransmission), so it cannot share the caller's buffer. Pooling eliminates
+// ~3.7 MB/sec of heap allocation at 30 Mbps (≈2620 allocs/sec × 1460 bytes).
+// Buffers are returned in processACK (on ACK) and doRetransmit (on drop).
+var payloadPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, MaxPayloadSize)
+		return &b
+	},
 }
 
 // ackedPktInfo carries per-packet measurements collected under sendMu in
@@ -343,10 +356,17 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 
 	// Copy payload once for retransmission storage. The original slice
 	// belongs to the caller and may be reused after Write returns.
+	// Use a pooled buffer to eliminate ~3.7 MB/sec of heap allocation at
+	// 30 Mbps. The backing pointer is stored in pendingPacket so it can be
+	// returned to payloadPool when the ACK arrives (processACK) or the packet
+	// is dropped after MaxRetransmits (doRetransmit).
 	var payloadCopy []byte
+	var payloadBacking *[]byte
 	if len(payload) > 0 {
-		payloadCopy = make([]byte, len(payload))
+		pb := payloadPool.Get().(*[]byte)
+		payloadCopy = (*pb)[:len(payload)]
 		copy(payloadCopy, payload)
+		payloadBacking = pb
 	}
 
 	// Encode packet using pooled buffer to avoid allocation.
@@ -391,6 +411,7 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 
 	pp := pendingPool.Get().(*pendingPacket)
 	pp.pkt = pkt
+	pp.payloadBacking = payloadBacking // nil when payload is empty
 	pp.firstSentAt = now
 	pp.sentAt = now
 	pp.retransmits = 0
@@ -483,8 +504,12 @@ func (c *Conn) processACK(ackNum uint32) {
 				retransmitted: pp.retransmits > 0,
 			})
 
-			// Return pendingPacket to pool.
-			pp.pkt = nil // release payload reference for GC
+			// Return payload buffer and pendingPacket to their pools.
+			if pp.payloadBacking != nil {
+				payloadPool.Put(pp.payloadBacking)
+				pp.payloadBacking = nil
+			}
+			pp.pkt = nil
 			pendingPool.Put(pp)
 		}
 	}
@@ -660,6 +685,10 @@ func (c *Conn) doRetransmit() {
 			c.bbr.inflight.OnLoss(int(payloadLen))
 			lostBytes += payloadLen
 			dropped++
+			if pp.payloadBacking != nil {
+				payloadPool.Put(pp.payloadBacking)
+				pp.payloadBacking = nil
+			}
 			pp.pkt = nil
 			pendingPool.Put(pp)
 			continue

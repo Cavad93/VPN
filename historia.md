@@ -515,11 +515,53 @@ s.readCh <- payload
 
 ---
 
+## Запуск 12 — 2026-04-06
+
+### Выполнено: payloadPool — устранение последней heap-аллокации в горячем send-пути
+
+**Файл:** `server/transport/udp.go`
+
+**Проблема:**
+В `writePacket` единственная оставшаяся heap-аллокация горячего пути:
+```go
+payloadCopy = make([]byte, len(payload))  // 1460 bytes × ~2622/сек = ~3.75 MB/сек
+```
+
+Payload-копия нужна для возможности ретрансмита — оригинальный буфер вызывающего может быть переиспользован сразу после `Write`. Поэтому простой zero-copy невозможен, но pooling — можно.
+
+**Решение:**
+
+1. **`payloadPool = sync.Pool`** — пул `*[]byte` буферов размером `MaxPayloadSize` (1460 байт).
+2. **`pendingPacket.payloadBacking *[]byte`** — новое поле: хранит указатель на pooled-буфер (nil для пустых пакетов и пакетов, созданных напрямую в тестах).
+3. **`writePacket`**: `payloadPool.Get()` → `payloadCopy = (*pb)[:len(payload)]` → `copy` → `payloadBacking = pb`. Ноль изменений в семантике — данные по-прежнему копируются, буфер просто берётся из пула вместо heap.
+4. **`processACK`**: после копирования `pp.pkt.Payload` размера в `ackedPktInfo`, перед `pendingPool.Put(pp)`:
+   ```go
+   if pp.payloadBacking != nil {
+       payloadPool.Put(pp.payloadBacking)
+       pp.payloadBacking = nil
+   }
+   ```
+5. **`doRetransmit`** (MaxRetransmits exceeded path): аналогичный возврат перед `pendingPool.Put(pp)`.
+
+**Безопасность:**
+- В `doRetransmit` под `sendMu`: читает `pp.pkt.Payload` (из pooled buf), затем отправляет через WriteToUDP. Pool возврат происходит только когда пакет удалён из `c.pending` (ACK или drop) — эти два события взаимоисключающие под `sendMu`.
+- Тесты, которые напрямую создают `&pendingPacket{pkt: ...}`, имеют `payloadBacking == nil` → условие `if pp.payloadBacking != nil` пропускается → no-op.
+
+**Эффект:**
+- Устранена `make([]byte, 1460)` аллокация ~2620 раз/сек при 30 Mbps → **0 аллокаций** в горячем пути.
+- Экономия: ~3.75 MB/сек heap allocation → GC cycles сокращаются.
+- Теперь `writePacket` имеет **нулевых heap-аллокаций** в steady-state: sendBufPool + payloadPool + pendingPool — все три pooled.
+
+**Тесты:** `go test ./...` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
-1. **ObfsConn write path** — `Write` нет батчинга: каждый `Write(p)` → один TLS record → один syscall.
-   При малых write (< MTU) это значительно снижает пропускную способность. Рассмотреть bufio.Writer с Flush по таймеру.
+1. **ObfsConn write path** — ~~`Write` нет батчинга~~ РЕШЕНО: `BufConn` (200µs timer, 14600 byte threshold) уже стоит между TCP socket и ObfsConn — все `ObfsConn.Write` вызовы батчатся внутри BufConn. Эта задача закрыта.
 
-2. **firstSentAt vs sentAt** — `ackedPktInfo.sentAt` = `pp.firstSentAt` (оригинальное время отправки, не обновляется при ретрансмите). Передаётся в `BBRState.OnACK` как `sentAt`. Это корректно для вычисления delivery rate (мы хотим именно время original send для сравнения с ack-arrived time). Документировано для ясности.
+2. **processData alloc** — `toDeliver := make([][]byte, 0, 4)` на каждый входящий пакет (~83 KB/сек при 30 Mbps). Малое влияние; можно poolить `[][]byte` с sync.Pool.
 
 3. **IPv6 inner tunnel support** — `markECNCE` пока обрабатывает только IPv4. Если туннель расширится до IPv6, нужен аналогичный путь для Traffic Class field (нет checksum → проще).
+
+4. **firstSentAt vs sentAt** — документировано; не баг.
