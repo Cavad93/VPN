@@ -56,8 +56,11 @@ _AF_INET = 2
 _UTUN_HDR = struct.pack(">I", _AF_INET)  # b'\x00\x00\x00\x02'
 _UTUN_HDR_LEN = 4
 
-# Maximum transmission unit default
-DEFAULT_MTU = 1420
+# Maximum transmission unit for the VPN tunnel interface.
+# Must satisfy: DEFAULT_MTU + VPN_OVERHEAD <= transport.MaxPayloadSize (1460)
+# VPN_OVERHEAD = mux(7) + noise_len(2) + noise_tag(16) + obfs_hdr(5) = 30 bytes
+# DEFAULT_MTU = 1460 - 30 = 1430  → inner IP packet fits in exactly one UDP datagram.
+DEFAULT_MTU = 1430
 
 
 # ---------------------------------------------------------------------------

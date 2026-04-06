@@ -54,7 +54,8 @@ const maxObfsPayload = 16383
 // ObfsConn.Write, avoiding one make() per outgoing TLS record.
 var obfsRecordPool = sync.Pool{
 	New: func() interface{} {
-		// header(5) + mux_header(7) + MTU(1460) + AEAD_tag(16) = 1488
+		// header(5) + mux_header(7) + tunMTU(1430) + noise_len(2) + AEAD_tag(16) = 1460
+		// = MaxPayloadSize: fits in exactly one UDP datagram, no splitting.
 		// Rounded to 1536 for allocator-friendly sizing.
 		b := make([]byte, 0, 1536)
 		return &b

@@ -46,6 +46,15 @@ func ConfigureTun(name, cidr string) error {
 		return fmt.Errorf("ConfigureTun: %w", netshErr)
 	}
 
+	// Set MTU to match the VPN tunnel overhead budget.
+	// VPN framing per packet: mux(7) + noise_len(2) + noise_tag(16) + obfs(5) = 30 bytes.
+	// tunMTU = MaxPayloadSize(1460) - overhead(30) = 1430 ensures each inner IP
+	// packet produces exactly one UDP datagram with no splitting (see tun_linux.go).
+	exec.Command( //nolint:errcheck
+		"netsh", "interface", "ipv4", "set", "subinterface",
+		name, "mtu=1430", "store=active",
+	).Run()
+
 	// Enable IP routing in the registry (takes effect after reboot; the
 	// install script also sets this, but we set it here for completeness).
 	exec.Command( //nolint:errcheck

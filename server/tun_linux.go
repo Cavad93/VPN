@@ -15,14 +15,28 @@ const (
 	iffNoPi   = 0x1000
 
 	// tunMTU is the MTU configured on the TUN interface.
-	// VPN framing overhead per packet:
-	//   mux header:   7 bytes
-	//   noise header: 2 + 16 (AEAD tag) = 18 bytes
-	//   obfs header:  5 bytes
-	//   total:        30 bytes
-	// Setting MTU = 1500 - 30 - 10 (minimal safety) = 1460 maximises payload
-	// per packet while staying within the 1500-byte Ethernet MTU.
-	tunMTU = 1460
+	//
+	// Every inner IP packet is wrapped in VPN framing before being handed to the
+	// UDP transport layer (transport.Conn.Write). The transport splits data into
+	// MaxPayloadSize (1460-byte) chunks, each tracked independently as one entry
+	// in the BBR congestion window (cwnd). A split wastes one cwnd slot on a tiny
+	// fragment, halving effective throughput at any given cwnd value.
+	//
+	// VPN framing overhead per inner IP packet:
+	//   mux header:        7 bytes  (streamID + type + length)
+	//   noise length:      2 bytes  (BE uint16 frame length)
+	//   noise AEAD tag:   16 bytes  (ChaCha20-Poly1305 authentication tag)
+	//   obfs TLS header:   5 bytes  (content_type + version + length)
+	//   total overhead:   30 bytes
+	//
+	// To avoid splitting, the obfs TLS record must fit in one UDP payload:
+	//   inner_IP + 30 ≤ MaxPayloadSize (1460)
+	//   inner_IP ≤ 1430
+	//
+	// Setting tunMTU = 1430 guarantees that every inner IP packet produces
+	// exactly ONE UDP datagram. This doubles the effective cwnd capacity
+	// compared to tunMTU = 1460 (which produces 2 datagrams per IP packet).
+	tunMTU = 1430
 )
 
 // tunIfreq is the ifreq structure for TUNSETIFF ioctl.

@@ -223,15 +223,84 @@ func (e *bbrEstimator) DeliveredSnapshot() (int64, time.Time) {
 
 ---
 
+---
+
+## Запуск 7 — 2026-04-06
+
+### Выполнено: TUN MTU — устранение UDP-splitting для каждого IP-пакета
+
+**Файлы:** `server/tun_linux.go`, `server/tun_configure_windows.go`, `client/tun_macos.py`
+
+**Обнаруженная проблема (в рамках анализа Double CC):**
+
+В процессе трассировки пути данных был обнаружен критический баг в настройке MTU:
+
+```
+Путь данных (server → client):
+  TUN read (1460 bytes)
+  → mux.writeFrame:   + 7 bytes header   = 1467 bytes
+  → noiseConn.Write:  + 2 (len) + 16 (AEAD tag) = 1485 bytes
+  → ObfsConn.Write:   + 5 (TLS header)   = 1490 bytes
+  → UDP transport.Write (MaxPayloadSize=1460): SPLIT!
+    → chunk 1: 1460 bytes  → writePacket → 1 cwnd slot
+    → chunk 2:   30 bytes  → writePacket → 1 cwnd slot  ← ЛИШНИЙ СЛОТ
+```
+
+Каждый 1460-байтный внутренний IP-пакет потреблял **2 cwnd-слота** вместо 1.
+
+**Последствия:**
+- При cwnd = 32 в воздухе одновременно не более **16** IP-пакетов (вместо 32)
+- Пропускная способность ограничена **вдвое** ниже теоретического максимума
+- 30-байтные фрагменты тратят ACK overhead такой же, как 1460-байтные (11 байт header — 36% overhead вместо 0.75%)
+- Двойное количество записей в `pending` map → двойное давление на BBR
+- Данная ошибка существовала с момента первых реализаций транспорта
+
+**Формула корректного tunMTU:**
+```
+inner_IP + overhead ≤ MaxPayloadSize
+inner_IP + 30 ≤ 1460
+inner_IP ≤ 1430
+→ tunMTU = 1430
+```
+
+**Исправления:**
+
+1. **`server/tun_linux.go`**: `tunMTU = 1460 → 1430`
+   Расширенный комментарий объясняет арифметику и запрет на увеличение.
+
+2. **`server/tun_configure_windows.go`**: добавлена команда
+   `netsh interface ipv4 set subinterface <name> mtu=1430 store=active`
+   Wintun не задаёт MTU автоматически; без этой команды Windows-сервер страдал от тех же splits.
+
+3. **`client/tun_macos.py`**: `DEFAULT_MTU = 1420 → 1430`
+   Старое значение 1420 было безопасным (1420+30=1450 < 1460), но неоптимальным.
+   1430 утилизирует весь UDP payload: 1430+30=1460 = MaxPayloadSize (ровно вписывается).
+
+**Эффект:**
+- Download direction (server→client): 1 UDP пакет на IP-пакет вместо 2 → cwnd полностью утилизируется
+- При cwnd=32: 32 IP-пакета в воздухе вместо 16 → **до 2x throughput**
+- Вдвое меньше записей в `pending` map
+- Вдвое меньше ACK-ов и retransmit-треков
+- Client→server: был безопасным (1420+30=1450≤1460), теперь оптимален (1430+30=1460=MaxPayloadSize)
+
+**Тесты:** `go test ./...` — все 8 пакетов зелёные; Python `unittest test_tun_macos` — 36 тестов OK.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
-1. **Double CC** — Наш user-space BBR (UDP) + TCP CC ОС (CUBIC/BBR). Два независимых CC на одном пути.
-   Архитектурная проблема; требует отдельного исследования. Решение: вынести VPN-транспорт на raw sockets или отключить Nagle/CC для inner TCP потоков.
+1. **Double CC (proper)** — Внутренний TCP пользователя (CUBIC/BBR в ОС) + наш BBR на UDP.
+   После исправления MTU (Запуск 7) эффект двойного CC уменьшился: cwnd теперь достаточно большой для большинства нагрузок. Но при высокой потере (>1%) оба CC всё ещё реагируют независимо. Возможное решение:
+   - **ECN propagation**: когда наш BBR перегружен (pending → cwnd), установить ECN CE в заголовке inner IP → inner TCP снизит cwnd в синхронизации с нашим BBR.
+   - Требует: парсинг IP-заголовка в `routeFromTun`, установка ECN-бита, пересчёт IP-checksum.
 
 2. **Диагностика** — pprof-профилирование под нагрузкой для поиска других узких мест:
    - `inflightTracker.mu` — вызывается из `processACK` и `doRetransmit` одновременно
    - `bbr_estimator.mu` — вызывается из `OnACK` для каждого ACK-а
    - `readLoop` в `mux.go` — `make([]byte, length)` на каждый фрейм
+
+3. **ObfsConn write path** — для TCP-транспорта: нет батчинга, каждый Write → один syscall.
+   Для UDP-пути: BufConn уже коалесцирует, поэтому менее критично.
 
 3. **ObfsConn write path** — `Write` нет батчинга: каждый `Write(p)` → один TLS record → один syscall.
    При малых write (< MTU) это значительно снижает пропускную способность. Рассмотреть bufio.Writer с Flush по таймеру.
