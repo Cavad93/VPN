@@ -37,15 +37,51 @@
 
 ---
 
+## Запуск 2 — 2026-04-06
+
+### Выполнено: sendMu contention — вынос WriteToUDP за пределы критической секции
+
+**Файл:** `server/transport/udp.go` → функция `doRetransmit()`
+
+**Проблема:**  
+`doRetransmit()` держала `sendMu` на протяжении всего цикла ретрансмита, включая каждый вызов `c.conn.WriteToUDP()`. Каждый syscall занимает 1–50 µs. При N ретрансмитах за один тик (`retransmitLoop` каждые 20–200 мс) `sendMu` удерживался на N×50 µs. В это время `writePacket` (основной путь записи данных) полностью блокировался — пропускная способность при потерях пакетов падала.
+
+**Конкретный сценарий:**  
+При 1% потери на канале 30 Mbps (~267 пакетов/сек, cwnd=32): ретрансмит-тик обрабатывает несколько тайм-аутов за раз. Если 5 пакетов ждут ретрансмита, `sendMu` держался ~250 µs. За это время `writePacket` простаивал, не подавая новые пакеты в окно.
+
+**Решение:**  
+Разделил `doRetransmit` на два этапа:
+
+1. **Под `sendMu`** (только память, без syscall):
+   - Итерация по `c.pending` для поиска тайм-аутов
+   - Кодирование пакета в pooled-буфер (`sendBufPool.Get()`)
+   - Обновление `pp.sentAt`, `pp.retransmits++`
+   - Регистрация в `bbr.inflight.OnSend()` (имеет свой lock, быстро)
+   - Сбор `rtxItem{bp, buf}` в локальный slice
+
+2. **После `sendMu`** (syscall без блокировки записи):
+   - Цикл `c.conn.WriteToUDP(item.buf, c.remote)` — UDP-сокеты thread-safe для concurrent writes
+   - Возврат буферов в `sendBufPool`
+
+Введён вспомогательный тип `rtxItem` и stack-allocated буфер `[8]rtxItem` (heap grows only under sustained loss with >8 simultaneous timeouts).
+
+**Эффект:**  
+Время удержания `sendMu` в `doRetransmit`: O(N×syscall) → O(N×memcopy). `writePacket` больше не блокируется на время ретрансмита. Под 1% потери при 30 Mbps — ожидаемое снижение задержки записи на 80–95%.
+
+**Тесты:** `go test ./...` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **BBR app-limited** — Обновление BtlBw при idle отправителе.  
-   Файл для изучения: найти реализацию BBR в `server/transport/` (возможно `udp.go`).
+   **Анализ:** Текущий код в `bbr_estimator.go:271` правильно пропускает app-limited сэмплы (`if !isAppLimited || deliveryRate > current_best`). Реальная проблема: после долгого idle (>10 RTT) `roundCount` опережает временны́е метки сэмплов в `windowedMaxFilter`, и при первом не-app-limited пакете `recalcBest()` выметает все старые записи → BtlBw может скакнуть до нового (возможно шумного) значения. Краткосрочный эффект: momentary throughput spike/dip, ProbeBW фаза восстанавливается за 2–3 RTT. Долгосрочного ущерба нет — ProbeBW компенсирует. **Можно пропустить или понизить приоритет.**
 
-2. **Mutex contention** — Оптимизация `sendMu` (устранение CPU spinning при 3000 lock/unlock в сек).  
-   Файлы: `server/transport/mux.go` (поле `writeMu`), возможно `server/main.go`.
+2. **Double CC** — Конфликт нашего BBR (user-space, UDP) и TCP CC ОС.  
+   VPN транспорт: UDP + BBR (user-space). Внутри VPN-туннеля клиент гоняет TCP-трафик с собственным TCP CC. Наш BBR управляет UDP-окном, не зная о TCP-окнах клиентских соединений → два независимых CC на одном пути. **Архитектурная проблема; требует отдельного исследования.**
 
-3. **Double CC** — Конфликт нашего BBR и TCP стека ОС.  
-   Требует анализа архитектуры: VPN работает поверх TCP/UDP, внутри которого идёт IP-трафик клиента с собственным TCP. Наш congestion control (в `udp.go`) конкурирует с TCP CC операционной системы.
-
-4. **Диагностика** — После исправления приоритетов провести профилирование с `go tool pprof` для поиска других узких мест.
+3. **Диагностика** — pprof-профилирование под нагрузкой для поиска других узких мест. Кандидаты:
+   - `inflightTracker.mu` — свой mutex, вызывается из `processACK` и `doRetransmit` одновременно
+   - `bbr_estimator.mu` — вызывается из `OnACK` для каждого ACK-а
+   - Аллокации в `processACK` (`make([]ackedInfo, 0, 16)` каждый вызов — можно poolить)
+   - `readLoop` в `mux.go` — `make([]byte, length)` на каждый фрейм

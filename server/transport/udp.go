@@ -574,17 +574,32 @@ func (c *Conn) retransmitLoop() {
 	}
 }
 
+// rtxItem holds a pre-encoded retransmit packet ready to send outside sendMu.
+type rtxItem struct {
+	bp  *[]byte // pointer to pooled buffer (must be returned to sendBufPool)
+	buf []byte  // sub-slice of *bp with the encoded frame
+}
+
 // doRetransmit resends any packet whose RetransmitTimeout has elapsed.
 // BBR does NOT halve cwnd on retransmit (unlike TCP Reno). It just
 // retransmits the packet and lets BBR.OnLoss() handle rate adjustment
 // only if loss rate exceeds 2%.
+//
+// Optimisation: packets are encoded and their state updated under sendMu, but
+// the actual WriteToUDP syscalls happen AFTER releasing sendMu. This eliminates
+// the sendMu hold time from O(N×syscall) to O(N×memcopy), so writePacket is not
+// blocked while the OS drains the retransmit queue.
 func (c *Conn) doRetransmit() {
-	c.sendMu.Lock()
-
 	dropped := 0
 	lostBytes := int64(0)
 	now := time.Now()
 	rto := c.getRTO()
+
+	// rtxPending is a small stack-allocated slice; grows on heap only under loss.
+	var rtxPending [8]rtxItem
+	toSend := rtxPending[:0]
+
+	c.sendMu.Lock()
 	for seq, pp := range c.pending {
 		if now.Sub(pp.sentAt) < rto {
 			continue
@@ -603,16 +618,15 @@ func (c *Conn) doRetransmit() {
 			continue
 		}
 
-		// Mark as loss in BBR inflight tracker and retransmit.
+		// Mark as loss in BBR inflight tracker on first retransmit.
 		if pp.retransmits == 0 {
-			// First retransmit — count as a loss event.
 			lostBytes += int64(len(pp.pkt.Payload))
 			if ifl, ok := c.bbr.inflight.OnLoss(seq); ok {
 				inflightPktPool.Put(ifl)
 			}
 		}
 
-		// Re-encode using pooled buffer to avoid allocation.
+		// Pre-encode frame into a pooled buffer (pure memory ops — no syscall).
 		rbp := sendBufPool.Get().(*[]byte)
 		rbuf := (*rbp)[:HeaderSize+len(pp.pkt.Payload)]
 		rbuf[0] = pp.pkt.Type
@@ -620,8 +634,9 @@ func (c *Conn) doRetransmit() {
 		binary.BigEndian.PutUint32(rbuf[5:9], pp.pkt.AckNum)
 		binary.BigEndian.PutUint16(rbuf[9:11], uint16(len(pp.pkt.Payload)))
 		copy(rbuf[HeaderSize:], pp.pkt.Payload)
-		c.conn.WriteToUDP(rbuf, c.remote) //nolint:errcheck
-		sendBufPool.Put(rbp)
+		toSend = append(toSend, rtxItem{bp: rbp, buf: rbuf})
+
+		// Update retransmit state under lock so next tick won't re-queue.
 		pp.sentAt = now
 		pp.retransmits++
 
@@ -638,6 +653,15 @@ func (c *Conn) doRetransmit() {
 		c.bbr.inflight.OnSend(ifl)
 	}
 	c.sendMu.Unlock()
+
+	// Send retransmits OUTSIDE sendMu — WriteToUDP is a syscall that can take
+	// 1–50 µs per call; holding sendMu across N such calls would block
+	// writePacket for N×50 µs, capping throughput under loss conditions.
+	// UDP sockets are safe for concurrent writes from multiple goroutines.
+	for _, item := range toSend {
+		c.conn.WriteToUDP(item.buf, c.remote) //nolint:errcheck
+		sendBufPool.Put(item.bp)
+	}
 
 	// Notify BBR about loss (it only reduces cwnd if loss rate > 2%).
 	if lostBytes > 0 {
