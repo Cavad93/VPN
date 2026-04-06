@@ -15,7 +15,6 @@ const (
 	rtpropFilterLen = 10 * time.Second
 
 	// btlbwFilterLen is the number of round-trips for the max bandwidth filter.
-	// BBR paper: 6–10 round-trips. We use 10 for stability.
 	btlbwFilterLen = 10
 )
 
@@ -248,6 +247,18 @@ func (e *bbrEstimator) OnACK(
 	deliveredInterval := e.delivered - sendDelivered
 	ackElapsed := now.Sub(sendDeliveredTime) // time since last delivery at send time
 	sendElapsed := now.Sub(sendTime)          // time since the packet was sent (≈ RTT)
+
+	// Cap ackElapsed at 2×RTprop when the sender was idle between bursts.
+	// VPN traffic is bursty: TUN packets arrive in batches separated by idle
+	// gaps. When the sender is idle, sendDeliveredTime is stale (seconds old),
+	// making ackElapsed huge → delivery rate near zero → BtlBw decays.
+	// Capping at 2×RTprop ensures idle gaps don't skew the measurement:
+	// the worst-case delivery rate is then deliveredInterval / (2×RTprop),
+	// which is at least half the true rate rather than near-zero.
+	if rtprop := e.rtpropFilter.get(); rtprop > 0 && ackElapsed > 2*rtprop {
+		ackElapsed = 2 * rtprop
+	}
+
 	timeInterval := ackElapsed
 	if sendElapsed > timeInterval {
 		timeInterval = sendElapsed
