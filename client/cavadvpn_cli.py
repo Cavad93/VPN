@@ -111,11 +111,35 @@ def cmd_connect(args: argparse.Namespace) -> int:
             def _get_vpn_state():
                 return {"server_addr": server, "state": "connected"}
 
-            telemetry = create_telemetry_collector(
+            def _on_config_update(cfg: dict) -> None:
+                """Автоматически применяет рекомендации AI агента."""
+                # Обновляем транспортную информацию в следующем отчёте.
+                transport = cfg.get("transport_mode", "")
+                bonds = cfg.get("bond_count", 0)
+                padding = cfg.get("padding_mode", "")
+                sni_list = cfg.get("sni_hosts") or []
+                sni = sni_list[0] if sni_list else ""
+                if transport or bonds or padding or sni:
+                    telemetry.set_transport_info(
+                        transport_mode=transport,
+                        bond_count=bonds,
+                        sni_host=sni,
+                        padding_mode=padding,
+                    )
+                print(f"[AI] Новый конфиг от сервера: transport={transport or '—'}, "
+                      f"padding={padding or '—'}, sni={sni or '—'}")
+
+            from telemetry import TelemetryConfig, TelemetryCollector  # type: ignore
+            from telemetry import _generate_device_id, _detect_platform  # type: ignore
+
+            tel_cfg = TelemetryConfig(
                 server_url=telemetry_url,
-                get_vpn_state=_get_vpn_state,
-                interval=300.0,
+                collect_interval=300.0,
+                on_config_update=_on_config_update,
             )
+            telemetry = TelemetryCollector(tel_cfg, get_vpn_state=_get_vpn_state)
+            # Сообщаем текущий транспортный режим (UDP по умолчанию).
+            telemetry.set_transport_info(transport_mode="udp", bond_count=0)
             telemetry.record_connect()
             telemetry.start()
             print(f"Telemetry active → {telemetry_url}")
