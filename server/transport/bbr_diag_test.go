@@ -51,12 +51,24 @@ type diagPktMeta struct {
 
 // TestBBRDiagnoseSlowThroughput simulates realistic VPN conditions and
 // traces BBR state to find the root cause of 5-6x speed drop.
+//
+// Bottleneck simulation: without capping ACKs per round, cwnd grows to hundreds
+// of thousands of packets (no real network to limit it), and each round's tight
+// loop over that many packets takes non-trivial wall-clock time. OnACK() uses
+// time.Now() internally, so longer real-time iterations → larger sendElapsed →
+// lower delivery-rate samples → BtlBw filter decays → pacing spirals down.
+// We cap ACKs/round to model the 50 Mbps bottleneck and keep the test
+// deterministic regardless of CPU speed or benchmark co-execution.
 func TestBBRDiagnoseSlowThroughput(t *testing.T) {
-	// Simulate: 50 Mbps bottleneck, 80ms RTT, 0.7% loss
+	// Simulate: 50 Mbps bottleneck, 80ms RTT
 	const (
 		bottleneckBps = 50_000_000 // 50 Mbps
 		rtt           = 80 * time.Millisecond
-		mss           = MaxPayloadSize // 1400 bytes
+		mss           = MaxPayloadSize // 1430 bytes
+
+		// How many packets can cross the bottleneck in one RTT.
+		// = bottleneckBps × rtt / mss = 50_000_000 × 0.08 / 1430 ≈ 2797
+		maxAcksPerRound = int(int64(bottleneckBps) * int64(rtt) / int64(time.Second) / mss)
 	)
 
 	est := newBBREstimator()
@@ -67,7 +79,8 @@ func TestBBRDiagnoseSlowThroughput(t *testing.T) {
 	// Per-packet metadata (delivery-rate snapshots) stored locally.
 	pktMeta := make(map[uint32]*diagPktMeta, 64)
 
-	var seq uint32
+	var seq uint32        // next sequence number to send
+	var nextAckSeq uint32 // oldest unACKed sequence (avoid O(seq) scan each round)
 	sentBytes := int64(0)
 	ackedBytes := int64(0)
 
@@ -91,14 +104,16 @@ func TestBBRDiagnoseSlowThroughput(t *testing.T) {
 		cwnd := bbr.CwndTarget()
 		phase := bbr.Phase()
 
-		// ACK all inflight packets (simulate perfect delivery).
+		// ACK up to maxAcksPerRound oldest in-flight packets.
+		// This models the 50 Mbps bottleneck: only that many packets can be
+		// delivered per RTT. Remaining packets stay in flight until next round.
 		acksThisRound := 0
-		for ackSeq := uint32(0); ackSeq < seq; ackSeq++ {
-			m, ok := pktMeta[ackSeq]
+		for ; nextAckSeq < seq && acksThisRound < maxAcksPerRound; nextAckSeq++ {
+			m, ok := pktMeta[nextAckSeq]
 			if !ok {
 				continue
 			}
-			delete(pktMeta, ackSeq)
+			delete(pktMeta, nextAckSeq)
 			ifl.OnACK(m.size)
 			ackedBytes += int64(mss)
 			acksThisRound++
@@ -152,10 +167,12 @@ func TestBBRDiagnoseSlowThroughput(t *testing.T) {
 	t.Logf("RTprop: %d µs", est.RTprop())
 	t.Logf("Total sent: %d KB, acked: %d KB", sentBytes/1024, ackedBytes/1024)
 
-	// The pacing rate should be close to bottleneck BW.
-	// If it's < 1 Mbps something is fundamentally wrong.
-	if finalPacing < 1_000_000 {
-		t.Errorf("CRITICAL: pacing rate %.1f Mbps is way too low (expected ~50 Mbps)",
+	// With a proper 50 Mbps bottleneck simulation, BBR should converge to
+	// approximately the bottleneck rate. We accept anything ≥ 5 Mbps (10% of
+	// bottleneck) to tolerate BBR undershoot and the windowed-max filter lag.
+	// Values below 1 Mbps indicate a fundamental BBR bug (BtlBw poisoning).
+	if finalPacing < 5_000_000 {
+		t.Errorf("CRITICAL: pacing rate %.1f Mbps is way too low (expected ~50 Mbps bottleneck)",
 			float64(finalPacing)*8/1_000_000)
 	}
 }
