@@ -179,6 +179,14 @@ type AppliedConfig struct {
 	Reason    string           `json:"reason"` // short summary of why this config was chosen
 }
 
+// OverrideConfig holds user-pinned values that AI must not change.
+// Any field listed in PinnedFields takes its value from Values map
+// and overrides whatever the AI recommends.
+type OverrideConfig struct {
+	PinnedFields []string               `json:"pinned_fields"` // e.g. ["bond_count","transport_mode"]
+	Values       map[string]interface{} `json:"values"`        // pinned values keyed by field name
+}
+
 // ---------------------------------------------------------------------------
 // Telemetry store (in-memory ring buffer)
 // ---------------------------------------------------------------------------
@@ -322,6 +330,10 @@ type TelemetryAnalyzer struct {
 	// Currently applied config chosen by AI.
 	cfgMu      sync.RWMutex
 	appliedCfg AppliedConfig
+
+	// User-pinned overrides — AI cannot change pinned fields.
+	overrideMu sync.RWMutex
+	override   OverrideConfig
 }
 
 // NewTelemetryAnalyzer creates an analyzer that runs every interval.
@@ -427,13 +439,80 @@ func (ta *TelemetryAnalyzer) runOnce(ctx context.Context) *AnalysisResult {
 	return result
 }
 
+// SetOverride replaces the current override config.
+func (ta *TelemetryAnalyzer) SetOverride(ov OverrideConfig) {
+	ta.overrideMu.Lock()
+	defer ta.overrideMu.Unlock()
+	ta.override = ov
+}
+
+// GetOverride returns the current override config.
+func (ta *TelemetryAnalyzer) GetOverride() OverrideConfig {
+	ta.overrideMu.RLock()
+	defer ta.overrideMu.RUnlock()
+	return ta.override
+}
+
+// applyOverride merges pinned values into cfg, marking overridden fields.
+// Returns the merged config and a list of fields that were overridden.
+func (ta *TelemetryAnalyzer) applyOverride(cfg ActionableConfig) (ActionableConfig, []string) {
+	ta.overrideMu.RLock()
+	ov := ta.override
+	ta.overrideMu.RUnlock()
+
+	pinned := make(map[string]bool, len(ov.PinnedFields))
+	for _, f := range ov.PinnedFields {
+		pinned[f] = true
+	}
+	overridden := []string{}
+
+	if pinned["transport_mode"] {
+		if v, ok := ov.Values["transport_mode"].(string); ok && v != "" {
+			cfg.TransportMode = v
+			overridden = append(overridden, "transport_mode")
+		}
+	}
+	if pinned["bond_count"] {
+		if v, ok := ov.Values["bond_count"].(float64); ok {
+			cfg.BondCount = int(v)
+			overridden = append(overridden, "bond_count")
+		}
+	}
+	if pinned["mtu"] {
+		if v, ok := ov.Values["mtu"].(float64); ok {
+			cfg.MTU = int(v)
+			overridden = append(overridden, "mtu")
+		}
+	}
+	if pinned["padding_mode"] {
+		if v, ok := ov.Values["padding_mode"].(string); ok && v != "" {
+			cfg.PaddingMode = v
+			overridden = append(overridden, "padding_mode")
+		}
+	}
+	if pinned["padding_enabled"] {
+		if v, ok := ov.Values["padding_enabled"].(bool); ok {
+			cfg.PaddingEnabled = v
+			overridden = append(overridden, "padding_enabled")
+		}
+	}
+	if pinned["jitter_ms"] {
+		if v, ok := ov.Values["jitter_ms"].(float64); ok {
+			cfg.JitterMs = int(v)
+			overridden = append(overridden, "jitter_ms")
+		}
+	}
+	return cfg, overridden
+}
+
 // applyConfig compares the new ActionableConfig with the current one,
 // records what changed in the decision log, and stores the new config.
 func (ta *TelemetryAnalyzer) applyConfig(result *AnalysisResult) {
 	if result == nil || result.ActionableConfig == nil {
 		return
 	}
-	newCfg := *result.ActionableConfig
+	// Apply user overrides before diff — pinned fields always win.
+	newCfg, overridden := ta.applyOverride(*result.ActionableConfig)
 
 	ta.cfgMu.Lock()
 	old := ta.appliedCfg.Config
@@ -444,6 +523,15 @@ func (ta *TelemetryAnalyzer) applyConfig(result *AnalysisResult) {
 		Reason:    result.Summary,
 	}
 	ta.cfgMu.Unlock()
+
+	// Mark overridden fields in the change log so UI can show lock icon.
+	for i := range changes {
+		for _, f := range overridden {
+			if changes[i].Field == f {
+				changes[i].Reason = "pinned by user"
+			}
+		}
+	}
 
 	dec := ConfigDecision{
 		Timestamp:   result.Timestamp,
@@ -953,6 +1041,9 @@ func (a *APIServer) SetTelemetryStore(ts *TelemetryStore, analyzer *TelemetryAna
 	a.mux.HandleFunc("GET /api/v1/telemetry/config/applied", a.handleGetAppliedConfig)
 	// AI decision history — auth required.
 	a.mux.HandleFunc("GET /api/v1/telemetry/decisions", a.auth(a.handleGetDecisions))
+	// User overrides — get/set pinned fields — auth required.
+	a.mux.HandleFunc("GET /api/v1/telemetry/config/override", a.auth(a.handleGetOverride))
+	a.mux.HandleFunc("POST /api/v1/telemetry/config/override", a.auth(a.handleSetOverride))
 	// AI enable/disable toggle — auth required.
 	a.mux.HandleFunc("GET /api/v1/telemetry/ai", a.auth(a.handleGetAIStatus))
 	a.mux.HandleFunc("POST /api/v1/telemetry/ai", a.auth(a.handleSetAIStatus))
@@ -1085,6 +1176,34 @@ func (a *APIServer) handleTriggerAnalysis(w http.ResponseWriter, r *http.Request
 	}
 	result := a.telemetryAnalyzer.RunOnce(r.Context())
 	writeJSON(w, http.StatusOK, result)
+}
+
+// handleGetOverride returns the current user-pinned override config.
+func (a *APIServer) handleGetOverride(w http.ResponseWriter, _ *http.Request) {
+	if a.telemetryAnalyzer == nil {
+		writeJSON(w, http.StatusOK, OverrideConfig{PinnedFields: []string{}, Values: map[string]interface{}{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, a.telemetryAnalyzer.GetOverride())
+}
+
+// handleSetOverride replaces the user-pinned override config.
+// Body: {"pinned_fields":["bond_count"],"values":{"bond_count":64}}
+func (a *APIServer) handleSetOverride(w http.ResponseWriter, r *http.Request) {
+	if a.telemetryAnalyzer == nil {
+		writeError(w, http.StatusServiceUnavailable, "analyzer not configured")
+		return
+	}
+	var ov OverrideConfig
+	if err := json.NewDecoder(r.Body).Decode(&ov); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if ov.Values == nil {
+		ov.Values = map[string]interface{}{}
+	}
+	a.telemetryAnalyzer.SetOverride(ov)
+	writeJSON(w, http.StatusOK, ov)
 }
 
 // handleGetAppliedConfig returns the config that AI most recently applied.

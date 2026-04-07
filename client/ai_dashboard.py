@@ -195,8 +195,11 @@ class State:
         self.new_cmd: str     = ""          # new cavadvpn command to run
         self.new_cmd_reason: str = ""       # why AI suggests this command
         # Step 4: history view mode
-        self.view_mode: str   = "main"      # "main" or "history"
+        self.view_mode: str   = "main"      # "main" or "history" or "override"
         self.all_decisions: list = []       # up to 50 decisions from server
+        # Step 5: user overrides
+        self.override: dict   = {}          # {pinned_fields:[...], values:{...}}
+        self.override_cursor  = 0           # selected field index in override view
 
     def set_status(self, msg: str):
         self.status_msg  = msg
@@ -228,6 +231,73 @@ def _wrap(text: str, width: int, indent: int = 5) -> list[str]:
     if line.strip():
         lines.append(line)
     return lines or [""]
+
+# Поля которые пользователь может закрепить
+OVERRIDE_FIELDS = [
+    ("transport_mode", "Транспорт",     "tcp / udp"),
+    ("bond_count",     "Bonds",         "число параллельных соединений"),
+    ("mtu",            "MTU",           "размер пакета в байтах"),
+    ("padding_mode",   "Padding",       "none / light / balanced / paranoid"),
+    ("jitter_ms",      "Jitter",        "задержка в мс (0 = выкл)"),
+    ("padding_enabled","Padding вкл",   "true / false"),
+]
+
+
+def render_override(state: State, base: str, token: str,
+                    width: int, height: int) -> None:
+    """Экран управления pinned overrides."""
+    out: list[str] = []
+    sep = BOLD + WHITE + "─" * width + RESET
+
+    out.append(sep)
+    out.append(BOLD + WHITE +
+               "  Ручной override — закреплённые параметры  ──  o: назад  q: выход"
+               + RESET)
+    out.append(sep)
+    out.append(f"  {GRAY}Закреплённые параметры AI не изменяет. "
+               f"Пробел — переключить pin.{RESET}")
+    out.append("")
+
+    pinned  = set(state.override.get("pinned_fields") or [])
+    values  = state.override.get("values") or {}
+    applied = state.applied
+
+    for i, (field, label, hint) in enumerate(OVERRIDE_FIELDS):
+        is_pinned   = field in pinned
+        is_selected = i == state.override_cursor
+        cur_val     = applied.get(field, values.get(field, "—"))
+
+        pin_icon = f"{GREEN}[PIN]{RESET}" if is_pinned else f"{GRAY}[ ] {RESET}"
+        sel_pfx  = f"{BOLD}{YELLOW}▶{RESET}" if is_selected else " "
+        val_col  = GREEN if is_pinned else CYAN
+        out.append(f"  {sel_pfx} {pin_icon}  {BOLD}{label:<16}{RESET} "
+                   f"{val_col}{cur_val}{RESET}  {GRAY}{hint}{RESET}")
+
+    out.append("")
+    out.append(f"  {GRAY}↑↓ / j k — выбор   Пробел — закрепить/открепить   o — назад{RESET}")
+    out.append("")
+
+    # Нижняя панель
+    FOOTER = 3
+    footer = [sep,
+              f"  {CYAN}Пробел: pin/unpin{RESET}   "
+              f"{GRAY}↑↓: выбор   o: назад   q: выход{RESET}",
+              sep]
+    body      = out
+    body_rows = max(0, height - FOOTER - 1)
+    visible   = body[:body_rows]
+
+    buf = hide_cursor() + ESC + "[?7l"
+    for i, line in enumerate(visible):
+        buf += ESC + f"[{i + 1};1H" + line + ESC + "[K"
+    for row in range(len(visible) + 1, height - FOOTER + 1):
+        buf += ESC + f"[{row};1H" + ESC + "[K"
+    for j, line in enumerate(footer):
+        buf += ESC + f"[{height - FOOTER + j};1H" + line + ESC + "[K"
+    buf += ESC + "[?7h"
+    sys.stdout.write(buf)
+    sys.stdout.flush()
+
 
 def render_history(state: State, width: int, height: int) -> None:
     """Полноэкранный просмотр истории решений AI."""
@@ -300,9 +370,12 @@ def render(state: State, tel: TelState, base: str) -> None:
     except Exception:
         width, height = 80, 24
 
-    # Step 4: переключение в режим истории
+    # Step 4/5: переключение режимов
     if state.view_mode == "history":
         render_history(state, width, height)
+        return
+    if state.view_mode == "override":
+        render_override(state, "", "", width, height)
         return
 
     now_str = datetime.now().strftime("%H:%M:%S")
@@ -467,8 +540,10 @@ def render(state: State, tel: TelState, base: str) -> None:
     out.append(BOLD + WHITE + "─" * width + RESET)
     ai_key  = f"{GREEN}a: ВЫКЛ AI" if state.ai_enabled else f"{YELLOW}a: ВКЛ AI"
     cmd_key = f"   {GREEN}c: копировать{RESET}" if state.new_cmd else ""
+    pinned  = state.override.get("pinned_fields") or []
+    pin_s   = f"   {YELLOW}[{len(pinned)} PIN]{RESET}" if pinned else ""
     out.append(f"  {ai_key}{RESET}   {CYAN}t: анализ{RESET}   "
-               f"{GRAY}h: история   r: обновить   q: выход{RESET}{cmd_key}")
+               f"{GRAY}h: история   o: override   q: выход{RESET}{cmd_key}{pin_s}")
     out.append(BOLD + WHITE + "─" * width + RESET)
 
     # Нижняя панель (3 строки) всегда приклеена к низу экрана.
@@ -552,6 +627,14 @@ def fetch_loop(base: str, token: str, state: State, interval: int,
             if isinstance(decs, list):
                 state.all_decisions = decs
                 state.decisions     = decs[-5:]   # compact view: last 5
+        except APIError:
+            pass
+
+        # Step 5: fetch current overrides
+        try:
+            ov = _req("GET", f"{base}/api/v1/telemetry/config/override", token)
+            if isinstance(ov, dict):
+                state.override = ov
         except APIError:
             pass
 
@@ -746,26 +829,75 @@ def main() -> None:
     else:
         os.system("cls")
 
+    def _send_override(new_ov: dict) -> None:
+        """Отправляет обновлённый override на сервер в фоне."""
+        try:
+            _req("POST", f"{base}/api/v1/telemetry/config/override",
+                 args.token, new_ov)
+            state.override = new_ov
+        except APIError as e:
+            state.set_status(f"Override error: {e}")
+
     try:
         while True:
             render(state, tel, base)
-            key = read_key().lower()
-            if key == "q":
+            key = read_key()        # НЕ lower() — нужны стрелки как есть
+            kl  = key.lower()
+
+            if kl == "q":
                 break
-            elif key == "a":
+
+            # ── override-режим: навигация и toggle ──
+            if state.view_mode == "override":
+                n = len(OVERRIDE_FIELDS)
+                if key in ("\x1b[A", "k"):     # стрелка вверх / k
+                    state.override_cursor = (state.override_cursor - 1) % n
+                elif key in ("\x1b[B", "j"):   # стрелка вниз / j
+                    state.override_cursor = (state.override_cursor + 1) % n
+                elif key == " ":               # пробел — toggle pin
+                    field = OVERRIDE_FIELDS[state.override_cursor][0]
+                    ov    = dict(state.override)
+                    pins  = list(ov.get("pinned_fields") or [])
+                    vals  = dict(ov.get("values") or {})
+                    if field in pins:
+                        pins.remove(field)
+                    else:
+                        pins.append(field)
+                        # Закрепляем текущее значение из applied config
+                        cur = state.applied.get(field)
+                        if cur is not None:
+                            vals[field] = cur
+                    ov["pinned_fields"] = pins
+                    ov["values"]        = vals
+                    threading.Thread(target=_send_override, args=(ov,),
+                                     daemon=True).start()
+                elif kl in ("o", "\x1b"):
+                    state.view_mode = "main"
+                continue
+
+            # ── history-режим ──
+            if state.view_mode == "history":
+                if kl in ("h", "o", "\x1b"):
+                    state.view_mode = "main"
+                continue
+
+            # ── главный режим ──
+            if kl == "a":
                 threading.Thread(
                     target=toggle_ai, args=(base, args.token, state), daemon=True
                 ).start()
-            elif key == "t":
+            elif kl == "t":
                 threading.Thread(
                     target=trigger_analysis, args=(base, args.token, state), daemon=True
                 ).start()
-            elif key == "c" and state.new_cmd:
+            elif kl == "c" and state.new_cmd:
                 ok = copy_to_clipboard(state.new_cmd)
                 state.set_status("Команда скопирована в буфер обмена ✓" if ok
                                  else "Не удалось скопировать (pbcopy/xclip не найден)")
-            elif key == "h":
-                state.view_mode = "history" if state.view_mode == "main" else "main"
+            elif kl == "h":
+                state.view_mode = "history"
+            elif kl == "o":
+                state.view_mode = "override"
     except KeyboardInterrupt:
         pass
     finally:
