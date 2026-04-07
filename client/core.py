@@ -935,6 +935,7 @@ class VPNClient:
         # Empty list → single-stream path (_data_stream used directly).
         self._send_streams: list = []   # [primary_stream] + secondary_streams
         self._send_idx: int = 0         # monotonically increasing; mod len(_send_streams)
+        self._send_lock = threading.Lock()  # protects _send_streams list mutations
 
     def connect(self) -> RouteInfo:
         """
@@ -1076,6 +1077,19 @@ class VPNClient:
         self._data_stream = None
         self._log.info("vpn_disconnected")
 
+    def _remove_dead_send_stream(self, dead: "MuxStream") -> None:
+        """Remove a failed stream from the upload round-robin list.
+
+        Thread-safe: uses _send_lock.  No-op if the stream has already been
+        removed by a concurrent caller.
+        """
+        with self._send_lock:
+            updated = [s for s in self._send_streams if s is not dead]
+            if len(updated) < len(self._send_streams):
+                self._send_streams = updated
+                self._log.warning("bond_send_stream_removed",
+                                  remaining=len(updated))
+
     def send_packet(self, pkt: bytes) -> None:
         """Send a raw IP packet, round-robining across all bonded streams.
 
@@ -1087,25 +1101,44 @@ class VPNClient:
         has its own independent TCP congestion window, so aggregate upload
         throughput under packet loss ≈ N × per-connection rate.
 
+        Graceful failover: if a stream write fails (dead connection), the
+        stream is removed from _send_streams and the packet is retried on the
+        next available stream.  If all streams fail, IOError is raised so the
+        caller (AutoReconnect) can trigger a reconnect.
+
         Thread safety: _send_idx is incremented as a single Python int
-        assignment, which is atomic under CPython's GIL.  The streams in
-        _send_streams are append-only during connect() and cleared only after
-        _connected.clear() in disconnect(), so the list reference is stable
-        while a caller can reach this method.
+        assignment, which is atomic under CPython's GIL.  Mutations of
+        _send_streams are serialised through _send_lock; the list reference
+        itself is replaced atomically, so readers that captured an old
+        reference still iterate a consistent snapshot.
         """
         if not self._connected.is_set() or self._data_stream is None:
             raise IOError("VPN not connected")
         streams = self._send_streams
-        if streams:
-            # Upload bonding: round-robin across primary + secondary streams.
-            # _send_idx grows monotonically; idx is the index into streams.
-            # Both the read and the += are single operations atomic under the GIL.
-            idx = self._send_idx % len(streams)
-            self._send_idx += 1
-            streams[idx].write(pkt)
-        else:
+        if not streams:
             # Single-connection path (bond_count == 1): no round-robin overhead.
             self._data_stream.write(pkt)
+        else:
+            # Upload bonding: round-robin with graceful failover.
+            # Try at most len(streams) candidates so we don't loop forever if
+            # every stream dies in rapid succession.
+            max_attempts = len(streams)
+            for attempt in range(max_attempts):
+                streams = self._send_streams
+                if not streams:
+                    raise IOError("All bonded send streams have failed")
+                idx = self._send_idx % len(streams)
+                self._send_idx += 1
+                stream = streams[idx]
+                try:
+                    stream.write(pkt)
+                    break  # success
+                except Exception as exc:
+                    self._log.warning("bond_stream_write_failed",
+                                      attempt=attempt + 1, err=str(exc))
+                    self._remove_dead_send_stream(stream)
+            else:
+                raise IOError("All bonded send streams have failed")
         if self._perf:
             from perf_collector import Stage
             self._perf.track_packet(Stage.TUN_WRITE, len(pkt))

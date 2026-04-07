@@ -1152,13 +1152,68 @@ recv_packet(): _recv_q.get() → serializes all packets for caller
 
 ---
 
+## Запуск 23 — 2026-04-07
+
+### Выполнено: Upload bonding — graceful failover при обрыве secondary stream
+
+**Файлы:** `client/core.py`, `client/test_core.py`
+
+**Проблема:**
+
+После Run 22 клиент имел upload bonding (`_send_streams = [primary] + secondaries`), но если secondary TCP-соединение обрывалось, `_send_streams` продолжал содержать мёртвый stream. Следующий вызов `send_packet()` пытался записать в него → `OSError` → VPN upload полностью ломался. `AutoReconnect` перезапускал всё соединение вместо того, чтобы продолжить на оставшихся живых streams.
+
+**Решение:**
+
+1. **`_send_lock = threading.Lock()`** (новое поле в `__init__`) — защищает мутации `_send_streams` (замену списка). Горячий путь (чтение ссылки на список) lock не требует — замена списка атомарна под GIL CPython.
+
+2. **`_remove_dead_send_stream(dead: MuxStream)`** (новый метод) — потокобезопасное удаление мёртвого stream: захватывает `_send_lock`, фильтрует список, логирует с `remaining=N`. Идемпотентен — если stream уже удалён (параллельный вызов), no-op.
+
+3. **`send_packet()` — graceful failover loop**:
+
+```python
+max_attempts = len(streams)
+for attempt in range(max_attempts):
+    streams = self._send_streams          # re-read after each removal
+    if not streams:
+        raise IOError("All bonded send streams have failed")
+    idx = self._send_idx % len(streams)
+    self._send_idx += 1
+    stream = streams[idx]
+    try:
+        stream.write(pkt)
+        break                             # success
+    except Exception as exc:
+        self._log.warning("bond_stream_write_failed", ...)
+        self._remove_dead_send_stream(stream)
+else:
+    raise IOError("All bonded send streams have failed")
+```
+
+Логика: `max_attempts` устанавливается один раз в начале метода (количество живых streams на момент вызова). Если все умерли — `IOError` поднимается, что штатно триггерит `AutoReconnect`. Пока есть хоть один живой stream — пакет доставляется.
+
+**Сценарии поведения:**
+- 1 secondary обрывается: пакет доставляется через primary/оставшиеся, dead удаляется → следующие пакеты идут без overhead.
+- Все secondary обрываются, primary жив: `_send_streams` = [primary] → один round-robin слот, VPN продолжает работать.
+- Все streams мертвы: `IOError` → `AutoReconnect` инициирует переподключение.
+- `bond_count == 1` (single-stream fast path): `_send_streams == []` → не затронут, нулевой overhead.
+
+**Тесты (5 новых в `TestUploadBonding`):**
+- `test_remove_dead_send_stream_removes_stream` — удаляет именно указанный stream
+- `test_remove_dead_send_stream_noop_if_already_removed` — идемпотентность
+- `test_send_packet_failover_to_next_stream_on_write_error` — dead_stream → evicted, пакет доставлен через live_stream
+- `test_send_packet_raises_when_all_streams_dead` — все streams мертвы → IOError, список очищен
+- `test_send_packet_failover_does_not_drop_packet` — 3 dead + 1 live (4 streams): пакет доставлен, только live остался
+
+`python3 -m unittest test_core.TestUploadBonding -v` — все 13 pass (8 старых + 5 новых).
+`cd server && go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **pprof CPU профилирование** — поиск скрытых узких мест под нагрузкой (теперь когда hot path имеет нулевых аллокаций).
 
 2. **IPv6 inner tunnel** — `markECNCE` только IPv4. При расширении туннеля до IPv6 нужен путь для Traffic Class field.
-
-3. **Upload bonding — graceful failover** — при закрытии secondary stream из `_send_streams` (обрыв соединения) нужно удалить его из списка без остановки VPN.
 
 ---
 

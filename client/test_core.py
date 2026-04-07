@@ -1928,6 +1928,149 @@ class TestUploadBonding(unittest.TestCase):
         with self.assertRaises(IOError):
             client.send_packet(b"\x45\x00" + b"\x00" * 18)
 
+    # -- graceful failover when a stream dies ----------------------------------
+
+    def test_remove_dead_send_stream_removes_stream(self) -> None:
+        """_remove_dead_send_stream() removes the stream from _send_streams."""
+        client_mux1, _ = _make_mux_pair()
+        client_mux2, _ = _make_mux_pair()
+
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+        stream1 = client_mux1.open_stream()
+        stream2 = client_mux2.open_stream()
+        client._data_stream = stream1
+        client._send_streams = [stream1, stream2]
+
+        client._remove_dead_send_stream(stream2)
+        self.assertEqual(client._send_streams, [stream1])
+
+        client_mux1.close()
+        client_mux2.close()
+
+    def test_remove_dead_send_stream_noop_if_already_removed(self) -> None:
+        """_remove_dead_send_stream() is idempotent — no-op for absent stream."""
+        client_mux1, _ = _make_mux_pair()
+        client_mux2, _ = _make_mux_pair()
+
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+        stream1 = client_mux1.open_stream()
+        stream2 = client_mux2.open_stream()
+        client._data_stream = stream1
+        client._send_streams = [stream1]
+
+        # stream2 is not in the list — must be a no-op
+        client._remove_dead_send_stream(stream2)
+        self.assertEqual(client._send_streams, [stream1])
+
+        client_mux1.close()
+        client_mux2.close()
+
+    def test_send_packet_failover_to_next_stream_on_write_error(self) -> None:
+        """When a stream write raises, send_packet() retries on the next stream."""
+        class _DeadStream:
+            """Fake MuxStream that always raises on write()."""
+            def write(self, _data: bytes) -> None:
+                raise OSError("connection reset")
+
+        client_mux, server_mux = _make_mux_pair()
+
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+        dead_stream = _DeadStream()
+        live_stream = client_mux.open_stream()
+
+        client._data_stream = live_stream
+        client._send_streams = [dead_stream, live_stream]
+        client._send_idx = 0  # will pick dead_stream first
+        client._connected.set()
+
+        import time
+        time.sleep(0.05)
+
+        with server_mux._streams_lock:
+            srv_streams = list(server_mux._streams.values())
+        self.assertTrue(srv_streams)
+        srv_stream = srv_streams[0]
+
+        pkt = b"\x45\x00" + b"\xBB" * 18
+        # Should NOT raise — dead_stream fails, then live_stream succeeds.
+        client.send_packet(pkt)
+
+        # dead_stream must have been evicted.
+        self.assertNotIn(dead_stream, client._send_streams)
+
+        # Packet must arrive on live_stream.
+        received = srv_stream.read()
+        self.assertEqual(received, pkt)
+
+        client._connected.clear()
+        client_mux.close()
+        server_mux.close()
+
+    def test_send_packet_raises_when_all_streams_dead(self) -> None:
+        """When every stream fails, send_packet() raises IOError."""
+        class _DeadStream:
+            def write(self, _data: bytes) -> None:
+                raise OSError("connection reset")
+
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+        dead1 = _DeadStream()
+        dead2 = _DeadStream()
+        # Provide a real _data_stream so the guard at the top of send_packet passes.
+        client_mux, _ = _make_mux_pair()
+        client._data_stream = client_mux.open_stream()
+        client._send_streams = [dead1, dead2]
+        client._send_idx = 0
+        client._connected.set()
+
+        with self.assertRaises(IOError):
+            client.send_packet(b"\x45\x00" + b"\x00" * 18)
+
+        # Both streams should have been removed from the list.
+        self.assertEqual(client._send_streams, [])
+
+        client._connected.clear()
+        client_mux.close()
+
+    def test_send_packet_failover_does_not_drop_packet(self) -> None:
+        """Packet is successfully delivered even if first N-1 streams are dead."""
+        class _DeadStream:
+            def write(self, _data: bytes) -> None:
+                raise OSError("broken pipe")
+
+        client_mux, server_mux = _make_mux_pair()
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=4)
+        client = VPNClient(cfg)
+        live_stream = client_mux.open_stream()
+        client._data_stream = live_stream
+        # 3 dead streams, then 1 live stream
+        client._send_streams = [_DeadStream(), _DeadStream(), _DeadStream(), live_stream]
+        client._send_idx = 0
+        client._connected.set()
+
+        import time
+        time.sleep(0.05)
+
+        with server_mux._streams_lock:
+            srv_streams = list(server_mux._streams.values())
+        srv_stream = srv_streams[0]
+
+        pkt = b"\x45\x00" + b"\xCC" * 18
+        client.send_packet(pkt)
+
+        received = srv_stream.read()
+        self.assertEqual(received, pkt)
+        # Only the live stream should remain.
+        self.assertEqual(len(client._send_streams), 1)
+        self.assertIs(client._send_streams[0], live_stream)
+
+        client._connected.clear()
+        client_mux.close()
+        server_mux.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
