@@ -315,11 +315,11 @@ func TestBBRThroughputVsSimpleSend(t *testing.T) {
 		var total int64
 		ctx := context.Background()
 		for total < totalBytes {
-			data, err := pair.server.Read(ctx)
-			if err != nil || data == nil {
+			rp, err := pair.server.Read(ctx)
+			if err != nil || rp.data == nil {
 				break
 			}
-			total += int64(len(data))
+			total += int64(len(rp.data))
 		}
 		received <- total
 	}()

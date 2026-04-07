@@ -87,11 +87,14 @@ func runInstantStartTest(t *testing.T, profile networkProfile, initialBw int64, 
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 		for received.Load() < int64(transferSize) {
-			data, err := receiverConn.Read(ctx)
+			rp, err := receiverConn.Read(ctx)
 			if err != nil {
 				return
 			}
-			received.Add(int64(len(data)))
+			received.Add(int64(len(rp.data)))
+			if rp.backing != nil {
+				decodePayloadPool.Put(rp.backing)
+			}
 		}
 	}()
 

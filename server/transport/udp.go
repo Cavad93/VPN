@@ -54,6 +54,12 @@ type Packet struct {
 	SeqNum  uint32
 	AckNum  uint32
 	Payload []byte
+
+	// payloadRecvBacking is the pool token for the receive-side payload buffer.
+	// Non-nil only for DATA packets decoded by DecodePacket; nil for ACK/SYN/FIN
+	// and for packets created directly in tests. The backing is returned to
+	// decodePayloadPool after UDPNetConn.Read copies the data into the caller's buffer.
+	payloadRecvBacking *[]byte
 }
 
 // Encode serializes the packet to bytes.
@@ -73,8 +79,33 @@ var pktPool = sync.Pool{
 	New: func() interface{} { return new(Packet) },
 }
 
+// decodePayloadPool pools receive-side payload buffers (MaxPayloadSize each).
+// Separate from the send-side payloadPool to avoid cross-contamination.
+// Buffers are allocated here in DecodePacket and returned in UDPNetConn.Read
+// after the data is copied into the caller's buffer.
+// At 30 Mbps / 1430-byte packets: ~2630 allocs/sec × 1430 bytes ≈ 3.7 MB/sec
+// heap pressure → eliminated.
+var decodePayloadPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, MaxPayloadSize)
+		return &b
+	},
+}
+
+// udpRecvPayload carries a received payload with its pool backing token.
+// Mirrors the muxPayload pattern in mux.go: data is the live slice, backing
+// is the *[]byte returned to decodePayloadPool once the data is consumed.
+// backing is nil for zero-length payloads (ACK/SYN/FIN) or test-created packets.
+type udpRecvPayload struct {
+	data    []byte
+	backing *[]byte
+}
+
 // DecodePacket parses a packet from raw bytes.
-// The returned Packet's Payload is a fresh copy (safe to hold after data is reused).
+// For DATA packets (payloadLen > 0), the payload buffer is borrowed from
+// decodePayloadPool to eliminate the per-packet heap allocation. The caller
+// (UDPNetConn.Read) must return the backing via decodePayloadPool.Put once
+// the data has been copied into the application buffer.
 func DecodePacket(data []byte) (*Packet, error) {
 	if len(data) < HeaderSize {
 		return nil, errors.New("transport: packet too short")
@@ -88,10 +119,14 @@ func DecodePacket(data []byte) (*Packet, error) {
 	p.SeqNum = binary.BigEndian.Uint32(data[1:5])
 	p.AckNum = binary.BigEndian.Uint32(data[5:9])
 	if payloadLen > 0 {
-		p.Payload = make([]byte, payloadLen)
-		copy(p.Payload, data[HeaderSize:HeaderSize+int(payloadLen)])
+		pb := decodePayloadPool.Get().(*[]byte)
+		buf := (*pb)[:payloadLen]
+		copy(buf, data[HeaderSize:HeaderSize+int(payloadLen)])
+		p.Payload = buf
+		p.payloadRecvBacking = pb
 	} else {
 		p.Payload = nil
+		p.payloadRecvBacking = nil
 	}
 	return p, nil
 }
@@ -152,13 +187,13 @@ var ackedSlicePool = sync.Pool{
 	},
 }
 
-// toDeliverPool pools the [][]byte backing arrays used in processData to
-// collect in-order payloads before delivering them to readCh.
+// toDeliverPool pools the []udpRecvPayload backing arrays used in processData
+// to collect in-order payloads before delivering them to readCh.
 // At 30 Mbps with 1430-byte packets, processData is called ~2630 times/sec;
 // reusing the backing array eliminates that many heap allocations (~83 KB/sec).
 var toDeliverPool = sync.Pool{
 	New: func() interface{} {
-		s := make([][]byte, 0, 4)
+		s := make([]udpRecvPayload, 0, 4)
 		return &s
 	},
 }
@@ -214,7 +249,7 @@ type Conn struct {
 	rttvar time.Duration // RTT variance
 	rto    time.Duration // current retransmission timeout
 
-	readCh    chan []byte
+	readCh    chan udpRecvPayload
 	ctx       context.Context
 	cancel    context.CancelFunc
 	closeOnce sync.Once
@@ -241,7 +276,7 @@ func newConn(conn *net.UDPConn, remote *net.UDPAddr, ownConn bool) *Conn {
 		remote:  remote,
 		pending: make(map[uint32]*pendingPacket, 128), // pre-allocate for typical cwnd
 		recvBuf: make(map[uint32]*Packet, 32), // pre-allocate for typical reorder window
-		readCh:  make(chan []byte, 256), // 256×1460≈370KB; 8192 caused bufferbloat (+1s latency)
+		readCh:  make(chan udpRecvPayload, 256), // 256×1460≈370KB; 8192 caused bufferbloat (+1s latency)
 		batch:   newBatchWriter(conn),
 		bbr:     bbr,
 		rto:     initialRTO,
@@ -566,16 +601,19 @@ func (c *Conn) processACK(ackNum uint32) {
 func (c *Conn) processData(pkt *Packet) {
 	c.recvMu.Lock()
 
-	// Borrow a [][]byte slice from the pool to collect in-order payloads.
-	// The pool eliminates ~2630 make([][]byte, 0, 4) allocations/sec at 30 Mbps.
-	tdPtr := toDeliverPool.Get().(*[][]byte)
+	// Borrow a []udpRecvPayload slice from the pool to collect in-order payloads.
+	// The pool eliminates ~2630 make([]udpRecvPayload, 0, 4) allocations/sec at 30 Mbps.
+	tdPtr := toDeliverPool.Get().(*[]udpRecvPayload)
 	toDeliver := (*tdPtr)[:0]
 
 	if pkt.SeqNum == c.recvSeq {
 		// In-order: deliver immediately.
 		// pkt.Payload is already a unique copy from DecodePacket — no need to copy again.
 		if len(pkt.Payload) > 0 {
-			toDeliver = append(toDeliver, pkt.Payload)
+			toDeliver = append(toDeliver, udpRecvPayload{data: pkt.Payload, backing: pkt.payloadRecvBacking})
+		} else if pkt.payloadRecvBacking != nil {
+			// SYN/FIN with a backing (shouldn't happen, but be safe).
+			decodePayloadPool.Put(pkt.payloadRecvBacking)
 		}
 		c.recvSeq++
 
@@ -586,16 +624,26 @@ func (c *Conn) processData(pkt *Packet) {
 				break
 			}
 			if len(buffered.Payload) > 0 {
-				toDeliver = append(toDeliver, buffered.Payload)
+				toDeliver = append(toDeliver, udpRecvPayload{data: buffered.Payload, backing: buffered.payloadRecvBacking})
+			} else if buffered.payloadRecvBacking != nil {
+				decodePayloadPool.Put(buffered.payloadRecvBacking)
 			}
 			delete(c.recvBuf, c.recvSeq)
 			c.recvSeq++
 		}
 	} else if pkt.SeqNum > c.recvSeq {
 		// Out-of-order: buffer for later delivery.
+		// The backing is stored in pkt.payloadRecvBacking and will be returned
+		// to decodePayloadPool when the packet is drained and delivered.
 		c.recvBuf[pkt.SeqNum] = pkt
+	} else {
+		// Duplicate (pkt.SeqNum < c.recvSeq): silently discard.
+		// Return the payload backing immediately to avoid leaking pool memory.
+		if pkt.payloadRecvBacking != nil {
+			decodePayloadPool.Put(pkt.payloadRecvBacking)
+			pkt.payloadRecvBacking = nil
+		}
 	}
-	// Duplicate (pkt.SeqNum < c.recvSeq): silently discard.
 
 	// Publish recvSeq for lock-free reads (writePacket, sendACK).
 	c.recvSeqAtomic.Store(c.recvSeq)
@@ -611,14 +659,18 @@ func (c *Conn) processData(pkt *Packet) {
 	c.sendACK()
 
 	// Deliver payloads OUTSIDE recvMu to avoid deadlock if readCh is full.
-	for _, payload := range toDeliver {
+	for _, rp := range toDeliver {
 		select {
-		case c.readCh <- payload:
+		case c.readCh <- rp:
 		case <-c.closed:
-			// Nil out references before returning slice to pool so the pooled
+			// Zero out references before returning slice to pool so the pooled
 			// backing array does not retain payload pointers past their lifetime.
+			// Also return any undelivered payload backings to decodePayloadPool.
 			for i := range toDeliver {
-				toDeliver[i] = nil
+				if toDeliver[i].backing != nil {
+					decodePayloadPool.Put(toDeliver[i].backing)
+				}
+				toDeliver[i] = udpRecvPayload{}
 			}
 			*tdPtr = toDeliver[:0]
 			toDeliverPool.Put(tdPtr)
@@ -626,10 +678,10 @@ func (c *Conn) processData(pkt *Packet) {
 		}
 	}
 
-	// Nil out payload references before returning the slice to the pool so the
+	// Zero out payload references before returning the slice to the pool so the
 	// pooled backing array does not retain pointers past their useful lifetime.
 	for i := range toDeliver {
-		toDeliver[i] = nil
+		toDeliver[i] = udpRecvPayload{}
 	}
 	*tdPtr = toDeliver[:0]
 	toDeliverPool.Put(tdPtr)
@@ -792,14 +844,16 @@ func (c *Conn) Congested() bool {
 
 // Read blocks until a data payload is available, the context is cancelled,
 // or the connection is closed.
-func (c *Conn) Read(ctx context.Context) ([]byte, error) {
+// The returned udpRecvPayload.backing must be returned to decodePayloadPool
+// once the caller has consumed the data; UDPNetConn.Read handles this automatically.
+func (c *Conn) Read(ctx context.Context) (udpRecvPayload, error) {
 	select {
-	case data := <-c.readCh:
-		return data, nil
+	case rp := <-c.readCh:
+		return rp, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return udpRecvPayload{}, ctx.Err()
 	case <-c.closed:
-		return nil, errors.New("transport: connection closed")
+		return udpRecvPayload{}, errors.New("transport: connection closed")
 	}
 }
 

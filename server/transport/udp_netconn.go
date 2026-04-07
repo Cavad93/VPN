@@ -18,8 +18,10 @@ type UDPNetConn struct {
 	inner *Conn
 
 	// Read buffering: bridge datagram → stream semantics.
-	readMu  sync.Mutex
-	readBuf []byte // buffered remainder from previous datagram
+	readMu         sync.Mutex
+	readBuf        []byte  // buffered remainder from previous datagram
+	readBufBacking *[]byte // pool token for readBuf; returned to decodePayloadPool
+	// when readBuf is fully consumed. nil when readBuf is empty or not from pool.
 
 	// Deadlines.
 	readDeadline  time.Time
@@ -35,6 +37,13 @@ func NewUDPNetConn(c *Conn) *UDPNetConn {
 // Read implements net.Conn. Returns data from the UDP connection as a stream.
 // If the caller's buffer is smaller than the datagram, the remainder is
 // buffered and returned on the next Read call.
+//
+// Pool lifecycle: DecodePacket borrows a buffer from decodePayloadPool for
+// each incoming DATA packet. UDPNetConn.Read returns that buffer to the pool
+// as soon as all bytes have been copied into the caller's p. On the fast path
+// (caller's buffer ≥ datagram, which is always true since mux reads with
+// 65536-byte buffers and datagrams are ≤1430 bytes) the backing is returned
+// on the same Read call that received it. Zero heap allocations on that path.
 func (u *UDPNetConn) Read(p []byte) (int, error) {
 	u.readMu.Lock()
 	defer u.readMu.Unlock()
@@ -43,20 +52,31 @@ func (u *UDPNetConn) Read(p []byte) (int, error) {
 	if len(u.readBuf) > 0 {
 		n := copy(p, u.readBuf)
 		u.readBuf = u.readBuf[n:]
+		if len(u.readBuf) == 0 && u.readBufBacking != nil {
+			// Remainder fully consumed — return backing to pool.
+			decodePayloadPool.Put(u.readBufBacking)
+			u.readBufBacking = nil
+		}
 		return n, nil
 	}
 
 	// Read a new datagram from the UDP connection.
 	ctx := u.readContext()
-	data, err := u.inner.Read(ctx)
+	rp, err := u.inner.Read(ctx)
 	if err != nil {
 		return 0, err
 	}
 
-	n := copy(p, data)
-	if n < len(data) {
-		// Buffer the remainder for the next Read call.
-		u.readBuf = data[n:]
+	n := copy(p, rp.data)
+	if n < len(rp.data) {
+		// Partial read: buffer the remainder and keep the pool token until
+		// the bytes are drained. This path is effectively unreachable in
+		// production (mux reads with 65536-byte buffer > 1430-byte datagram).
+		u.readBuf = rp.data[n:]
+		u.readBufBacking = rp.backing
+	} else if rp.backing != nil {
+		// Fast path: all bytes consumed in a single copy — return immediately.
+		decodePayloadPool.Put(rp.backing)
 	}
 	return n, nil
 }

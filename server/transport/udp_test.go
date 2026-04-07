@@ -129,12 +129,12 @@ func TestProcessDataInOrder(t *testing.T) {
 	defer cancel()
 
 	for _, want := range []string{"a", "b", "c"} {
-		data, err := c.Read(ctx)
+		rp, err := c.Read(ctx)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
-		if string(data) != want {
-			t.Errorf("Read: got %q, want %q", data, want)
+		if string(rp.data) != want {
+			t.Errorf("Read: got %q, want %q", rp.data, want)
 		}
 	}
 }
@@ -153,12 +153,12 @@ func TestProcessDataOutOfOrder(t *testing.T) {
 
 	expected := []string{"first", "second", "third"}
 	for _, want := range expected {
-		data, err := c.Read(ctx)
+		rp, err := c.Read(ctx)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
-		if string(data) != want {
-			t.Errorf("Read: got %q, want %q", data, want)
+		if string(rp.data) != want {
+			t.Errorf("Read: got %q, want %q", rp.data, want)
 		}
 	}
 }
@@ -174,12 +174,12 @@ func TestProcessDataDuplicate(t *testing.T) {
 	defer cancel()
 
 	// First read should succeed.
-	data, err := c.Read(ctx)
+	rp, err := c.Read(ctx)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	if string(data) != "x" {
-		t.Errorf("Read: got %q, want %q", data, "x")
+	if string(rp.data) != "x" {
+		t.Errorf("Read: got %q, want %q", rp.data, "x")
 	}
 
 	// Second read must time out (duplicate was discarded).
@@ -440,12 +440,12 @@ func TestListenAndDial(t *testing.T) {
 	}
 	defer server.Close()
 
-	data, err := server.Read(ctx)
+	rp, err := server.Read(ctx)
 	if err != nil {
 		t.Fatalf("server.Read: %v", err)
 	}
-	if !bytes.Equal(data, msg) {
-		t.Errorf("server read: got %q, want %q", data, msg)
+	if !bytes.Equal(rp.data, msg) {
+		t.Errorf("server read: got %q, want %q", rp.data, msg)
 	}
 }
 
@@ -477,12 +477,12 @@ func TestBidirectionalCommunication(t *testing.T) {
 	}
 	defer server.Close()
 
-	data, err := server.Read(ctx)
+	rp, err := server.Read(ctx)
 	if err != nil {
 		t.Fatalf("server.Read: %v", err)
 	}
-	if string(data) != "ping" {
-		t.Errorf("server read: got %q, want %q", data, "ping")
+	if string(rp.data) != "ping" {
+		t.Errorf("server read: got %q, want %q", rp.data, "ping")
 	}
 
 	// Server → client.
@@ -490,12 +490,12 @@ func TestBidirectionalCommunication(t *testing.T) {
 		t.Fatalf("server.Write: %v", err)
 	}
 
-	data, err = client.Read(ctx)
+	rp2, err := client.Read(ctx)
 	if err != nil {
 		t.Fatalf("client.Read: %v", err)
 	}
-	if string(data) != "pong" {
-		t.Errorf("client read: got %q, want %q", data, "pong")
+	if string(rp2.data) != "pong" {
+		t.Errorf("client read: got %q, want %q", rp2.data, "pong")
 	}
 }
 
@@ -548,13 +548,13 @@ func TestMultipleClients(t *testing.T) {
 	for i := 0; i < numClients; i++ {
 		select {
 		case sc := <-serverConns:
-			data, err := sc.Read(ctx)
+			rp, err := sc.Read(ctx)
 			if err != nil {
 				t.Errorf("server[%d].Read: %v", i, err)
 				continue
 			}
 			mu.Lock()
-			received[string(data)] = true
+			received[string(rp.data)] = true
 			mu.Unlock()
 			sc.Close()
 		case <-ctx.Done():
@@ -607,11 +607,11 @@ func TestLargePayloadFragmentation(t *testing.T) {
 	// Read all fragments and reassemble.
 	var received []byte
 	for len(received) < len(bigPayload) {
-		chunk, err := server.Read(ctx)
+		rp, err := server.Read(ctx)
 		if err != nil {
 			t.Fatalf("server.Read: %v", err)
 		}
-		received = append(received, chunk...)
+		received = append(received, rp.data...)
 	}
 
 	if !bytes.Equal(received, bigPayload) {

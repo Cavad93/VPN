@@ -254,11 +254,14 @@ func runDataTransfer(t *testing.T, profile networkProfile, sender, receiver *Con
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		for received.Load() < int64(transferSize) {
-			data, err := receiver.Read(ctx)
+			rp, err := receiver.Read(ctx)
 			if err != nil {
 				return
 			}
-			received.Add(int64(len(data)))
+			received.Add(int64(len(rp.data)))
+			if rp.backing != nil {
+				decodePayloadPool.Put(rp.backing)
+			}
 		}
 	}()
 
