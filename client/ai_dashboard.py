@@ -493,12 +493,12 @@ def main() -> None:
 
     time.sleep(1.5)  # ждём первого обновления
 
-    # Переключаемся в alternate screen buffer + сбрасываем экран
+    # Очищаем экран один раз при старте
     if os.name != "nt":
-        sys.stdout.write(ESC + "[?1049h" + ESC + "[2J" + ESC + "[H")
+        sys.stdout.write(ESC + "[2J" + ESC + "[H")
+        sys.stdout.flush()
     else:
         os.system("cls")
-    sys.stdout.flush()
 
     try:
         while True:
@@ -518,12 +518,7 @@ def main() -> None:
         pass
     finally:
         stop.set()
-        if os.name != "nt":
-            # Возвращаемся на основной экран и восстанавливаем курсор
-            sys.stdout.write(show_cursor() + ESC + "[?1049l")
-        else:
-            sys.stdout.write(show_cursor())
-            os.system("cls")
+        sys.stdout.write(ESC + "[2J" + ESC + "[H" + show_cursor())
         sys.stdout.flush()
         print("До свидания.")
 
