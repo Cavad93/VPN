@@ -978,12 +978,118 @@ Download (server → client):  [ДО ИСПРАВЛЕНИЯ]
 
 ---
 
+## Запуск 21 — 2026-04-07
+
+### Выполнено: CTL_SECONDARY + Download bonding — устранение последней причины download < upload асимметрии
+
+**Файлы:** `client/core.py`, `client/test_core.py`
+
+**Диагноз — корневая причина (последняя):**
+
+После Run 20 (TCP_QUICKACK, SO_RCVBUF=4MB, TCP_CONGESTION=bbr) сервер уже имел полную инфраструктуру download bonding (`streamBond` в `main.go`), но Python-клиент не реализовал протокол `ctlSecondary`. В результате:
+
+- **Upload**: клиент → сервер через 1 TCP-соединение с полным cwnd
+- **Download**: сервер → клиент через **1 TCP-соединение**, хотя сервер готов к N-кратному round-robin
+
+При 0.7% потерях (Россия↔Казахстан), 1 TCP-соединение с BBR даёт ~5-8 Мбит/с.  
+С N=8 соединениями: ~40-60 Мбит/с (каждое соединение имеет независимый cwnd).
+
+**Исправления в `client/core.py`:**
+
+1. **Исправлен `CTL_ERROR = 0xFF`** (было: `0x03` — совпадало с `CTL_SECONDARY`!)  
+   Сервер (`main.go`) отправляет `ctlError = 0xFF` при ошибке, а клиент проверял `resp[0] == CTL_ERROR` (0x03). Это означало что ошибки IP-пула никогда не детектировались.
+
+2. **Добавлен `CTL_SECONDARY = 0x03`**  
+   Первый байт secondary control stream. Сервер (`handleConn`) читает его как `typeBuf[0]` и вызывает `runSecondaryConn`.
+
+3. **Добавлен `VPNConfig.bond_count: int = 1`**  
+   Количество параллельных TCP-соединений для download bonding. По умолчанию 1 (backward-compatible). Рекомендуется 4-8 для CIS-маршрутов.
+
+4. **Добавлены поля в `VPNClient.__init__`:**  
+   `_bond_muxes`, `_bond_data_streams`, `_recv_q` (SimpleQueue), `_bond_closed` (Event).
+
+5. **Рефакторинг `_do_noise_handshake` → `_do_noise_handshake_on(obfs, kp)`**  
+   Перегруженная версия принимает явный `ObfsConn` параметр вместо `self._obfs`.  
+   `_do_noise_handshake` теперь вызывает `_do_noise_handshake_on(self._obfs, kp)`.
+
+6. **Новый метод `_attach_secondary_conn(host, port, kp, ip4_bytes)`:**
+   ```
+   Wire protocol (mirrors runSecondaryConn в main.go):
+     1. TCP socket → ObfsConn.client_handshake()
+     2. Noise_XX handshake (тот же key pair)
+     3. NoiseConn + ClientMux
+     4. Открыть control stream (ID=2)
+     5. Отправить CTL_SECONDARY(1) + assigned_ip(4)
+     6. Прочитать CTL_ASSIGN(1) — сервер добавляет data stream в cs.bond
+     7. Открыть data stream (ID=4)
+     8. Запустить _bond_reader_thread для этого stream
+   ```
+
+7. **Новый метод `_bond_reader_thread(stream)`:**  
+   Фоновый daemon-поток. Читает пакеты из bonded stream → `_recv_q.put(pkt)`.  
+   Выход при: EOF (`b""` от FIN), `_bond_closed.is_set()`, любой ошибке.  
+   Timeout=2s для периодической проверки `_bond_closed`.
+
+8. **`connect()` — шаг 8 (bonding):**
+   При `bond_count > 1`:
+   - Создаёт `SimpleQueue` (`_recv_q`)
+   - Запускает `_bond_reader_thread` для PRIMARY data stream
+   - Вызывает `_attach_secondary_conn` ещё `bond_count-1` раз
+   - Ошибки secondary подключений — `warning` без abort (graceful degradation)
+
+9. **`recv_packet()` — переключение на очередь при bonding:**
+   ```python
+   if self._recv_q is not None:
+       return self._recv_q.get()  # блокирует до появления пакета из любого stream
+   return self._data_stream.read()  # single-connection path (unchanged)
+   ```
+
+10. **`disconnect()` — очистка secondary соединений:**  
+    `_bond_closed.set()` → закрыть все secondary mux → закрыть primary mux → clear state.
+
+**Схема работы bonding при bond_count=4:**
+```
+Server routeFromTun:
+  pkt 1 → bond.next() = stream A (primary)  → conn 1 (cwnd₁)
+  pkt 2 → bond.next() = stream B (secondary)→ conn 2 (cwnd₂)
+  pkt 3 → bond.next() = stream C (secondary)→ conn 3 (cwnd₃)
+  pkt 4 → bond.next() = stream D (secondary)→ conn 4 (cwnd₄)
+
+Client _bond_reader_threads (4 threads):
+  thread 1: stream A → _recv_q
+  thread 2: stream B → _recv_q
+  thread 3: stream C → _recv_q
+  thread 4: stream D → _recv_q
+
+recv_packet(): _recv_q.get() → serializes all packets for caller
+```
+
+**Ожидаемый эффект:**
+- 0.7% потерь: 1 conn BBR ~6 Мбит/с → 8 conn BBR ~48 Мбит/с
+- 0% потерь (LAN): линейный рост до пропускной способности канала
+- Backward-compatible: `bond_count=1` (default) — нулевых изменений в поведении
+
+**Тесты (12 новых):**
+- `test_ctl_secondary_value` — CTL_SECONDARY == 0x03
+- `test_ctl_error_value` — CTL_ERROR == 0xFF (регрессия)
+- `test_ctl_constants_distinct` — все 4 константы уникальны
+- `test_bond_count_default_is_one` — backward-compatible default
+- `test_bond_count_configurable` — bond_count=4 принимается
+- `test_bond_reader_thread_forwards_packets` — thread читает из stream → queue
+- `test_bond_reader_thread_stops_on_fin` — thread выходит при FIN
+- `test_bond_reader_thread_stops_on_bond_closed` — thread выходит при disconnect()
+- `test_disconnect_clears_bond_state` — bond поля очищаются
+- `test_secondary_handshake_protocol` — CTL_SECONDARY + IP + CTL_ASSIGN протокол
+- `test_connect_with_bond_count_2` — полный connect() с 2 соединениями
+- `test_recv_packet_via_bond_queue` — recv_packet() читает из SimpleQueue
+
+`python3 -m unittest test_core.TestDownloadBonding -v` — все 12 pass.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
-1. **Асимметрия download < upload (оставшиеся причины)**
-   - Run 20 устранил TCP delayed ACK (главная причина)
-   - Следующая потенциальная причина: upload bondingотсутствует (только 1 TCP conn vs N bonded download)
-   - Проанализировать: имеет ли смысл multi-conn upload bonding?
+1. **Upload bonding** — клиент сейчас посылает всё через primary stream. Для CIS-маршрутов upload тоже ограничен. Решение: round-robin `send_packet()` across primary + secondary streams.
 
 2. **pprof CPU профилирование** — поиск скрытых узких мест под нагрузкой.
 

@@ -59,9 +59,15 @@ MUX_HEADER_SIZE = 7  # streamID(4) + type(1) + payloadLen(2)
 MUX_KEEPALIVE_INTERVAL: float = 15.0  # seconds
 
 # Control stream message types
-CTL_HELLO = 0x01
-CTL_ASSIGN = 0x02
-CTL_ERROR = 0x03
+CTL_HELLO      = 0x01
+CTL_ASSIGN     = 0x02
+# CTL_SECONDARY is the first byte sent on a secondary (bonded) control stream.
+# It tells the server to attach this connection to an existing primary session
+# identified by the 4-byte assigned IP that immediately follows this byte.
+# The server responds with CTL_ASSIGN (0x02) on success.
+# Wire: open stream → write CTL_SECONDARY(1) + assigned_ip(4) → read CTL_ASSIGN(1)
+CTL_SECONDARY  = 0x03
+CTL_ERROR      = 0xFF  # server→client error (e.g. IP pool exhaustion)
 CTL_ASSIGN_PAYLOAD_LEN = 9  # ip(4) + prefixLen(1) + gateway(4)
 
 
@@ -874,6 +880,13 @@ class VPNConfig:
     connect_timeout: float = 30.0
     read_timeout: float = 60.0
     transport: str = "udp"      # "tcp" or "udp" (user-space BBR on server)
+    # bond_count: number of parallel TCP connections for download bonding.
+    # With 0.7% packet loss (Russia↔Kazakhstan), a single TCP connection is
+    # throttled to ~1-2 Mbps (CUBIC) or ~5-8 Mbps (BBR). N connections each
+    # have an independent congestion window, so aggregate download ≈ N × rate.
+    # The server round-robins download packets across all bonded streams
+    # (streamBond in main.go). Recommended: 4-8 for CIS routes; 1 for LAN.
+    bond_count: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +914,19 @@ class VPNClient:
         self._connected = threading.Event()
         self._log = logger.bind(server=config.server_addr)
         self._perf = perf  # optional PerfCollector instance
+        # --- Download bonding state (populated when bond_count > 1) ---
+        # Secondary connections each have their own TCP socket, ObfsConn,
+        # NoiseConn, ClientMux, and data stream.  The server round-robins
+        # download packets across all bonded streams (streamBond), so the
+        # client must be able to receive from any of them.
+        self._bond_muxes: list = []        # ClientMux for each secondary conn
+        self._bond_data_streams: list = [] # MuxStream for each secondary conn
+        # _recv_q is non-None only when bond_count > 1.  Background threads
+        # for every stream (primary + secondaries) push packets here.
+        # recv_packet() reads from this queue instead of blocking on
+        # _data_stream.read() directly.
+        self._recv_q: Optional[object] = None  # queue.SimpleQueue[bytes]
+        self._bond_closed = threading.Event()  # set by disconnect() to stop reader threads
 
     def connect(self) -> RouteInfo:
         """
@@ -955,11 +981,68 @@ class VPNClient:
         self._data_stream = self._mux.open_stream()
         self._connected.set()
 
+        # 8. Download bonding: establish secondary connections when bond_count > 1.
+        #
+        # Each secondary connection adds an independent TCP congestion window.
+        # The server (streamBond / routeFromTun) round-robins download packets
+        # across primary + all secondary data streams.  With N connections and
+        # 0.7% packet loss (Russia↔Kazakhstan), aggregate download ≈ N × rate:
+        #   1 conn  @ 0.7% loss, BBR → ~5-8 Mbps
+        #   8 conns @ 0.7% loss, BBR → ~40-60 Mbps aggregate
+        #
+        # Implementation: all streams (primary + secondaries) are read by
+        # background daemon threads that push packets into _recv_q.
+        # recv_packet() blocks on _recv_q instead of a single stream.
+        if self._config.bond_count > 1:
+            import queue as _queue
+            self._recv_q = _queue.SimpleQueue()
+            self._bond_closed.clear()
+
+            # Background reader for the PRIMARY data stream.
+            threading.Thread(
+                target=self._bond_reader_thread,
+                args=(self._data_stream,),
+                daemon=True,
+                name="vpn-bond-reader-primary",
+            ).start()
+
+            # Secondary connections (bond_count - 1 additional connections).
+            ip4_bytes = socket.inet_aton(route.assigned_ip)
+            for i in range(self._config.bond_count - 1):
+                try:
+                    self._attach_secondary_conn(host, port, kp, ip4_bytes)
+                except Exception as exc:
+                    self._log.warning("secondary_conn_failed",
+                                      index=i + 1, err=str(exc))
+
+            self._log.info("bond_established",
+                           total_conns=1 + len(self._bond_muxes))
+
         return route
 
     def disconnect(self) -> None:
-        """Close all layers gracefully."""
+        """Close all layers gracefully, including all bonded secondary connections."""
         self._connected.clear()
+
+        # Signal bond reader threads to stop (they'll also stop when streams FIN).
+        self._bond_closed.set()
+
+        # Close secondary connections first (data streams + muxes).
+        for ds in self._bond_data_streams:
+            try:
+                ds.close()
+            except Exception:
+                pass
+        for mux in self._bond_muxes:
+            try:
+                mux.close()
+            except Exception:
+                pass
+        self._bond_data_streams = []
+        self._bond_muxes = []
+        self._recv_q = None
+
+        # Close primary connection.
         if self._data_stream:
             try:
                 self._data_stream.close()
@@ -987,10 +1070,24 @@ class VPNClient:
             self._perf.track_packet(Stage.TUN_WRITE, len(pkt))
 
     def recv_packet(self) -> bytes:
-        """Receive a raw IP packet from the data stream."""
+        """Receive a raw IP packet from any bonded data stream.
+
+        When bond_count == 1 (default), reads directly from _data_stream —
+        identical to the pre-bonding behaviour.
+
+        When bond_count > 1, reads from _recv_q, which is fed by background
+        reader threads for every bonded stream (primary + secondaries).  The
+        server round-robins download packets across all bonded connections, so
+        packets can arrive on any stream; the queue serialises them into a
+        single receive path for the caller.
+        """
         if not self._connected.is_set() or self._data_stream is None:
             raise IOError("VPN not connected")
-        data = self._data_stream.read()
+        if self._recv_q is not None:
+            # Bonded mode: block until any reader thread deposits a packet.
+            data = self._recv_q.get()  # type: ignore[union-attr]
+        else:
+            data = self._data_stream.read()
         if self._perf:
             from perf_collector import Stage
             self._perf.track_packet(Stage.TUN_READ, len(data))
@@ -1085,21 +1182,115 @@ class VPNClient:
         return conn
 
     def _do_noise_handshake(self, kp: KeyPair) -> NoiseSession:
+        """Perform Noise_XX handshake on the primary obfs connection (self._obfs)."""
+        return self._do_noise_handshake_on(self._obfs, kp)
+
+    def _do_noise_handshake_on(self, obfs: ObfsConn, kp: KeyPair) -> NoiseSession:
+        """Perform Noise_XX handshake on an arbitrary ObfsConn.
+
+        Used for both primary and secondary connections so that secondary
+        connections can reuse the same key pair without touching self._obfs.
+        """
         hs = NoiseHandshake(kp)
 
         # WriteMessage1: -> e (32 bytes)
         msg1 = hs.write_message1()
-        self._send_handshake_msg(msg1)
+        obfs.write(struct.pack(">H", len(msg1)) + msg1)
 
         # ReadMessage2: <- e, ee, s, es
-        msg2 = self._recv_handshake_msg()
+        len_b = obfs.read(2)
+        msg2 = obfs.read(struct.unpack(">H", len_b)[0])
         hs.read_message2(msg2)
 
         # WriteMessage3: -> s, se
         msg3, session = hs.write_message3()
-        self._send_handshake_msg(msg3)
+        obfs.write(struct.pack(">H", len(msg3)) + msg3)
 
         return session
+
+    def _bond_reader_thread(self, stream: MuxStream) -> None:
+        """Background daemon thread: reads download packets from a bonded data
+        stream and puts them into _recv_q.
+
+        The thread exits when:
+          - The stream closes (read() returns b"" / empty bytes on EOF)
+          - _bond_closed is set (disconnect() called) — detected via the
+            stream's FIN signal triggered by mux.close()
+          - Any unexpected exception (broken connection)
+        """
+        while not self._bond_closed.is_set():
+            try:
+                # Timeout=2s allows _bond_closed check to run periodically
+                # without blocking the thread forever during idle connections.
+                pkt = stream.read(timeout=2.0)
+                if not pkt:
+                    break  # EOF: remote FIN or stream closed
+                if self._recv_q is not None:
+                    self._recv_q.put(pkt)  # type: ignore[union-attr]
+            except TimeoutError:
+                continue  # idle — retry
+            except Exception:
+                break  # broken connection: exit silently
+
+    def _attach_secondary_conn(
+        self,
+        host: str,
+        port: int,
+        kp: KeyPair,
+        assigned_ip_bytes: bytes,
+    ) -> None:
+        """Establish one secondary TCP connection for download bonding.
+
+        Wire protocol (mirrors server's runSecondaryConn in main.go):
+          1. Full TCP → ObfsConn → Noise_XX handshake (same key pair)
+          2. Open control stream (mux stream ID=2)
+          3. Write CTL_SECONDARY (1 byte) + assigned_ip (4 bytes big-endian)
+          4. Read CTL_ASSIGN (1 byte) from server — confirms attachment
+          5. Close control stream
+          6. Open data stream (mux stream ID=4)
+          7. Start _bond_reader_thread for this data stream
+
+        The server adds the data stream to its streamBond for this session,
+        so download packets are now round-robined across all bonded connections.
+        """
+        sock = self._connect_tcp(host, port)
+
+        obfs = ObfsConn(sock)
+        obfs.client_handshake()
+
+        session = self._do_noise_handshake_on(obfs, kp)
+        nc = NoiseConn(obfs, session)
+        mux = ClientMux(nc)
+
+        # Control stream: announce secondary attachment
+        ctl = mux.open_stream()
+        try:
+            ctl.write(bytes([CTL_SECONDARY]) + assigned_ip_bytes)
+            resp = ctl.read_exactly(1, timeout=10.0)
+            if resp[0] != CTL_ASSIGN:
+                raise IOError(
+                    f"secondary: unexpected response 0x{resp[0]:02x} "
+                    f"(expected CTL_ASSIGN 0x{CTL_ASSIGN:02x})"
+                )
+        finally:
+            ctl.close()
+
+        # Open data stream — server's AcceptStream() picks it up and registers
+        # it in cs.bond for round-robin download forwarding.
+        ds = mux.open_stream()
+
+        self._bond_muxes.append(mux)
+        self._bond_data_streams.append(ds)
+
+        t = threading.Thread(
+            target=self._bond_reader_thread,
+            args=(ds,),
+            daemon=True,
+            name=f"vpn-bond-reader-{len(self._bond_muxes)}",
+        )
+        t.start()
+        self._log.info("secondary_conn_attached",
+                       bond=len(self._bond_muxes) + 1)  # +1 for primary
 
     def _send_handshake_msg(self, msg: bytes) -> None:
         """Send a length-prefixed handshake message over the obfs layer."""

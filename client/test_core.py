@@ -1250,5 +1250,454 @@ class TestVPNClientIntegration(unittest.TestCase):
         self.assertEqual(received.get("data"), b"hello mux")
 
 
+# ===========================================================================
+# 11. TestDownloadBonding — CTL_SECONDARY + multi-connection bonding
+# ===========================================================================
+
+from core import CTL_SECONDARY, MuxStream
+
+
+def _run_vpn_server_side_with_secondary(
+    primary_conn: socket.socket,
+    server_kp: KeyPair,
+    assigned_ip: str = "10.8.0.2",
+    prefix_len: int = 24,
+    gateway: str = "10.8.0.1",
+    secondary_accepted: Optional[threading.Event] = None,
+) -> None:
+    """Server mock that supports both primary and secondary (CTL_SECONDARY) connections.
+
+    After serving the primary connection it continues accepting new connections
+    on the same listener socket (passed via the secondary_sock shared state in
+    the closure below).  Use _start_bonded_server() which wraps this logic.
+    """
+    _run_vpn_server_side(primary_conn, server_kp, assigned_ip, prefix_len, gateway)
+
+
+def _run_secondary_server_side(
+    conn: socket.socket,
+    server_kp: KeyPair,
+    assigned_ip: str = "10.8.0.2",
+    done: Optional[threading.Event] = None,
+) -> None:
+    """Simulates the server handling of a CTL_SECONDARY connection.
+
+    Mirrors runSecondaryConn in main.go:
+      1. TLS obfuscation handshake
+      2. Noise_XX responder handshake
+      3. Open NoiseConn + Mux
+      4. Accept first stream; read CTL_SECONDARY byte + 4-byte IP
+      5. Validate IP (simplified: just check it's non-zero)
+      6. Send CTL_ASSIGN back
+      7. Close control stream
+      8. Accept data stream
+      9. Echo any IP packets back (for testing recv_packet via secondary)
+    """
+    try:
+        s_obfs = ObfsConn(conn)
+        s_obfs.server_handshake()
+
+        resp = NoiseResponder(server_kp)
+        len_b = s_obfs.read(2)
+        msg1 = s_obfs.read(struct.unpack(">H", len_b)[0])
+        resp.read_message1(msg1)
+        msg2 = resp.write_message2()
+        s_obfs.write(struct.pack(">H", len(msg2)) + msg2)
+        len_b = s_obfs.read(2)
+        msg3 = s_obfs.read(struct.unpack(">H", len_b)[0])
+        session = resp.read_message3(msg3)
+
+        nc = NoiseConn(s_obfs, session)
+
+        def read_frame() -> bytes:
+            return nc.read_message()
+
+        def write_frame(payload: bytes) -> None:
+            nc.write_message(payload)
+
+        def build_frame(sid: int, ftype: int, payload: bytes) -> bytes:
+            return struct.pack(">I", sid) + bytes([ftype]) + struct.pack(">H", len(payload)) + payload
+
+        # Read SYN for first stream (stream_id=2)
+        frame = read_frame()
+        assert frame[4] == FRAME_SYN
+
+        # Read DATA: CTL_SECONDARY(1) + ip(4) = 5 bytes
+        frame = read_frame()
+        assert frame[4] == FRAME_DATA
+        plen = struct.unpack(">H", frame[5:7])[0]
+        payload = frame[7:7 + plen]
+        # First byte must be CTL_SECONDARY
+        assert payload[0] == CTL_SECONDARY, f"expected CTL_SECONDARY, got 0x{payload[0]:02x}"
+        # Next 4 bytes are the assigned IP
+        ip_bytes = payload[1:5]
+        assert len(ip_bytes) == 4
+        assert socket.inet_ntoa(ip_bytes) == assigned_ip
+
+        # Respond with CTL_ASSIGN
+        write_frame(build_frame(2, FRAME_DATA, bytes([CTL_ASSIGN])))
+        # Send FIN for control stream
+        write_frame(build_frame(2, FRAME_FIN, b""))
+
+        # Signal that secondary handshake is done
+        if done is not None:
+            done.set()
+
+        # Read frames until data stream SYN arrives (skip FIN from client ctl close)
+        data_sid = None
+        for _ in range(10):
+            try:
+                frame = read_frame()
+                if len(frame) < MUX_HEADER_SIZE:
+                    continue
+                sid = struct.unpack(">I", frame[0:4])[0]
+                ftype = frame[4]
+                if ftype == FRAME_SYN and sid != 2:
+                    data_sid = sid
+                    break
+            except Exception:
+                break
+
+        if data_sid is None:
+            return
+
+        # Echo any DATA packets from this secondary stream back.
+        for _ in range(10):
+            try:
+                frame = read_frame()
+                if len(frame) < MUX_HEADER_SIZE:
+                    continue
+                sid = struct.unpack(">I", frame[0:4])[0]
+                ftype = frame[4]
+                plen = struct.unpack(">H", frame[5:7])[0]
+                payload = frame[7:7 + plen]
+                if ftype == FRAME_DATA and sid == data_sid and payload:
+                    write_frame(build_frame(data_sid, FRAME_DATA, payload))
+                    break
+            except Exception:
+                break
+
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+class TestDownloadBonding(unittest.TestCase):
+    """Tests for CTL_SECONDARY constant, VPNConfig.bond_count, and download bonding."""
+
+    # -- Constant correctness --------------------------------------------------
+
+    def test_ctl_secondary_value(self) -> None:
+        """CTL_SECONDARY must be 0x03 (matches ctlSecondary in main.go)."""
+        self.assertEqual(CTL_SECONDARY, 0x03)
+
+    def test_ctl_error_value(self) -> None:
+        """CTL_ERROR must be 0xFF (matches ctlError in main.go).
+
+        Previously was incorrectly 0x03 (same as CTL_SECONDARY).
+        This regression test ensures they are distinct.
+        """
+        self.assertEqual(CTL_ERROR, 0xFF)
+
+    def test_ctl_constants_distinct(self) -> None:
+        """All four CTL constants must be distinct."""
+        values = [CTL_HELLO, CTL_ASSIGN, CTL_SECONDARY, CTL_ERROR]
+        self.assertEqual(len(values), len(set(values)),
+                         "CTL constants must be unique")
+
+    # -- VPNConfig.bond_count --------------------------------------------------
+
+    def test_bond_count_default_is_one(self) -> None:
+        """bond_count defaults to 1 (no bonding — backward-compatible)."""
+        cfg = VPNConfig(server_addr="1.2.3.4:443")
+        self.assertEqual(cfg.bond_count, 1)
+
+    def test_bond_count_configurable(self) -> None:
+        cfg = VPNConfig(server_addr="1.2.3.4:443", bond_count=4)
+        self.assertEqual(cfg.bond_count, 4)
+
+    # -- VPNClient._bond_reader_thread -----------------------------------------
+
+    def test_bond_reader_thread_forwards_packets(self) -> None:
+        """_bond_reader_thread reads from a MuxStream and puts packets in queue."""
+        import queue as _queue
+        client_mux, server_mux = _make_mux_pair()
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+
+        # Get the client data stream (opened via client_mux, odd server IDs)
+        client_stream = client_mux.open_stream()
+
+        recv_q = _queue.SimpleQueue()
+        client._recv_q = recv_q
+        client._bond_closed.clear()
+
+        t = threading.Thread(
+            target=client._bond_reader_thread,
+            args=(client_stream,),
+            daemon=True,
+        )
+        t.start()
+
+        # Server-side: write data into the stream's read path
+        import time
+        time.sleep(0.05)
+        with server_mux._streams_lock:
+            streams = list(server_mux._streams.values())
+        if not streams:
+            time.sleep(0.1)
+            with server_mux._streams_lock:
+                streams = list(server_mux._streams.values())
+        self.assertTrue(streams, "server should see the opened stream")
+        server_stream = streams[0]
+
+        pkt = b"\x45\x00" + b"\xAB" * 18
+        # Use write() — this sends a DATA frame through the loopback NoiseConn
+        # to client_mux._read_loop, which calls client_stream._deliver(pkt),
+        # which the _bond_reader_thread reads and puts in recv_q.
+        server_stream.write(pkt)
+
+        result = recv_q.get(timeout=3.0)
+        self.assertEqual(result, pkt)
+
+        # Cleanup
+        client._bond_closed.set()
+        client_stream._signal_fin()
+        t.join(timeout=3.0)
+        client_mux.close()
+        server_mux.close()
+
+    def test_bond_reader_thread_stops_on_fin(self) -> None:
+        """_bond_reader_thread exits when the stream receives FIN."""
+        import queue as _queue
+        client_mux, server_mux = _make_mux_pair()
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+
+        client_stream = client_mux.open_stream()
+        recv_q = _queue.SimpleQueue()
+        client._recv_q = recv_q
+        client._bond_closed.clear()
+
+        t = threading.Thread(
+            target=client._bond_reader_thread,
+            args=(client_stream,),
+            daemon=True,
+        )
+        t.start()
+
+        # Trigger FIN — thread should exit cleanly
+        import time
+        time.sleep(0.05)
+        client_stream._signal_fin()
+        t.join(timeout=3.0)
+        self.assertFalse(t.is_alive(), "reader thread should exit on FIN")
+
+        client_mux.close()
+        server_mux.close()
+
+    def test_bond_reader_thread_stops_on_bond_closed(self) -> None:
+        """_bond_reader_thread exits when _bond_closed is set."""
+        import queue as _queue
+        client_mux, server_mux = _make_mux_pair()
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+
+        client_stream = client_mux.open_stream()
+        recv_q = _queue.SimpleQueue()
+        client._recv_q = recv_q
+        client._bond_closed.clear()
+
+        t = threading.Thread(
+            target=client._bond_reader_thread,
+            args=(client_stream,),
+            daemon=True,
+        )
+        t.start()
+
+        import time
+        time.sleep(0.05)
+
+        # Signal bond closed AND send FIN to unblock read()
+        client._bond_closed.set()
+        client_stream._signal_fin()
+        t.join(timeout=3.0)
+        self.assertFalse(t.is_alive(), "reader thread should exit when bond_closed")
+
+        client_mux.close()
+        server_mux.close()
+
+    # -- disconnect() cleanup ---------------------------------------------------
+
+    def test_disconnect_clears_bond_state(self) -> None:
+        """disconnect() clears bond_muxes, bond_data_streams, and recv_q."""
+        import queue as _queue
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+
+        # Manually inject fake bond state
+        client._recv_q = _queue.SimpleQueue()
+        # (No real mux — just verify the lists are cleared)
+        client._bond_muxes = []
+        client._bond_data_streams = []
+
+        client._connected.clear()
+        client._bond_closed.clear()
+        client.disconnect()
+
+        self.assertIsNone(client._recv_q)
+        self.assertEqual(client._bond_muxes, [])
+        self.assertEqual(client._bond_data_streams, [])
+
+    # -- Secondary connection handshake (integration) --------------------------
+
+    def test_secondary_handshake_protocol(self) -> None:
+        """Client performs CTL_SECONDARY handshake correctly against a real mock server."""
+        server_kp = generate_key_pair()
+        client_kp = generate_key_pair()
+
+        secondary_done = threading.Event()
+
+        # Start a secondary server that handles CTL_SECONDARY
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv_sock.bind(("127.0.0.1", 0))
+        srv_sock.listen(1)
+        port = srv_sock.getsockname()[1]
+
+        def accept_secondary():
+            try:
+                srv_sock.settimeout(5.0)
+                conn, _ = srv_sock.accept()
+                srv_sock.close()
+                _run_secondary_server_side(conn, server_kp,
+                                           assigned_ip="10.8.0.2",
+                                           done=secondary_done)
+            except Exception:
+                secondary_done.set()
+
+        t = threading.Thread(target=accept_secondary, daemon=True)
+        t.start()
+
+        import time
+        time.sleep(0.05)
+
+        cfg = VPNConfig(server_addr=f"127.0.0.1:{port}", key_pair=client_kp)
+        client = VPNClient(cfg)
+
+        # Directly invoke _attach_secondary_conn to test the protocol
+        assigned_ip_bytes = socket.inet_aton("10.8.0.2")
+        client._attach_secondary_conn("127.0.0.1", port, client_kp, assigned_ip_bytes)
+
+        ok = secondary_done.wait(timeout=5.0)
+        self.assertTrue(ok, "secondary handshake should complete within timeout")
+
+        # Clean up secondary bond state
+        client.disconnect()
+        t.join(timeout=5)
+
+    # -- Full bonded connect (integration) -------------------------------------
+
+    def test_connect_with_bond_count_2(self) -> None:
+        """connect() establishes primary + 1 secondary connection when bond_count=2."""
+        server_kp = generate_key_pair()
+        client_kp = generate_key_pair()
+        secondary_done = threading.Event()
+
+        # Server listens for 2 connections: primary + 1 secondary
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv_sock.bind(("127.0.0.1", 0))
+        srv_sock.listen(5)
+        port = srv_sock.getsockname()[1]
+
+        def serve():
+            conns_handled = 0
+            try:
+                srv_sock.settimeout(5.0)
+                while conns_handled < 2:
+                    try:
+                        conn, _ = srv_sock.accept()
+                        conns_handled += 1
+                        if conns_handled == 1:
+                            threading.Thread(
+                                target=_run_vpn_server_side,
+                                args=(conn, server_kp),
+                                daemon=True,
+                            ).start()
+                        else:
+                            threading.Thread(
+                                target=_run_secondary_server_side,
+                                args=(conn, server_kp, "10.8.0.2", secondary_done),
+                                daemon=True,
+                            ).start()
+                    except socket.timeout:
+                        break
+            finally:
+                try:
+                    srv_sock.close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+
+        import time
+        time.sleep(0.05)
+
+        cfg = VPNConfig(
+            server_addr=f"127.0.0.1:{port}",
+            key_pair=client_kp,
+            connect_timeout=5.0,
+            bond_count=2,
+            transport="tcp",
+        )
+        client = VPNClient(cfg)
+        route = client.connect()
+
+        self.assertIsInstance(route, RouteInfo)
+        self.assertEqual(route.assigned_ip, "10.8.0.2")
+
+        # Verify secondary connection was established
+        ok = secondary_done.wait(timeout=5.0)
+        self.assertTrue(ok, "secondary connection should be established")
+        self.assertEqual(len(client._bond_muxes), 1,
+                         "should have 1 secondary mux (bond_count=2)")
+        self.assertEqual(len(client._bond_data_streams), 1)
+        self.assertIsNotNone(client._recv_q)
+
+        client.disconnect()
+        t.join(timeout=5)
+
+    def test_recv_packet_via_bond_queue(self) -> None:
+        """recv_packet() returns a packet injected directly into _recv_q."""
+        import queue as _queue
+
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+        client._connected.set()
+
+        # Inject fake state so recv_packet() uses the queue path
+        # and _data_stream is non-None (for the guard check)
+        client_mux, server_mux = _make_mux_pair()
+        client._data_stream = client_mux.open_stream()
+        q = _queue.SimpleQueue()
+        client._recv_q = q
+
+        pkt = b"\x45\x00" + b"\xBB" * 18
+        q.put(pkt)
+
+        result = client.recv_packet()
+        self.assertEqual(result, pkt)
+
+        client._bond_closed.set()
+        client_mux.close()
+        server_mux.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
