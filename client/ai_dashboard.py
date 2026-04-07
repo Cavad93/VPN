@@ -220,9 +220,11 @@ def _wrap(text: str, width: int, indent: int = 5) -> list[str]:
 def render(state: State, tel: TelState, base: str) -> None:
     now_str = datetime.now().strftime("%H:%M:%S")
     try:
-        width = max(os.get_terminal_size().columns, 70)
+        ts = os.get_terminal_size()
+        width  = max(ts.columns, 70)
+        height = ts.lines
     except Exception:
-        width = 80
+        width, height = 80, 24
     out: list[str] = []
 
     # ── Заголовок ──
@@ -330,12 +332,15 @@ def render(state: State, tel: TelState, base: str) -> None:
                f"{GRAY}r: обновить   q: выход{RESET}")
     out.append(BOLD + WHITE + "─" * width + RESET)
 
-    # Абсолютное позиционирование — скролл невозможен физически
+    # Абсолютное позиционирование — обрезаем по высоте терминала
+    # чтобы ESC[N;1H никогда не выходил за пределы экрана
+    visible = out[: height - 1]
     buf = hide_cursor()
-    for i, line in enumerate(out):
+    for i, line in enumerate(visible):
         buf += ESC + f"[{i + 1};1H" + line + ESC + "[K"
     # Очистить остаток экрана ниже последней строки
-    buf += ESC + f"[{len(out) + 1};1H" + ESC + "[J"
+    if len(visible) < height:
+        buf += ESC + f"[{len(visible) + 1};1H" + ESC + "[J"
     sys.stdout.write(buf)
     sys.stdout.flush()
 
