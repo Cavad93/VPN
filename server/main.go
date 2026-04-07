@@ -1402,6 +1402,7 @@ func main() {
 	var vlessAddr, vlessCert, vlessKey, vlessPath string
 	var anthropicKey string
 	var relayTo string
+	var diagnosticsFile string
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
 	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
 	flag.StringVar(&cfg.PrivKeyFile, "privkey", cfg.PrivKeyFile, "path to hex-encoded private key file")
@@ -1414,6 +1415,7 @@ func main() {
 	flag.StringVar(&vlessPath, "vless-path", "/tunnel", "WebSocket path for VLESS")
 	flag.StringVar(&anthropicKey, "anthropic-key", "", "Anthropic API key for telemetry analysis (or ANTHROPIC_API_KEY env)")
 	flag.StringVar(&relayTo, "relay-to", "", "relay VPN traffic to this upstream address (e.g. 193.124.93.240:8443); disables local VPN termination")
+	flag.StringVar(&diagnosticsFile, "diagnostics-file", "", "path to append telemetry reports as JSONL (e.g. /var/log/cavadvpn/diagnostics.jsonl)")
 	flag.Parse()
 
 	// Anthropic API key: flag takes precedence, then environment variable.
@@ -1487,7 +1489,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	apiSrv := startAPIServer(ctx, apiCfg, srv, logger, anthropicKey)
+	apiSrv := startAPIServer(ctx, apiCfg, srv, logger, anthropicKey, diagnosticsFile)
 
 	// Start VLESS+WS+TLS listener if configured.
 	if vlessAddr != "" {
@@ -1547,7 +1549,7 @@ func main() {
 
 // startAPIServer launches the REST management API in a background goroutine.
 // If cfg.ListenAddr is empty the API is not started.
-func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *slog.Logger, anthropicKey string) *api.APIServer {
+func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *slog.Logger, anthropicKey, diagnosticsFile string) *api.APIServer {
 	if cfg.ListenAddr == "" {
 		return nil
 	}
@@ -1612,6 +1614,10 @@ func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *sl
 		logger.Info("telemetry collection enabled (no AI analysis — set -anthropic-key or ANTHROPIC_API_KEY)")
 	}
 	apiSrv.SetTelemetryStore(telemetryStore, analyzer)
+	if diagnosticsFile != "" {
+		apiSrv.SetDiagnosticsFile(diagnosticsFile)
+		logger.Info("diagnostics file enabled", "path", diagnosticsFile)
+	}
 
 	go func() {
 		<-ctx.Done()

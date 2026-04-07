@@ -91,6 +91,7 @@ type APIServer struct {
 	perfCollector     *perf.Collector
 	telemetryStore    *TelemetryStore
 	telemetryAnalyzer *TelemetryAnalyzer
+	diagnosticsFile   string // path to diagnostics.jsonl (empty = disabled)
 }
 
 // NewAPIServer creates a new APIServer and registers all routes.

@@ -16,7 +16,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -277,6 +279,7 @@ type TelemetryAnalyzer struct {
 	interval time.Duration
 	cancel   context.CancelFunc
 	done     chan struct{}
+	enabled  atomic.Bool // toggleable at runtime; true by default
 	// Optional: callbacks to get server-side data for enriching analysis.
 	GetServerPerf    func() *ServerPerfSummary
 	GetServerMetrics func() *ServerMetrics
@@ -284,13 +287,21 @@ type TelemetryAnalyzer struct {
 
 // NewTelemetryAnalyzer creates an analyzer that runs every interval.
 func NewTelemetryAnalyzer(store *TelemetryStore, fn AnalyzerFunc, apiKey string, interval time.Duration) *TelemetryAnalyzer {
-	return &TelemetryAnalyzer{
+	a := &TelemetryAnalyzer{
 		store:    store,
 		analyze:  fn,
 		apiKey:   apiKey,
 		interval: interval,
 	}
+	a.enabled.Store(true)
+	return a
 }
+
+// SetEnabled enables or disables the periodic AI analysis.
+func (ta *TelemetryAnalyzer) SetEnabled(v bool) { ta.enabled.Store(v) }
+
+// IsEnabled reports whether AI analysis is currently enabled.
+func (ta *TelemetryAnalyzer) IsEnabled() bool { return ta.enabled.Load() }
 
 // Start begins the periodic analysis loop.
 func (ta *TelemetryAnalyzer) Start() {
@@ -328,6 +339,9 @@ func (ta *TelemetryAnalyzer) RunOnce(ctx context.Context) *AnalysisResult {
 }
 
 func (ta *TelemetryAnalyzer) runOnce(ctx context.Context) *AnalysisResult {
+	if !ta.enabled.Load() {
+		return nil // AI выключен пользователем
+	}
 	// Analyze reports from the last interval (+ 10% overlap).
 	since := time.Now().Add(-ta.interval - ta.interval/10)
 	reports := ta.store.Since(since)
@@ -750,6 +764,28 @@ func parseAnalysisResponse(text string, reportCount int) *AnalysisResult {
 // API route registration
 // ---------------------------------------------------------------------------
 
+// SetDiagnosticsFile enables appending every received report to a JSONL file.
+// Each line is a JSON-encoded TelemetryReport. File is created if it doesn't exist.
+func (a *APIServer) SetDiagnosticsFile(path string) {
+	a.diagnosticsFile = path
+}
+
+// appendDiagnostics appends one report as a JSON line to the diagnostics file.
+func (a *APIServer) appendDiagnostics(r TelemetryReport) {
+	line, err := json.Marshal(r)
+	if err != nil {
+		return
+	}
+	line = append(line, '\n')
+	f, err := os.OpenFile(a.diagnosticsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
+	if err != nil {
+		a.logger.Warn("diagnostics write failed", "err", err)
+		return
+	}
+	defer f.Close()
+	f.Write(line) //nolint:errcheck
+}
+
 // SetTelemetryStore enables telemetry endpoints on the API server.
 func (a *APIServer) SetTelemetryStore(ts *TelemetryStore, analyzer *TelemetryAnalyzer) {
 	a.telemetryStore = ts
@@ -765,6 +801,9 @@ func (a *APIServer) SetTelemetryStore(ts *TelemetryStore, analyzer *TelemetryAna
 	a.mux.HandleFunc("POST /api/v1/telemetry/analyze", a.auth(a.handleTriggerAnalysis))
 	// Get actionable config from latest analysis — no auth (clients poll this every 5 min).
 	a.mux.HandleFunc("GET /api/v1/telemetry/config", a.handleGetTelemetryConfig)
+	// AI enable/disable toggle — auth required.
+	a.mux.HandleFunc("GET /api/v1/telemetry/ai", a.auth(a.handleGetAIStatus))
+	a.mux.HandleFunc("POST /api/v1/telemetry/ai", a.auth(a.handleSetAIStatus))
 }
 
 // handleSubmitTelemetry receives a telemetry report from a client.
@@ -794,6 +833,12 @@ func (a *APIServer) handleSubmitTelemetry(w http.ResponseWriter, r *http.Request
 
 	a.telemetryStore.Add(report)
 	a.logger.Debug("telemetry received", "device", report.DeviceID, "platform", report.Platform)
+
+	// Persist to diagnostics file if configured.
+	if a.diagnosticsFile != "" {
+		go a.appendDiagnostics(report)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -821,6 +866,33 @@ func (a *APIServer) handleListTelemetry(w http.ResponseWriter, r *http.Request) 
 		reports = []TelemetryReport{}
 	}
 	writeJSON(w, http.StatusOK, reports)
+}
+
+// handleGetAIStatus returns whether AI analysis is currently enabled.
+func (a *APIServer) handleGetAIStatus(w http.ResponseWriter, _ *http.Request) {
+	if a.telemetryAnalyzer == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"enabled": false, "reason": "no anthropic key configured"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"enabled": a.telemetryAnalyzer.IsEnabled()})
+}
+
+// handleSetAIStatus enables or disables AI analysis at runtime.
+func (a *APIServer) handleSetAIStatus(w http.ResponseWriter, r *http.Request) {
+	if a.telemetryAnalyzer == nil {
+		writeError(w, http.StatusServiceUnavailable, "no anthropic key configured")
+		return
+	}
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	a.telemetryAnalyzer.SetEnabled(body.Enabled)
+	a.logger.Info("AI analysis toggled", "enabled", body.Enabled)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"enabled": body.Enabled})
 }
 
 // handleGetTelemetryConfig returns only the ActionableConfig from the latest analysis.

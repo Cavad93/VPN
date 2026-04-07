@@ -1652,7 +1652,7 @@ func TestStartAPIServer_Disabled(t *testing.T) {
 	srv, _ := NewServer(DefaultConfig(), kp, tun, nil, newTestLogger())
 
 	// Should return immediately without starting a server.
-	startAPIServer(ctx, api.Config{ListenAddr: ""}, srv, newTestLogger(), "")
+	startAPIServer(ctx, api.Config{ListenAddr: ""}, srv, newTestLogger(), "", "")
 }
 
 func TestStartAPIServer_Enabled(t *testing.T) {
@@ -1669,7 +1669,7 @@ func TestStartAPIServer_Enabled(t *testing.T) {
 	cfg := api.Config{ListenAddr: "127.0.0.1:0"}
 	// This starts the API server in a goroutine; context cancellation stops it.
 	// We just verify it doesn't panic during startup and cancellation.
-	startAPIServer(ctx, cfg, srv, newTestLogger(), "")
+	startAPIServer(ctx, cfg, srv, newTestLogger(), "", "")
 	// Give goroutine a moment to start, then cancel.
 	time.Sleep(time.Millisecond)
 	cancel()
