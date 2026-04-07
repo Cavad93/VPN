@@ -697,6 +697,40 @@ decodePayloadPool.Put(rp.backing)  ← UDPNetConn.Read (fast path)
 
 ---
 
+## Запуск 16 — 2026-04-07
+
+### Выполнено: TestBBRDiagnoseSlowThroughput — симуляция боттленека, устранение flakiness
+
+**Файл:** `server/transport/bbr_diag_test.go`
+
+**Проблема:**
+
+Тест `TestBBRDiagnoseSlowThroughput` стабильно проходил в изоляции, но падал при запуске вместе с бенчмарками. Причина:
+
+1. Тест ACKовал **все** пакеты в каждом раунде без ограничения.
+2. `BBRState.OnACK` использует `time.Now()` внутри для расчёта `sendElapsed` и `ackElapsed`.
+3. Без реального боттленека cwnd рос экспоненциально (до 246 тысяч пакетов).
+4. Каждый раунд с огромным cwnd: цикл ACK 246K итераций → значительное реальное wall-clock время → `sendElapsed` растёт → `deliveryRate = bytes / bigTime` = маленькое значение → BtlBw filter заменяет старые высокие сэмплы новыми маленькими → пакирование падает спирально.
+5. Под нагрузкой бенчмарков wall-clock время ещё больше → FAIL с "pacing rate 4.5 Mbps".
+
+**Исправление:**
+
+```go
+const maxAcksPerRound = int(int64(bottleneckBps) * int64(rtt) / int64(time.Second) / mss)
+// = 50_000_000 × 0.08 / 1430 ≈ 2797 пакетов
+```
+
+Теперь в каждом раунде ACKуется не более `maxAcksPerRound` пакетов — именно столько может пройти через боттленек 50 Mbps за один RTT 80ms. Это:
+- Удерживает количество итераций в цикле ACK на уровне ~2800 (а не 246K)
+- Сохраняет wall-clock время итерации предсказуемым и маленьким
+- `sendElapsed` остаётся малым → `deliveryRate` стабилен → BtlBw не деградирует
+
+Также введён `nextAckSeq uint32` для O(1)-продвижения вместо O(seq) сканирования при каждом раунде. Порог pass повышен с 1 Mbps до 5 Mbps (10% от 50 Mbps боттленека).
+
+**Тесты:** `go test ./transport/ -run TestBBRDiagnoseSlowThroughput -bench BenchmarkThroughput -count=2` — PASS под нагрузкой. `cd server && go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **ObfsConn write path** — ~~РЕШЕНО~~: `BufConn` уже батчирует. Закрыта.
@@ -707,10 +741,10 @@ decodePayloadPool.Put(rp.backing)  ← UDPNetConn.Read (fast path)
 
 4. **DecodePacket payload alloc** — ~~РЕШЕНО~~ (Запуск 15): `decodePayloadPool` устраняет ~3.7 MB/сек heap pressure.
 
-5. **IPv6 inner tunnel support** — `markECNCE` только IPv4. При расширении туннеля до IPv6 нужен путь для Traffic Class field.
+5. **TestBBRDiagnoseSlowThroughput flakiness** — ~~РЕШЕНО~~ (Запуск 16): `maxAcksPerRound` cap + `nextAckSeq` O(1).
 
-6. **firstSentAt vs sentAt** — документировано; не баг.
+6. **IPv6 inner tunnel support** — `markECNCE` только IPv4. При расширении туннеля до IPv6 нужен путь для Traffic Class field.
 
-7. **pprof профилирование под нагрузкой** — для поиска скрытых узких мест. Теперь горячий путь (send + receive) имеет нулевых аллокаций — следующий шаг: CPU profiling для runtime overhead (GC sweep, mutex scheduling, syscall).
+7. **firstSentAt vs sentAt** — документировано; не баг.
 
-8. **TestBBRDiagnoseSlowThroughput flakiness** — тест чувствителен к system load при параллельном запуске. Candidate для изоляции через `t.Parallel()` + `runtime.GOMAXPROCS(1)` или добавления `-p 1` в CI.
+8. **pprof профилирование под нагрузкой** — для поиска скрытых узких мест. Теперь горячий путь (send + receive) имеет нулевых аллокаций — следующий шаг: CPU profiling для runtime overhead (GC sweep, mutex scheduling, syscall).
