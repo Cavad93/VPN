@@ -1448,8 +1448,15 @@ func main() {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 		logger.Info("starting in relay mode", "listen", cfg.ListenAddr, "upstream", relayTo)
-		if err := runRelay(ctx, cfg.ListenAddr, relayTo, logger); err != nil {
-			logger.Error("relay error", "err", err)
+		// TCP relay: handles CavadVPN TCP transport + decoy for scanners.
+		go func() {
+			if err := runRelay(ctx, cfg.ListenAddr, relayTo, logger); err != nil {
+				logger.Error("TCP relay error", "err", err)
+			}
+		}()
+		// UDP relay: handles CavadVPN UDP+BBR transport (default client transport).
+		if err := runUDPRelay(ctx, cfg.ListenAddr, relayTo, logger); err != nil {
+			logger.Error("UDP relay error", "err", err)
 			os.Exit(1)
 		}
 		return

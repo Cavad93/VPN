@@ -35,7 +35,7 @@ func startEchoServer(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// startRelayWithUpstream starts a relay pointing at upstream and returns its addr.
+// startRelayWithUpstream starts a TCP relay pointing at upstream and returns its addr.
 func startRelayWithUpstream(t *testing.T, upstream string) string {
 	t.Helper()
 	// Use port 0 so the OS picks a free port.
@@ -53,6 +53,47 @@ func startRelayWithUpstream(t *testing.T, upstream string) string {
 	go runRelay(ctx, addr, upstream, logger) //nolint:errcheck
 
 	// Give the relay goroutine a moment to bind.
+	time.Sleep(20 * time.Millisecond)
+	return addr
+}
+
+// startUDPRelayWithUpstream starts a UDP relay and returns (listenAddr, echoAddr).
+func startUDPEchoServer(t *testing.T) string {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("udp echo listen: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	go func() {
+		buf := make([]byte, udpBufSize)
+		for {
+			n, addr, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			conn.WriteTo(buf[:n], addr) //nolint:errcheck
+		}
+	}()
+	return conn.LocalAddr().String()
+}
+
+func startUDPRelay(t *testing.T, upstream string) string {
+	t.Helper()
+	// Pre-bind to get a free port.
+	tmp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pre-bind udp: %v", err)
+	}
+	addr := tmp.LocalAddr().String()
+	tmp.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	go runUDPRelay(ctx, addr, upstream, logger) //nolint:errcheck
+
 	time.Sleep(20 * time.Millisecond)
 	return addr
 }
@@ -142,6 +183,59 @@ func TestRelayClosesConnectionWhenUpstreamUnreachable(t *testing.T) {
 	n, err := conn.Read(buf)
 	if n != 0 || err == nil {
 		t.Fatalf("expected closed connection from relay on unreachable upstream, got n=%d err=%v", n, err)
+	}
+}
+
+// TestUDPRelayForwardsPackets verifies that UDP packets are forwarded to upstream
+// and replies are routed back to the original client.
+func TestUDPRelayForwardsPackets(t *testing.T) {
+	echo := startUDPEchoServer(t)
+	relay := startUDPRelay(t, echo)
+
+	conn, err := net.Dial("udp", relay)
+	if err != nil {
+		t.Fatalf("dial udp relay: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("hello udp relay")
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(buf) != string(payload) {
+		t.Fatalf("echo mismatch: got %q want %q", buf, payload)
+	}
+}
+
+// TestUDPRelayMultipleClients verifies that two different clients get independent
+// sessions and replies are routed back to the correct sender.
+func TestUDPRelayMultipleClients(t *testing.T) {
+	echo := startUDPEchoServer(t)
+	relay := startUDPRelay(t, echo)
+
+	send := func(msg string) string {
+		conn, err := net.Dial("udp", relay)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		conn.Write([]byte(msg)) //nolint:errcheck
+		buf := make([]byte, 64)
+		n, _ := conn.Read(buf)
+		return string(buf[:n])
+	}
+
+	if got := send("client-A"); got != "client-A" {
+		t.Errorf("client A: got %q", got)
+	}
+	if got := send("client-B"); got != "client-B" {
+		t.Errorf("client B: got %q", got)
 	}
 }
 

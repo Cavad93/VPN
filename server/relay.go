@@ -25,6 +25,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -146,4 +147,110 @@ func relayOne(client net.Conn, target string, logger *slog.Logger) {
 	<-done
 
 	logger.Info("relay: connection closed", "client", routed.RemoteAddr())
+}
+
+// ── UDP relay ──────────────────────────────────────────────────────────────────
+//
+// runUDPRelay listens for UDP datagrams on listenAddr and forwards them to
+// relayTarget.  Each unique (client IP:port) gets its own upstream UDP socket
+// so that replies are routed back to the correct client.
+//
+// Unlike the TCP relay there is no per-connection peek-and-route: UDP is
+// connectionless so HTTP decoy pages are meaningless.  Random scanners very
+// rarely probe UDP ports, and if they do they receive silence (no response),
+// which is indistinguishable from a closed port.
+//
+// Sessions are cleaned up after udpSessionTimeout of inactivity.
+
+const udpSessionTimeout = 5 * time.Minute
+const udpBufSize = 65536
+
+// udpSession tracks one client ↔ upstream mapping.
+type udpSession struct {
+	upstream net.Conn
+	lastSeen time.Time
+}
+
+func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *slog.Logger) error {
+	local, err := net.ListenPacket("udp", listenAddr)
+	if err != nil {
+		return err
+	}
+	logger.Info("udp relay listening", "listen", listenAddr, "upstream", relayTarget)
+
+	go func() {
+		<-ctx.Done()
+		local.Close()
+	}()
+
+	var mu sync.Mutex
+	sessions := make(map[string]*udpSession)
+
+	// Periodic cleanup of idle sessions.
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				for k, s := range sessions {
+					if time.Since(s.lastSeen) > udpSessionTimeout {
+						s.upstream.Close()
+						delete(sessions, k)
+					}
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	buf := make([]byte, udpBufSize)
+	for {
+		n, clientAddr, err := local.ReadFrom(buf)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				logger.Warn("udp relay: read error", "err", err)
+				continue
+			}
+		}
+
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		key := clientAddr.String()
+
+		mu.Lock()
+		sess, ok := sessions[key]
+		if !ok {
+			up, err := net.Dial("udp", relayTarget)
+			if err != nil {
+				mu.Unlock()
+				logger.Warn("udp relay: dial upstream failed", "target", relayTarget, "err", err)
+				continue
+			}
+			sess = &udpSession{upstream: up, lastSeen: time.Now()}
+			sessions[key] = sess
+
+			// Goroutine: upstream → client.
+			go func(up net.Conn, dst net.Addr) {
+				rbuf := make([]byte, udpBufSize)
+				for {
+					m, err := up.Read(rbuf)
+					if err != nil {
+						return
+					}
+					local.WriteTo(rbuf[:m], dst) //nolint:errcheck
+				}
+			}(up, clientAddr)
+		}
+		sess.lastSeen = time.Now()
+		mu.Unlock()
+
+		sess.upstream.Write(pkt) //nolint:errcheck
+	}
 }
