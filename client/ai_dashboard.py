@@ -332,15 +332,29 @@ def render(state: State, tel: TelState, base: str) -> None:
                f"{GRAY}r: обновить   q: выход{RESET}")
     out.append(BOLD + WHITE + "─" * width + RESET)
 
-    # Отключаем перенос строк — emoji и спецсимволы могут быть шире width
-    # и вызывать скролл при переносе. ESC[?7l = no-wrap, ESC[?7h = wrap back.
-    visible = out[: height - 1]
-    buf = hide_cursor() + ESC + "[?7l"          # disable line wrap
+    # Нижняя панель (3 строки) всегда приклеена к низу экрана.
+    # Контент (всё кроме footer) обрезается по оставшемуся месту.
+    FOOTER = 3
+    footer  = out[-FOOTER:]          # separator + nav + separator
+    body    = out[:-FOOTER]          # всё остальное
+    body_rows = max(0, height - FOOTER - 1)
+    visible = body[:body_rows]
+
+    buf = hide_cursor() + ESC + "[?7l"   # отключаем перенос строк
+
+    # Тело
     for i, line in enumerate(visible):
         buf += ESC + f"[{i + 1};1H" + line + ESC + "[K"
-    if len(visible) < height:
-        buf += ESC + f"[{len(visible) + 1};1H" + ESC + "[J"
-    buf += ESC + "[?7h"                          # restore line wrap
+
+    # Зазор между телом и футером — очищаем строки
+    for row in range(len(visible) + 1, height - FOOTER + 1):
+        buf += ESC + f"[{row};1H" + ESC + "[K"
+
+    # Футер — всегда на последних 3 строках
+    for j, line in enumerate(footer):
+        buf += ESC + f"[{height - FOOTER + j};1H" + line + ESC + "[K"
+
+    buf += ESC + "[?7h"                   # восстанавливаем перенос строк
     sys.stdout.write(buf)
     sys.stdout.flush()
 
