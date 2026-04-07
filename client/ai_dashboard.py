@@ -330,11 +330,11 @@ def render(state: State, tel: TelState, base: str) -> None:
                f"{GRAY}r: обновить   q: выход{RESET}")
     out.append(BOLD + WHITE + "─" * width + RESET)
 
-    # Атомарная перерисовка
-    sys.stdout.write(hide_cursor() + ESC + "[H")
+    # Атомарная перерисовка в alternate screen buffer
+    buf = hide_cursor() + ESC + "[2J" + ESC + "[H"
     for line in out:
-        sys.stdout.write(line + ESC + "[K\n")
-    sys.stdout.write(ESC + "[J")
+        buf += line + ESC + "[K\r\n"
+    sys.stdout.write(buf)
     sys.stdout.flush()
 
 
@@ -490,7 +490,11 @@ def main() -> None:
         state.set_status("--vpn-server не указан, телеметрия не отправляется")
 
     time.sleep(1.5)  # ждём первого обновления
-    os.system("cls" if os.name == "nt" else "clear")
+
+    # Переключаемся в alternate screen buffer (отдельный экран, без скролла)
+    if os.name != "nt":
+        sys.stdout.write(ESC + "[?1049h")
+        sys.stdout.flush()
 
     try:
         while True:
@@ -510,8 +514,13 @@ def main() -> None:
         pass
     finally:
         stop.set()
-        sys.stdout.write(show_cursor())
-        os.system("cls" if os.name == "nt" else "clear")
+        if os.name != "nt":
+            # Возвращаемся на основной экран и восстанавливаем курсор
+            sys.stdout.write(show_cursor() + ESC + "[?1049l")
+        else:
+            sys.stdout.write(show_cursor())
+            os.system("cls")
+        sys.stdout.flush()
         print("До свидания.")
 
 
