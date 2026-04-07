@@ -1699,5 +1699,235 @@ class TestDownloadBonding(unittest.TestCase):
         server_mux.close()
 
 
+class TestUploadBonding(unittest.TestCase):
+    """Tests for upload bonding: send_packet() round-robin across all streams."""
+
+    # -- send_packet() single-stream path (bond_count == 1) --------------------
+
+    def test_send_packet_single_stream_no_round_robin(self) -> None:
+        """bond_count=1: send_packet() uses _data_stream directly, _send_streams empty."""
+        client_mux, server_mux = _make_mux_pair()
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=1)
+        client = VPNClient(cfg)
+        client._data_stream = client_mux.open_stream()
+        client._connected.set()
+
+        # _send_streams must be empty for the single-stream path
+        self.assertEqual(client._send_streams, [])
+
+        # Server side: accept the SYN stream
+        import time
+        time.sleep(0.05)
+        with server_mux._streams_lock:
+            streams = list(server_mux._streams.values())
+        self.assertTrue(streams)
+        server_stream = streams[0]
+
+        pkt = b"\x45\x00" + b"\xAA" * 18
+        client.send_packet(pkt)
+
+        # Server receives the packet on the single stream
+        received = server_stream.read()
+        self.assertEqual(received, pkt)
+
+        client._connected.clear()
+        client_mux.close()
+        server_mux.close()
+
+    # -- _send_streams construction -------------------------------------------
+
+    def test_send_streams_built_from_primary_and_secondary(self) -> None:
+        """_send_streams = [primary_stream] + bond_data_streams."""
+        client_mux1, _ = _make_mux_pair()
+        client_mux2, _ = _make_mux_pair()
+        client_mux3, _ = _make_mux_pair()
+
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=3)
+        client = VPNClient(cfg)
+
+        primary_stream = client_mux1.open_stream()
+        sec1 = client_mux2.open_stream()
+        sec2 = client_mux3.open_stream()
+
+        client._data_stream = primary_stream
+        client._bond_data_streams = [sec1, sec2]
+        # Simulate what connect() does after the bonding loop:
+        client._send_streams = [client._data_stream] + list(client._bond_data_streams)
+        client._send_idx = 0
+
+        self.assertEqual(len(client._send_streams), 3)
+        self.assertIs(client._send_streams[0], primary_stream)
+        self.assertIs(client._send_streams[1], sec1)
+        self.assertIs(client._send_streams[2], sec2)
+
+        client_mux1.close()
+        client_mux2.close()
+        client_mux3.close()
+
+    # -- round-robin index advancement ----------------------------------------
+
+    def test_send_packet_round_robin_two_streams(self) -> None:
+        """With 2 bonded streams, send_packet() alternates between them."""
+        client_mux1, server_mux1 = _make_mux_pair()
+        client_mux2, server_mux2 = _make_mux_pair()
+
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+        stream1 = client_mux1.open_stream()
+        stream2 = client_mux2.open_stream()
+
+        client._data_stream = stream1
+        client._send_streams = [stream1, stream2]
+        client._send_idx = 0
+        client._connected.set()
+
+        import time
+        time.sleep(0.05)
+
+        # Gather server-side streams
+        with server_mux1._streams_lock:
+            s1_list = list(server_mux1._streams.values())
+        with server_mux2._streams_lock:
+            s2_list = list(server_mux2._streams.values())
+        self.assertTrue(s1_list, "server_mux1 should see stream1")
+        self.assertTrue(s2_list, "server_mux2 should see stream2")
+        srv1 = s1_list[0]
+        srv2 = s2_list[0]
+
+        pkt_a = b"\x45\x00" + b"\x11" * 18
+        pkt_b = b"\x45\x00" + b"\x22" * 18
+        pkt_c = b"\x45\x00" + b"\x33" * 18
+        pkt_d = b"\x45\x00" + b"\x44" * 18
+
+        # Send 4 packets: should alternate stream1, stream2, stream1, stream2
+        client.send_packet(pkt_a)  # → stream1
+        client.send_packet(pkt_b)  # → stream2
+        client.send_packet(pkt_c)  # → stream1
+        client.send_packet(pkt_d)  # → stream2
+
+        self.assertEqual(srv1.read(), pkt_a)
+        self.assertEqual(srv1.read(), pkt_c)
+        self.assertEqual(srv2.read(), pkt_b)
+        self.assertEqual(srv2.read(), pkt_d)
+
+        client._connected.clear()
+        client_mux1.close()
+        client_mux2.close()
+        server_mux1.close()
+        server_mux2.close()
+
+    def test_send_packet_round_robin_index_advances(self) -> None:
+        """_send_idx advances by 1 per send_packet() call."""
+        client_mux1, server_mux1 = _make_mux_pair()
+        client_mux2, server_mux2 = _make_mux_pair()
+
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+        stream1 = client_mux1.open_stream()
+        stream2 = client_mux2.open_stream()
+
+        client._data_stream = stream1
+        client._send_streams = [stream1, stream2]
+        client._send_idx = 0
+        client._connected.set()
+
+        import time
+        time.sleep(0.05)
+
+        pkt = b"\x45\x00" + b"\x00" * 18
+        client.send_packet(pkt)
+        self.assertEqual(client._send_idx, 1)
+        client.send_packet(pkt)
+        self.assertEqual(client._send_idx, 2)
+        client.send_packet(pkt)
+        self.assertEqual(client._send_idx, 3)
+
+        client._connected.clear()
+        client_mux1.close()
+        client_mux2.close()
+        server_mux1.close()
+        server_mux2.close()
+
+    def test_send_packet_round_robin_three_streams(self) -> None:
+        """With 3 streams each gets 1/3 of packets in strict rotation."""
+        mux_pairs = [_make_mux_pair() for _ in range(3)]
+        client_muxes = [p[0] for p in mux_pairs]
+        server_muxes = [p[1] for p in mux_pairs]
+
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=3)
+        client = VPNClient(cfg)
+        client_streams = [m.open_stream() for m in client_muxes]
+
+        client._data_stream = client_streams[0]
+        client._send_streams = list(client_streams)
+        client._send_idx = 0
+        client._connected.set()
+
+        import time
+        time.sleep(0.05)
+
+        counters = [0, 0, 0]
+        for i in range(9):
+            pkt = bytes([0x45, 0x00]) + bytes([i]) * 18
+            client.send_packet(pkt)
+            counters[i % 3] += 1
+
+        # Each stream should receive exactly 3 packets
+        self.assertEqual(counters, [3, 3, 3])
+        # _send_idx should be 9
+        self.assertEqual(client._send_idx, 9)
+
+        client._connected.clear()
+        for m in client_muxes + server_muxes:
+            m.close()
+
+    # -- disconnect() clears upload state -------------------------------------
+
+    def test_disconnect_clears_send_streams_and_idx(self) -> None:
+        """disconnect() clears _send_streams and resets _send_idx to 0."""
+        client_mux1, _ = _make_mux_pair()
+        client_mux2, _ = _make_mux_pair()
+
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+
+        stream1 = client_mux1.open_stream()
+        stream2 = client_mux2.open_stream()
+
+        client._data_stream = stream1
+        client._send_streams = [stream1, stream2]
+        client._send_idx = 42
+
+        # disconnect() without a real mux — just verify state cleanup
+        client._connected.clear()
+        client._bond_closed.clear()
+        client.disconnect()
+
+        self.assertEqual(client._send_streams, [])
+        self.assertEqual(client._send_idx, 0)
+
+        client_mux1.close()
+        client_mux2.close()
+
+    # -- send_packet() raises when not connected ------------------------------
+
+    def test_send_packet_raises_when_not_connected(self) -> None:
+        """send_packet() raises IOError when _connected is not set."""
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+        # _connected is not set — should raise immediately
+        with self.assertRaises(IOError):
+            client.send_packet(b"\x45\x00" + b"\x00" * 18)
+
+    def test_send_packet_raises_when_data_stream_is_none(self) -> None:
+        """send_packet() raises IOError when _data_stream is None."""
+        cfg = VPNConfig(server_addr="127.0.0.1:443", bond_count=2)
+        client = VPNClient(cfg)
+        client._connected.set()
+        client._data_stream = None
+        with self.assertRaises(IOError):
+            client.send_packet(b"\x45\x00" + b"\x00" * 18)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

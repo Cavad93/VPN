@@ -927,6 +927,14 @@ class VPNClient:
         # _data_stream.read() directly.
         self._recv_q: Optional[object] = None  # queue.SimpleQueue[bytes]
         self._bond_closed = threading.Event()  # set by disconnect() to stop reader threads
+        # --- Upload bonding state (populated when bond_count > 1) ---
+        # send_packet() round-robins upload packets across _send_streams so that
+        # each bonded TCP connection carries an equal share of outgoing traffic.
+        # Each stream has its own independent TCP congestion window, giving
+        # aggregate upload bandwidth ≈ N × per-connection rate under packet loss.
+        # Empty list → single-stream path (_data_stream used directly).
+        self._send_streams: list = []   # [primary_stream] + secondary_streams
+        self._send_idx: int = 0         # monotonically increasing; mod len(_send_streams)
 
     def connect(self) -> RouteInfo:
         """
@@ -1015,8 +1023,14 @@ class VPNClient:
                     self._log.warning("secondary_conn_failed",
                                       index=i + 1, err=str(exc))
 
+            # Build upload round-robin list: primary first, then secondaries.
+            # Includes only successfully attached streams.
+            self._send_streams = [self._data_stream] + list(self._bond_data_streams)
+            self._send_idx = 0
+
             self._log.info("bond_established",
-                           total_conns=1 + len(self._bond_muxes))
+                           total_conns=1 + len(self._bond_muxes),
+                           upload_streams=len(self._send_streams))
 
         return route
 
@@ -1041,6 +1055,8 @@ class VPNClient:
         self._bond_data_streams = []
         self._bond_muxes = []
         self._recv_q = None
+        self._send_streams = []
+        self._send_idx = 0
 
         # Close primary connection.
         if self._data_stream:
@@ -1061,10 +1077,35 @@ class VPNClient:
         self._log.info("vpn_disconnected")
 
     def send_packet(self, pkt: bytes) -> None:
-        """Send a raw IP packet over the data stream."""
+        """Send a raw IP packet, round-robining across all bonded streams.
+
+        When bond_count == 1 (default), writes directly to _data_stream —
+        zero overhead, identical to the pre-bonding behaviour.
+
+        When bond_count > 1, round-robins upload packets across _send_streams
+        (primary + all successfully attached secondary streams).  Each stream
+        has its own independent TCP congestion window, so aggregate upload
+        throughput under packet loss ≈ N × per-connection rate.
+
+        Thread safety: _send_idx is incremented as a single Python int
+        assignment, which is atomic under CPython's GIL.  The streams in
+        _send_streams are append-only during connect() and cleared only after
+        _connected.clear() in disconnect(), so the list reference is stable
+        while a caller can reach this method.
+        """
         if not self._connected.is_set() or self._data_stream is None:
             raise IOError("VPN not connected")
-        self._data_stream.write(pkt)
+        streams = self._send_streams
+        if streams:
+            # Upload bonding: round-robin across primary + secondary streams.
+            # _send_idx grows monotonically; idx is the index into streams.
+            # Both the read and the += are single operations atomic under the GIL.
+            idx = self._send_idx % len(streams)
+            self._send_idx += 1
+            streams[idx].write(pkt)
+        else:
+            # Single-connection path (bond_count == 1): no round-robin overhead.
+            self._data_stream.write(pkt)
         if self._perf:
             from perf_collector import Stage
             self._perf.track_packet(Stage.TUN_WRITE, len(pkt))

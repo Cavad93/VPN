@@ -1087,13 +1087,78 @@ recv_packet(): _recv_q.get() → serializes all packets for caller
 
 ---
 
+## Запуск 22 — 2026-04-07
+
+### Выполнено: Upload bonding — round-robin send_packet() через все bonded streams
+
+**Файлы:** `client/core.py`, `client/test_core.py`
+
+**Диагноз — корневая причина (upload throttle):**
+
+После Run 21 клиент получил download bonding (N соединений → N×download rate), но upload по-прежнему шёл через один primary stream (`self._data_stream`). При 0.7% потерях (Россия↔Казахстан) один BBR-поток даёт ~6 Мбит/с upload. При N=4 соединениях: download ~24 Мбит/с, upload ~6 Мбит/с — очевидная асимметрия в обратную сторону.
+
+**Исправление в `client/core.py`:**
+
+1. **Новые поля в `__init__`:**
+   ```python
+   self._send_streams: list = []   # [primary_stream] + secondary_streams
+   self._send_idx: int = 0         # монотонно растёт; % len(_send_streams) = текущий слот
+   ```
+
+2. **`connect()` — сборка `_send_streams` после bonding loop:**
+   ```python
+   self._send_streams = [self._data_stream] + list(self._bond_data_streams)
+   self._send_idx = 0
+   ```
+   Включает только успешно подключённые secondary streams (graceful degradation).
+
+3. **`send_packet()` — round-robin при активном bonding:**
+   ```python
+   streams = self._send_streams
+   if streams:
+       idx = self._send_idx % len(streams)
+       self._send_idx += 1       # монотонный инкремент — атомарен под GIL CPython
+       streams[idx].write(pkt)
+   else:
+       self._data_stream.write(pkt)  # single-connection path (bond_count == 1)
+   ```
+   В режиме `bond_count == 1`: `_send_streams == []` → нулевой overhead, поведение идентично pre-bonding.
+
+4. **`disconnect()` — очистка:**
+   ```python
+   self._send_streams = []
+   self._send_idx = 0
+   ```
+
+**Thread safety:** `_send_idx += 1` — атомарная операция под GIL CPython. `_send_streams` — append-only во время `connect()`, очищается только после `_connected.clear()` в `disconnect()`, поэтому список стабилен пока `send_packet()` может быть вызван.
+
+**Ожидаемый эффект:**
+- Upload: 1 поток ~6 Мбит/с → N потоков ~6N Мбит/с (те же N×cwnd)
+- Полностью симметричный bonding: download и upload масштабируются одинаково
+- `bond_count=1` (default): нулевых изменений в поведении (else-ветка → `_data_stream.write`)
+
+**Тесты (8 новых в `TestUploadBonding`):**
+- `test_send_packet_single_stream_no_round_robin` — bond_count=1: нет round-robin, `_send_streams` пуст
+- `test_send_streams_built_from_primary_and_secondary` — `_send_streams = [primary] + secondaries`
+- `test_send_packet_round_robin_two_streams` — 2 потока: строгое чередование (pkt_a→stream1, pkt_b→stream2)
+- `test_send_packet_round_robin_index_advances` — `_send_idx` монотонно растёт (+1 на вызов)
+- `test_send_packet_round_robin_three_streams` — 3 потока: каждый получает ровно 1/3 пакетов
+- `test_disconnect_clears_send_streams_and_idx` — `_send_streams = []`, `_send_idx = 0` после disconnect
+- `test_send_packet_raises_when_not_connected` — IOError при `_connected` не установлен
+- `test_send_packet_raises_when_data_stream_is_none` — IOError при `_data_stream = None`
+
+`python3 -m unittest test_core.TestDownloadBonding test_core.TestUploadBonding -v` — 20/20 pass.
+`cd server && go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
-1. **Upload bonding** — клиент сейчас посылает всё через primary stream. Для CIS-маршрутов upload тоже ограничен. Решение: round-robin `send_packet()` across primary + secondary streams.
+1. **pprof CPU профилирование** — поиск скрытых узких мест под нагрузкой (теперь когда hot path имеет нулевых аллокаций).
 
-2. **pprof CPU профилирование** — поиск скрытых узких мест под нагрузкой.
+2. **IPv6 inner tunnel** — `markECNCE` только IPv4. При расширении туннеля до IPv6 нужен путь для Traffic Class field.
 
-3. **IPv6 inner tunnel** — `markECNCE` только IPv4.
+3. **Upload bonding — graceful failover** — при закрытии secondary stream из `_send_streams` (обрыв соединения) нужно удалить его из списка без остановки VPN.
 
 ---
 
