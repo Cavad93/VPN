@@ -330,10 +330,12 @@ def render(state: State, tel: TelState, base: str) -> None:
                f"{GRAY}r: обновить   q: выход{RESET}")
     out.append(BOLD + WHITE + "─" * width + RESET)
 
-    # Атомарная перерисовка в alternate screen buffer
-    buf = hide_cursor() + ESC + "[2J" + ESC + "[H"
-    for line in out:
-        buf += line + ESC + "[K\r\n"
+    # Абсолютное позиционирование — скролл невозможен физически
+    buf = hide_cursor()
+    for i, line in enumerate(out):
+        buf += ESC + f"[{i + 1};1H" + line + ESC + "[K"
+    # Очистить остаток экрана ниже последней строки
+    buf += ESC + f"[{len(out) + 1};1H" + ESC + "[J"
     sys.stdout.write(buf)
     sys.stdout.flush()
 
@@ -491,10 +493,12 @@ def main() -> None:
 
     time.sleep(1.5)  # ждём первого обновления
 
-    # Переключаемся в alternate screen buffer (отдельный экран, без скролла)
+    # Переключаемся в alternate screen buffer + сбрасываем экран
     if os.name != "nt":
-        sys.stdout.write(ESC + "[?1049h")
-        sys.stdout.flush()
+        sys.stdout.write(ESC + "[?1049h" + ESC + "[2J" + ESC + "[H")
+    else:
+        os.system("cls")
+    sys.stdout.flush()
 
     try:
         while True:
