@@ -332,15 +332,15 @@ def render(state: State, tel: TelState, base: str) -> None:
                f"{GRAY}r: обновить   q: выход{RESET}")
     out.append(BOLD + WHITE + "─" * width + RESET)
 
-    # Абсолютное позиционирование — обрезаем по высоте терминала
-    # чтобы ESC[N;1H никогда не выходил за пределы экрана
+    # Отключаем перенос строк — emoji и спецсимволы могут быть шире width
+    # и вызывать скролл при переносе. ESC[?7l = no-wrap, ESC[?7h = wrap back.
     visible = out[: height - 1]
-    buf = hide_cursor()
+    buf = hide_cursor() + ESC + "[?7l"          # disable line wrap
     for i, line in enumerate(visible):
         buf += ESC + f"[{i + 1};1H" + line + ESC + "[K"
-    # Очистить остаток экрана ниже последней строки
     if len(visible) < height:
         buf += ESC + f"[{len(visible) + 1};1H" + ESC + "[J"
+    buf += ESC + "[?7h"                          # restore line wrap
     sys.stdout.write(buf)
     sys.stdout.flush()
 
