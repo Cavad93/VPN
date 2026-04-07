@@ -841,34 +841,117 @@ lossRate := float64(cumulativeLost) / float64(total) // всегда > 2%
 
 ---
 
-## Следующие задачи (приоритетный бэклог)
+---
 
-1. **Защита от активного сканирования (заглушка/decoy page)**
-   Реализовать peek-and-route: если первые 5 байт не TLS record — подать HTTP decoy HTML; иначе пустить в ObfsConn/VPN.
-   *Файлы:* `server/main.go` (TCP accept loop), `server/transport/obfs.go`.
+## Запуск 19 — 2026-04-07
 
-2. **Асимметрия download < upload**
-   Баги на `claude/funny-tesla-8v2SV` (cumulative lostAtomic, per-round windowed loss rate) — проверить наличие в этой ветке; при необходимости cherry-pick.
+### Выполнено: Защита от активного сканирования — peek-and-route + nginx decoy page
 
-3. **pprof CPU профилирование** — поиск скрытых узких мест под нагрузкой.
+**Файлы:** `server/decoy.go` (новый), `server/decoy_test.go` (новый), `server/main.go`
 
-4. **IPv6 inner tunnel** — `markECNCE` только IPv4.
+**Задача:**
+Любой DPI/сканер, подключившийся на порт VPN-сервера без правильных VPN-заголовков, получал silent close или ошибку от ObfsConn. Это само по себе является детектируемым сигнатурным паттерном.
+
+**Решение: peek-and-route**
+
+Вместо того, чтобы передавать все соединения в `handleConn` напрямую, в `runTCP` добавлен промежуточный шаг:
+
+```
+TCP accept → peekAndRoute(conn) → {
+    first byte == 0x16  →  peekConn (byte replayed) → handleConn (VPN)
+    first byte != 0x16  →  serveHTTPDecoy → close
+}
+```
+
+**`peekAndRoute(conn net.Conn) (net.Conn, bool)`**
+- Устанавливает read deadline `decoyReadDeadline` (5 с) для чтения первого байта.
+- Если байт не пришёл (timeout/RST) — `conn.Close()`, возврат `(nil, false)`.
+- Если `first[0] == 0x16` (TLS Handshake record) — снимает deadline, возвращает `(peekConn{...}, true)`. Для `handleConn` всё прозрачно.
+- Иначе — вызывает `serveHTTPDecoy`, возвращает `(nil, false)`.
+
+**`peekConn`** — тонкая обёртка над `net.Conn`, которая «возвращает» уже прочитанный байт обратно в поток. Первый `Read` отдаёт сохранённый байт + продолжает чтение из wire. Последующие `Read` делегируются напрямую. Ноль heap-аллокаций в горячем пути VPN-клиента.
+
+**`serveHTTPDecoy(conn net.Conn)`**
+Отправляет реалистичный HTTP/1.1 400 ответ, имитирующий nginx 1.24.0:
+
+```
+HTTP/1.1 400 Bad Request
+Server: nginx/1.24.0
+Content-Type: text/html
+Content-Length: 221
+Connection: close
+
+<html>...<center>The plain HTTP request was sent to HTTPS port</center>...
+```
+
+Это дословно то, что возвращает реальный nginx при HTTP-запросе на HTTPS-порт.
+Write deadline = 2 с (не блокируем горутину на медленных сканерах).
+
+**Почему 0x16 как маркер VPN:**
+ObfsConn отправляет синтетический TLS ClientHello. TLS Handshake record всегда начинается с `content_type = 0x16`. Это единственный байт, который нужно проверить — никаких полных TLS-парсингов, никаких аллокаций.
+
+**Производительность:**
+- VPN-клиент: +1 `Read(1-byte)` syscall на установку соединения. Совершенно незначимо на фоне Noise_XX handshake (4–6 RTT).
+- Ложные срабатывания невозможны: ObfsConn.ClientHandshake гарантирует первый байт 0x16.
+
+**Тесты (16 новых):**
+- `TestPeekConnReplaysByte` — peeked byte присутствует в первом Read
+- `TestPeekConnOneByte` — Read(1-byte buf) возвращает только peeked byte
+- `TestPeekConnZeroLenBuffer` — Read(nil) не трогает peeked byte
+- `TestPeekConnUsedFlagAfterFirstRead` — флаг `used` устанавливается
+- `TestPeekConnSubsequentReadsGoThroughConn` — после consumed byte: делегация в Conn
+- `TestPeekAndRouteVPNClientPassesThrough` — 0x16 → (peeked conn, true)
+- `TestPeekAndRouteHTTPScannerGetsDecoyPage` — 'G' → (nil, false) + 400 response
+- `TestPeekAndRouteRawTCPScannerGetsDecoy` — 0x00 → (nil, false) + 400 response
+- `TestPeekAndRouteSilentlyClosesOnTimeout` — no data → graceful close без паники
+- `TestPeekAndRouteByte0x16IsOnlyVPNPath/0x00…0xFF` — 7 байт: все non-0x16 → decoy
+- `TestServeHTTPDecoyWritesValidHTTP` — все ожидаемые HTTP-строки присутствуют
+- `TestServeHTTPDecoyContentLengthMatchesBody` — Content-Length == len(body)
+- `TestDecoyHTTPResponseBodyLengthMatchesHeader` — самоконсистентность константы
+- `TestDecoyBodyLenConstant` — `decoyBodyLen == len(decoyHTTPBody)`
+
+**Результат:** `go test ./... -count=1` — все 8 пакетов зелёные.
 
 ---
 
-### Инструкция: настройка сервера с защитой API
+## Следующие задачи (приоритетный бэклог)
+
+1. **Асимметрия download < upload**
+   Баги на `claude/funny-tesla-8v2SV` (cumulative lostAtomic, per-round windowed loss rate) — проверить наличие в этой ветке; при необходимости cherry-pick.
+
+2. **pprof CPU профилирование** — поиск скрытых узких мест под нагрузкой.
+
+3. **IPv6 inner tunnel** — `markECNCE` только IPv4.
+
+---
+
+### Гайд: полная настройка сервера (API + Decoy)
 
 ```bash
-# Вариант 1: auto-generated token (не рекомендуется для продакшна — меняется при перезапуске)
-./vpnserver -addr 0.0.0.0:443 -api-addr 127.0.0.1:8080
-# Токен появится в stderr при старте. Сохраните его.
-
-# Вариант 2: явный токен (рекомендуется)
+# 1. Запуск с явным токеном (рекомендуется для продакшна)
 ./vpnserver -addr 0.0.0.0:443 -api-addr 127.0.0.1:8080 -api-token $(openssl rand -hex 32)
 
-# Использование API с токеном:
-curl -H "Authorization: Bearer <TOKEN>" http://127.0.0.1:8080/api/v1/sessions
-curl -H "X-API-Key: <TOKEN>" http://127.0.0.1:8080/api/v1/stats
+# 2. Запуск без токена — сервер сгенерирует случайный и напечатает в stderr
+./vpnserver -addr 0.0.0.0:443 -api-addr 127.0.0.1:8080
+# → stderr: "⚠ Auto-generated API TOKEN: <hex>"
 
-# Веб-дашборд: открыть http://127.0.0.1:8080 и ввести токен в поле "API Token"
+# --- Поведение порта 443 (VPN listen) ---
+# VPN клиент (первый байт 0x16): → ObfsConn → Noise_XX → VPN туннель
+# Сканер / curl / браузер:       → HTTP 400 "plain HTTP to HTTPS port" + close
+# Ничего не отправлено (5 с):   → silent close
+
+# Проверить decoy от сканера:
+curl -v http://YOUR_SERVER_IP:443/
+# Ожидаемый ответ: HTTP/1.1 400 Bad Request, Server: nginx/1.24.0
+
+# --- REST API (порт 8080, только localhost) ---
+# Сессии:
+curl -H "Authorization: Bearer <TOKEN>" http://127.0.0.1:8080/api/v1/sessions
+# Статистика:
+curl -H "X-API-Key: <TOKEN>" http://127.0.0.1:8080/api/v1/stats
+# Веб-дашборд: открыть http://127.0.0.1:8080, ввести токен в поле "API Token"
+
+# --- Проверка что API без токена → 401 ---
+curl -v http://127.0.0.1:8080/api/v1/sessions
+# Ожидаемый ответ: HTTP/1.1 401 Unauthorized
 ```

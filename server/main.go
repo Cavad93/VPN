@@ -289,7 +289,15 @@ func (s *Server) runTCP(ctx context.Context) error {
 			tc.SetKeepAlive(true)
 			tc.SetKeepAlivePeriod(15 * time.Second)
 		}
-		go s.handleConn(ctx, conn)
+		go func(c net.Conn) {
+			// Peek at the first byte to distinguish VPN clients from probes.
+			// TLS ClientHello starts with 0x16; anything else gets an HTTP decoy.
+			routed, ok := peekAndRoute(c)
+			if !ok {
+				return // decoy served + conn closed inside peekAndRoute
+			}
+			s.handleConn(ctx, routed)
+		}(conn)
 	}
 }
 
