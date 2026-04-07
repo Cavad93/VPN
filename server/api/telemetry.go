@@ -152,6 +152,34 @@ type ActionableConfig struct {
 }
 
 // ---------------------------------------------------------------------------
+// AI decision log — history of config changes made by the analyzer
+// ---------------------------------------------------------------------------
+
+// ConfigChange describes one parameter that AI changed.
+type ConfigChange struct {
+	Field    string `json:"field"`
+	OldValue any    `json:"old_value"`
+	NewValue any    `json:"new_value"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// ConfigDecision is one entry in the AI decision history.
+type ConfigDecision struct {
+	Timestamp   time.Time      `json:"timestamp"`
+	Changes     []ConfigChange `json:"changes"`      // what changed; empty if NoChange
+	Summary     string         `json:"summary"`      // AI one-liner
+	ReportCount int            `json:"report_count"` // how many reports were analyzed
+	NoChange    bool           `json:"no_change"`    // true when AI kept current config
+}
+
+// AppliedConfig is the currently-active configuration that AI chose.
+type AppliedConfig struct {
+	Config    ActionableConfig `json:"config"`
+	AppliedAt time.Time        `json:"applied_at"`
+	Reason    string           `json:"reason"` // short summary of why this config was chosen
+}
+
+// ---------------------------------------------------------------------------
 // Telemetry store (in-memory ring buffer)
 // ---------------------------------------------------------------------------
 
@@ -280,9 +308,20 @@ type TelemetryAnalyzer struct {
 	cancel   context.CancelFunc
 	done     chan struct{}
 	enabled  atomic.Bool // toggleable at runtime; true by default
+
 	// Optional: callbacks to get server-side data for enriching analysis.
 	GetServerPerf    func() *ServerPerfSummary
 	GetServerMetrics func() *ServerMetrics
+
+	// AI decision log — last 50 decisions in a ring buffer.
+	decMu      sync.RWMutex
+	decisions  [50]ConfigDecision
+	decPos     int
+	decFull    bool
+
+	// Currently applied config chosen by AI.
+	cfgMu      sync.RWMutex
+	appliedCfg AppliedConfig
 }
 
 // NewTelemetryAnalyzer creates an analyzer that runs every interval.
@@ -352,6 +391,12 @@ func (ta *TelemetryAnalyzer) runOnce(ctx context.Context) *AnalysisResult {
 			Summary:     "No telemetry reports received in the last analysis window.",
 		}
 		ta.store.SetAnalysis(result)
+		ta.recordDecision(ConfigDecision{
+			Timestamp:   result.Timestamp,
+			NoChange:    true,
+			Summary:     result.Summary,
+			ReportCount: 0,
+		})
 		return result
 	}
 
@@ -375,7 +420,110 @@ func (ta *TelemetryAnalyzer) runOnce(ctx context.Context) *AnalysisResult {
 		}
 	}
 	ta.store.SetAnalysis(result)
+
+	// Auto-apply the config recommended by AI.
+	ta.applyConfig(result)
+
 	return result
+}
+
+// applyConfig compares the new ActionableConfig with the current one,
+// records what changed in the decision log, and stores the new config.
+func (ta *TelemetryAnalyzer) applyConfig(result *AnalysisResult) {
+	if result == nil || result.ActionableConfig == nil {
+		return
+	}
+	newCfg := *result.ActionableConfig
+
+	ta.cfgMu.Lock()
+	old := ta.appliedCfg.Config
+	changes := diffConfig(old, newCfg)
+	ta.appliedCfg = AppliedConfig{
+		Config:    newCfg,
+		AppliedAt: result.Timestamp,
+		Reason:    result.Summary,
+	}
+	ta.cfgMu.Unlock()
+
+	dec := ConfigDecision{
+		Timestamp:   result.Timestamp,
+		Changes:     changes,
+		Summary:     result.Summary,
+		ReportCount: result.ReportCount,
+		NoChange:    len(changes) == 0,
+	}
+	ta.recordDecision(dec)
+}
+
+// diffConfig computes field-level differences between two ActionableConfig values.
+func diffConfig(old, new ActionableConfig) []ConfigChange {
+	var out []ConfigChange
+	if old.TransportMode != new.TransportMode && new.TransportMode != "" {
+		out = append(out, ConfigChange{Field: "transport_mode", OldValue: old.TransportMode, NewValue: new.TransportMode})
+	}
+	if old.BondCount != new.BondCount && new.BondCount != 0 {
+		out = append(out, ConfigChange{Field: "bond_count", OldValue: old.BondCount, NewValue: new.BondCount})
+	}
+	if old.MTU != new.MTU && new.MTU != 0 {
+		out = append(out, ConfigChange{Field: "mtu", OldValue: old.MTU, NewValue: new.MTU})
+	}
+	if old.PaddingMode != new.PaddingMode && new.PaddingMode != "" {
+		out = append(out, ConfigChange{Field: "padding_mode", OldValue: old.PaddingMode, NewValue: new.PaddingMode})
+	}
+	if old.PaddingEnabled != new.PaddingEnabled {
+		out = append(out, ConfigChange{Field: "padding_enabled", OldValue: old.PaddingEnabled, NewValue: new.PaddingEnabled})
+	}
+	if old.JitterMs != new.JitterMs {
+		out = append(out, ConfigChange{Field: "jitter_ms", OldValue: old.JitterMs, NewValue: new.JitterMs})
+	}
+	if old.RelayAddr != new.RelayAddr && new.RelayAddr != "" {
+		out = append(out, ConfigChange{Field: "relay_addr", OldValue: old.RelayAddr, NewValue: new.RelayAddr})
+	}
+	return out
+}
+
+// recordDecision appends a decision to the ring buffer.
+func (ta *TelemetryAnalyzer) recordDecision(d ConfigDecision) {
+	ta.decMu.Lock()
+	defer ta.decMu.Unlock()
+	ta.decisions[ta.decPos] = d
+	ta.decPos++
+	if ta.decPos >= 50 {
+		ta.decPos = 0
+		ta.decFull = true
+	}
+}
+
+// Decisions returns the last n decisions in chronological order.
+func (ta *TelemetryAnalyzer) Decisions(n int) []ConfigDecision {
+	ta.decMu.RLock()
+	defer ta.decMu.RUnlock()
+	total := ta.decPos
+	if ta.decFull {
+		total = 50
+	}
+	if n <= 0 || n > total {
+		n = total
+	}
+	if n == 0 {
+		return nil
+	}
+	out := make([]ConfigDecision, n)
+	start := ta.decPos - n
+	if start < 0 {
+		start += 50
+	}
+	for i := 0; i < n; i++ {
+		out[i] = ta.decisions[(start+i)%50]
+	}
+	return out
+}
+
+// CurrentApplied returns the config that AI most recently applied.
+func (ta *TelemetryAnalyzer) CurrentApplied() AppliedConfig {
+	ta.cfgMu.RLock()
+	defer ta.cfgMu.RUnlock()
+	return ta.appliedCfg
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +949,10 @@ func (a *APIServer) SetTelemetryStore(ts *TelemetryStore, analyzer *TelemetryAna
 	a.mux.HandleFunc("POST /api/v1/telemetry/analyze", a.auth(a.handleTriggerAnalysis))
 	// Get actionable config from latest analysis — no auth (clients poll this every 5 min).
 	a.mux.HandleFunc("GET /api/v1/telemetry/config", a.handleGetTelemetryConfig)
+	// Get currently applied config (what AI chose) — no auth.
+	a.mux.HandleFunc("GET /api/v1/telemetry/config/applied", a.handleGetAppliedConfig)
+	// AI decision history — auth required.
+	a.mux.HandleFunc("GET /api/v1/telemetry/decisions", a.auth(a.handleGetDecisions))
 	// AI enable/disable toggle — auth required.
 	a.mux.HandleFunc("GET /api/v1/telemetry/ai", a.auth(a.handleGetAIStatus))
 	a.mux.HandleFunc("POST /api/v1/telemetry/ai", a.auth(a.handleSetAIStatus))
@@ -933,6 +1085,38 @@ func (a *APIServer) handleTriggerAnalysis(w http.ResponseWriter, r *http.Request
 	}
 	result := a.telemetryAnalyzer.RunOnce(r.Context())
 	writeJSON(w, http.StatusOK, result)
+}
+
+// handleGetAppliedConfig returns the config that AI most recently applied.
+// Clients poll this to know what settings are currently active.
+func (a *APIServer) handleGetAppliedConfig(w http.ResponseWriter, _ *http.Request) {
+	if a.telemetryAnalyzer == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{})
+		return
+	}
+	writeJSON(w, http.StatusOK, a.telemetryAnalyzer.CurrentApplied())
+}
+
+// handleGetDecisions returns the AI decision history (last N decisions).
+func (a *APIServer) handleGetDecisions(w http.ResponseWriter, r *http.Request) {
+	if a.telemetryAnalyzer == nil {
+		writeJSON(w, http.StatusOK, []ConfigDecision{})
+		return
+	}
+	n := 20
+	if v := r.URL.Query().Get("limit"); v != "" {
+		fmt.Sscanf(v, "%d", &n)
+		if n < 1 {
+			n = 1
+		} else if n > 50 {
+			n = 50
+		}
+	}
+	decisions := a.telemetryAnalyzer.Decisions(n)
+	if decisions == nil {
+		decisions = []ConfigDecision{}
+	}
+	writeJSON(w, http.StatusOK, decisions)
 }
 
 // remoteIP extracts the client IP from the request.
