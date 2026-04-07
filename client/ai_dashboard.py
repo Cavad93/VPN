@@ -194,6 +194,9 @@ class State:
         # Step 3: generated command
         self.new_cmd: str     = ""          # new cavadvpn command to run
         self.new_cmd_reason: str = ""       # why AI suggests this command
+        # Step 4: history view mode
+        self.view_mode: str   = "main"      # "main" or "history"
+        self.all_decisions: list = []       # up to 50 decisions from server
 
     def set_status(self, msg: str):
         self.status_msg  = msg
@@ -226,14 +229,83 @@ def _wrap(text: str, width: int, indent: int = 5) -> list[str]:
         lines.append(line)
     return lines or [""]
 
+def render_history(state: State, width: int, height: int) -> None:
+    """Полноэкранный просмотр истории решений AI."""
+    out: list[str] = []
+    sep = BOLD + WHITE + "─" * width + RESET
+
+    out.append(sep)
+    total = len(state.all_decisions)
+    out.append(BOLD + WHITE +
+               f"  История решений AI  ({total} записей)  ──  h: назад  q: выход"
+               + RESET)
+    out.append(sep)
+    out.append("")
+
+    if not state.all_decisions:
+        out.append(f"  {GRAY}Решений пока нет. AI запустит анализ через час.{RESET}")
+    else:
+        # Показываем от новых к старым
+        for d in reversed(state.all_decisions):
+            ts       = _fmt_ts(d.get("timestamp", ""))
+            cnt      = d.get("report_count", 0)
+            changes  = d.get("changes") or []
+            summary  = d.get("summary", "")
+            no_chg   = d.get("no_change", False) or not changes
+
+            if no_chg:
+                out.append(f"  {GRAY}{ts}  ·  {cnt} отч.  ·  без изменений{RESET}")
+            else:
+                out.append(f"  {YELLOW}{ts}{RESET}  ·  {CYAN}{cnt} отч.{RESET}")
+                for ch in changes:
+                    field = ch.get("field", "")
+                    old_v = ch.get("old_value", "—")
+                    new_v = ch.get("new_value", "—")
+                    out.append(f"    {BOLD}{field}:{RESET}  "
+                               f"{GRAY}{old_v}{RESET} → {GREEN}{BOLD}{new_v}{RESET}")
+
+            # Краткое резюме AI (первые 120 символов)
+            if summary and not no_chg:
+                short = summary[:width - 6].rstrip()
+                out.append(f"    {GRAY}{short}{RESET}")
+
+            out.append("")  # пустая строка между записями
+
+    # Футер приклеен к низу
+    FOOTER = 3
+    footer = [sep,
+              f"  {GRAY}h — вернуться на главный экран   q — выход{RESET}",
+              sep]
+    body      = out
+    body_rows = max(0, height - FOOTER - 1)
+    visible   = body[:body_rows]
+
+    buf = hide_cursor() + ESC + "[?7l"
+    for i, line in enumerate(visible):
+        buf += ESC + f"[{i + 1};1H" + line + ESC + "[K"
+    for row in range(len(visible) + 1, height - FOOTER + 1):
+        buf += ESC + f"[{row};1H" + ESC + "[K"
+    for j, line in enumerate(footer):
+        buf += ESC + f"[{height - FOOTER + j};1H" + line + ESC + "[K"
+    buf += ESC + "[?7h"
+    sys.stdout.write(buf)
+    sys.stdout.flush()
+
+
 def render(state: State, tel: TelState, base: str) -> None:
-    now_str = datetime.now().strftime("%H:%M:%S")
     try:
         ts = os.get_terminal_size()
         width  = max(ts.columns, 70)
         height = ts.lines
     except Exception:
         width, height = 80, 24
+
+    # Step 4: переключение в режим истории
+    if state.view_mode == "history":
+        render_history(state, width, height)
+        return
+
+    now_str = datetime.now().strftime("%H:%M:%S")
     out: list[str] = []
 
     # ── Заголовок ──
@@ -393,10 +465,10 @@ def render(state: State, tel: TelState, base: str) -> None:
 
     # ── Нижняя панель ──
     out.append(BOLD + WHITE + "─" * width + RESET)
-    ai_key = f"{GREEN}a: ВЫКЛ AI" if state.ai_enabled else f"{YELLOW}a: ВКЛ AI"
-    cmd_key = f"   {GREEN}c: скопировать команду{RESET}" if state.new_cmd else ""
+    ai_key  = f"{GREEN}a: ВЫКЛ AI" if state.ai_enabled else f"{YELLOW}a: ВКЛ AI"
+    cmd_key = f"   {GREEN}c: копировать{RESET}" if state.new_cmd else ""
     out.append(f"  {ai_key}{RESET}   {CYAN}t: анализ{RESET}   "
-               f"{GRAY}r: обновить   q: выход{RESET}{cmd_key}")
+               f"{GRAY}h: история   r: обновить   q: выход{RESET}{cmd_key}")
     out.append(BOLD + WHITE + "─" * width + RESET)
 
     # Нижняя панель (3 строки) всегда приклеена к низу экрана.
@@ -476,9 +548,10 @@ def fetch_loop(base: str, token: str, state: State, interval: int,
             pass
 
         try:
-            decs = _req("GET", f"{base}/api/v1/telemetry/decisions?limit=5", token)
+            decs = _req("GET", f"{base}/api/v1/telemetry/decisions?limit=50", token)
             if isinstance(decs, list):
-                state.decisions = decs
+                state.all_decisions = decs
+                state.decisions     = decs[-5:]   # compact view: last 5
         except APIError:
             pass
 
@@ -691,6 +764,8 @@ def main() -> None:
                 ok = copy_to_clipboard(state.new_cmd)
                 state.set_status("Команда скопирована в буфер обмена ✓" if ok
                                  else "Не удалось скопировать (pbcopy/xclip не найден)")
+            elif key == "h":
+                state.view_mode = "history" if state.view_mode == "main" else "main"
     except KeyboardInterrupt:
         pass
     finally:
