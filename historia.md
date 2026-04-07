@@ -748,3 +748,50 @@ const maxAcksPerRound = int(int64(bottleneckBps) * int64(rtt) / int64(time.Secon
 7. **firstSentAt vs sentAt** — документировано; не баг.
 
 8. **pprof профилирование под нагрузкой** — для поиска скрытых узких мест. Теперь горячий путь (send + receive) имеет нулевых аллокаций — следующий шаг: CPU profiling для runtime overhead (GC sweep, mutex scheduling, syscall).
+
+---
+
+### Запуск 17: Исправление cumulative lostAtomic bug — входящая скорость 3.73 Мбит/с
+
+**Наблюдаемые метрики:** входящая=3.73 Мбит/с, исходящая=10.76 Мбит/с, RTT=102 мс
+
+**Диагноз — корневая причина:**
+
+`inflightTracker.lostAtomic` накапливался за всё время жизни соединения и никогда не сбрасывался. `BBRState.OnLoss` использовал этот кумулятивный счётчик для расчёта `lossRate`:
+
+```go
+cumulativeLost := s.inflight.LostBytes()           // растёт бесконечно
+total := windowBytes + cumulativeLost
+lossRate := float64(cumulativeLost) / float64(total) // всегда > 2%
+```
+
+Математика фиксации cwnd:
+1. Начальный seed BBR: 15 Мбит/с @ 65 мс RTT → cwnd=170 пакетов, pacingRate=15 Мбит/с
+2. Реальная пропускная способность upload: ~3.73 Мбит/с → первоначальная потеря ~75% пакетов
+3. `lostAtomic` ≈ 127 пакетов × 1430 байт = 181 КБ (и растёт)
+4. В стационарном режиме: `lossRate = 181 КБ / (94.4 КБ + 181 КБ) = 65.7%` → всегда > 2%
+5. → cwnd постоянно прижат к `minCwndPackets = 32`
+6. 32 × 1430 / 0.102 с = **3.58 Мбит/с** ≈ наблюдаемые 3.73 Мбит/с ✓
+
+**Исправление:**
+
+**`server/transport/bbr_inflight.go`** — добавлены per-round счётчики:
+- `roundLostAtomic atomic.Int64` — байты потерянные в текущем BBR-раунде
+- `roundDelivAtomic atomic.Int64` — байты доставленные (ACK) в текущем BBR-раунде
+- `OnACK` теперь инкрементирует `roundDelivAtomic`
+- `OnLoss` теперь инкрементирует `roundLostAtomic`
+- `ResetRound()` — сбрасывает оба счётчика (вызывается на границе раунда)
+- `RoundLostBytes()` / `RoundDeliveredBytes()` — атомарные геттеры
+- `Reset()` — теперь сбрасывает и per-round счётчики
+
+**`server/transport/bbr_state.go`** — два изменения:
+1. `OnACK`: добавлен вызов `s.inflight.ResetRound()` при `s.estimator.IsRoundStart()` — сброс счётчиков на границе каждого BBR-раунда
+2. `OnLoss`: вместо `cumulativeLost` используется `roundLost + roundDeliv` с guard `total < minSample` (minCwndPackets × mss) — игнорируем потери если выборка за раунд слишком мала
+
+**Эффект:** Теперь loss rate вычисляется только по пакетам текущего раунда (≈1 RTT окно). Начальный burst потерь не влияет на steady-state cwnd. BBR конвергирует к реальной пропускной способности вместо того, чтобы быть зафиксированным на floor 32 пакетов.
+
+**Тесты добавлены:**
+- `TestInflightRoundTracking` — проверяет ResetRound очищает per-round, не трогает cumulative
+- `TestInflightResetClearsRoundCounters` — проверяет Reset сбрасывает per-round счётчики
+
+`cd server && go test ./... -count=1` — все 8 пакетов зелёные.

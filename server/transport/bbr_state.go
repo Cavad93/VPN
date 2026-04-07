@@ -243,6 +243,14 @@ func (s *BBRState) OnACK(rtt time.Duration, ackedBytes int64, delivered int64, d
 		sentAt, appLimited,
 	)
 
+	// Reset per-round loss counters at each BBR round boundary so that
+	// OnLoss uses a windowed (not cumulative) loss rate. This prevents
+	// the initial packet loss burst from permanently inflating the loss
+	// estimate and pinning cwnd at minCwndPackets.
+	if s.estimator.IsRoundStart() {
+		s.inflight.ResetRound()
+	}
+
 	// Phase-specific logic.
 	switch s.phase {
 	case BBRStartup:
@@ -268,26 +276,32 @@ func (s *BBRState) OnACK(rtt time.Duration, ackedBytes int64, delivered int64, d
 // BBR does NOT halve cwnd on loss (unlike CUBIC/Reno). It only limits
 // cwnd when loss rate exceeds 2% (BBRv2 behavior).
 //
+// Loss rate is computed over the *current BBR round* (bytes lost / bytes
+// delivered+lost in this round), not cumulatively. This prevents old loss
+// bursts (e.g. from an overestimated initial bandwidth seed) from permanently
+// pinning cwnd at minCwndPackets.
+//
 // Parameters:
 //   - lostBytes: bytes in this loss event
 func (s *BBRState) OnLoss(lostBytes int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Compute loss rate over the current window: lost / (inflight + lost).
-	// We use cumulative inflight.LostBytes() for the lost side and
-	// the current cwndTarget as the window denominator.
-	cumulativeLost := s.inflight.LostBytes()
-	windowBytes := int64(s.cwndTarget) * int64(s.mss)
-	if windowBytes <= 0 {
-		windowBytes = int64(minCwndPackets) * int64(s.mss)
-	}
-	total := windowBytes + cumulativeLost
-	if total <= 0 {
+	// Compute loss rate over the current BBR round.
+	// roundLost and roundDeliv are reset at each round boundary (IsRoundStart).
+	roundLost := s.inflight.RoundLostBytes()
+	roundDeliv := s.inflight.RoundDeliveredBytes()
+	total := roundLost + roundDeliv
+
+	// Require a minimum sample size of one cwnd-worth of data before acting
+	// on the loss rate. This avoids triggering on a single stray loss at the
+	// very start of a round when the counters have just been reset.
+	minSample := int64(minCwndPackets) * int64(s.mss)
+	if total < minSample {
 		return
 	}
 
-	lossRate := float64(cumulativeLost) / float64(total)
+	lossRate := float64(roundLost) / float64(total)
 	if lossRate > 0.02 {
 		// High loss: limit cwnd. Use BDP if available, otherwise scale cwnd directly.
 		bdpBytes := s.estimator.BDP()

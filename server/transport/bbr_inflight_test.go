@@ -112,6 +112,50 @@ func TestInflightReset(t *testing.T) {
 	}
 }
 
+func TestInflightRoundTracking(t *testing.T) {
+	tr := newInflightTracker()
+	tr.OnSend(1400)
+	tr.OnSend(1400)
+	tr.OnSend(1400)
+
+	tr.OnACK(1400)
+	tr.OnLoss(1400)
+
+	if tr.RoundDeliveredBytes() != 1400 {
+		t.Fatalf("expected roundDeliv=1400, got %d", tr.RoundDeliveredBytes())
+	}
+	if tr.RoundLostBytes() != 1400 {
+		t.Fatalf("expected roundLost=1400, got %d", tr.RoundLostBytes())
+	}
+
+	// ResetRound clears per-round counters but not cumulative lostAtomic.
+	tr.ResetRound()
+	if tr.RoundDeliveredBytes() != 0 {
+		t.Fatalf("expected roundDeliv=0 after ResetRound, got %d", tr.RoundDeliveredBytes())
+	}
+	if tr.RoundLostBytes() != 0 {
+		t.Fatalf("expected roundLost=0 after ResetRound, got %d", tr.RoundLostBytes())
+	}
+	if tr.LostBytes() != 1400 {
+		t.Fatalf("expected cumulative lostBytes=1400 after ResetRound, got %d", tr.LostBytes())
+	}
+}
+
+func TestInflightResetClearsRoundCounters(t *testing.T) {
+	tr := newInflightTracker()
+	tr.OnSend(1400)
+	tr.OnACK(700)
+	tr.OnLoss(700)
+
+	tr.Reset()
+	if tr.RoundDeliveredBytes() != 0 {
+		t.Fatalf("expected roundDeliv=0 after Reset, got %d", tr.RoundDeliveredBytes())
+	}
+	if tr.RoundLostBytes() != 0 {
+		t.Fatalf("expected roundLost=0 after Reset, got %d", tr.RoundLostBytes())
+	}
+}
+
 func TestInflightConcurrent(t *testing.T) {
 	tr := newInflightTracker()
 	done := make(chan struct{})
