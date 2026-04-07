@@ -1347,6 +1347,84 @@ t.Cleanup(func() { setDecoyReadDeadline(orig) })
 
 ---
 
+## Запуск 26 — 2026-04-07
+
+### Выполнено: Relay mode — прозрачный TCP-ретранслятор с decoy-защитой
+
+**Файлы:** `server/relay.go` (новый), `server/relay_test.go` (новый), `server/main.go`
+
+**Задача:**
+Реализовать схему MacBook → СПб-relay → Астана-VPN. СПб-сервер не терминирует VPN-протокол, а прозрачно пробрасывает байты к Астане. При этом decoy-защита от активного сканирования работает на СПб так же, как на полном VPN-сервере.
+
+**Архитектура:**
+```
+MacBook ──[TLS+Noise+Mux]──► СПб :443
+    peekAndRoute (первый байт)
+    0x16 → dial Астана:8443, bidirectional pipe
+    other → HTTP 400 nginx decoy + close
+                              СПб ──[raw TCP]──► Астана:8443
+                                                   VPN терминируется здесь
+```
+
+**`server/relay.go`:**
+- `runRelay(ctx, listenAddr, relayTarget, logger)` — TCP listener с теми же socket options что у `runTCP` (SO_SNDBUF/SO_RCVBUF=4MB, TCP_NODELAY, keepalive 15s, TFO, DEFER_ACCEPT)
+- `relayOne(client, target, logger)` — одно соединение: peekAndRoute → dial upstream → bidirectional `io.Copy` → close both sides
+- `relayDialTimeout = 10s` — таймаут на подключение к Астане (переопределяем в тестах)
+- `relayPipeTimeout = 5 min` — дедлайн на idle pipe (защита от zombie соединений)
+
+**`server/main.go`:**
+- Новый флаг `-relay-to <host:port>`
+- Если задан: ранний выход ДО открытия TUN / создания Server / запуска API. Relay запускается в минимальной конфигурации (только `applySysctls()` + `runRelay`)
+
+**Ключевые свойства:**
+- Протокол-агностик: relay не знает ни о Noise, ни о Mux, ни о BBR — пробрасывает raw bytes
+- End-to-end шифрование сохранено: MacBook ↔ Астана Noise_XX хэндшейк полный
+- decoy на СПб идентичен: nginx 1.24.0 400 Bad Request для сканеров
+- Нет TUN, нет IP-пула, нет ключевых пар на СПб — минимальная атакуемая поверхность
+- Bonding (64 параллельных TCP) работает: каждое bond-соединение проходит через `relayOne` независимо
+
+**Тесты (4 новых):**
+- `TestRelayForwardsVPNConnection` — байт 0x16 → данные доходят до upstream echo-сервера
+- `TestRelayServesDecoyForNonVPNProbe` — HTTP GET → 400 nginx decoy, upstream не получает ничего
+- `TestRelayClosesConnectionWhenUpstreamUnreachable` — upstream недоступен → relay закрывает клиента gracefully
+- `TestRelayNonVPNBytesNeverReachUpstream` — probe байт 0x00 → upstream вообще не получает соединения
+
+`go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+### Гайд: схема MacBook → СПб relay → Астана VPN
+
+#### Астана (основной VPN-сервер, без изменений)
+```powershell
+cavad-vpn.exe -addr 0.0.0.0:8443 -tun-cidr 10.8.0.1/24 -transport tcp -api-addr 127.0.0.1:8080 -api-token "ТОКЕН"
+```
+
+#### СПб (relay-сервер, Linux)
+```bash
+# Сборка
+cd /opt/cavadvpn/repo/server
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o /usr/local/bin/cavad-relay .
+
+# Запуск (relay на порт 443, пробрасывает к Астане)
+cavad-relay -addr 0.0.0.0:443 -relay-to АСТАНА_IP:8443
+```
+
+Для СПб:
+- **НЕ нужен** TUN-интерфейс и IP-маршрутизация
+- **НЕ нужен** wintun.dll
+- **НЕ нужны** ключевые пары
+- Decoy работает автоматически: `curl http://СПБ_IP:443/` → `HTTP/1.1 400 nginx/1.24.0`
+
+#### MacBook (клиент, подключается к СПб)
+```bash
+sudo cavadvpn -server СПБ_IP:443 -transport tcp -bonds 64
+```
+
+Итоговый IP будет — **Астана** (VPN терминируется там).
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **IPv6 inner tunnel** — `markECNCE` только IPv4. При расширении туннеля до IPv6 нужен путь для Traffic Class field.

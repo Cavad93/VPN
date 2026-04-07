@@ -1401,6 +1401,7 @@ func main() {
 
 	var vlessAddr, vlessCert, vlessKey, vlessPath string
 	var anthropicKey string
+	var relayTo string
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
 	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
 	flag.StringVar(&cfg.PrivKeyFile, "privkey", cfg.PrivKeyFile, "path to hex-encoded private key file")
@@ -1412,6 +1413,7 @@ func main() {
 	flag.StringVar(&vlessKey, "vless-key", "key.pem", "TLS private key file for VLESS")
 	flag.StringVar(&vlessPath, "vless-path", "/tunnel", "WebSocket path for VLESS")
 	flag.StringVar(&anthropicKey, "anthropic-key", "", "Anthropic API key for telemetry analysis (or ANTHROPIC_API_KEY env)")
+	flag.StringVar(&relayTo, "relay-to", "", "relay VPN traffic to this upstream address (e.g. 193.124.93.240:8443); disables local VPN termination")
 	flag.Parse()
 
 	// Anthropic API key: flag takes precedence, then environment variable.
@@ -1436,6 +1438,23 @@ func main() {
 	// Verify BBR is actually loaded — a missing tcp_bbr module silently
 	// falls back to CUBIC, causing 10× worse throughput on lossy links.
 	verifyBBR(logger)
+
+	// ── Relay mode ────────────────────────────────────────────────────────────
+	// When -relay-to is set the process acts as a transparent TCP relay:
+	// it does NOT open a TUN device or run any VPN logic locally.
+	// Active-probe protection (peek-and-route / decoy) is still applied so the
+	// SPb relay is indistinguishable from a normal HTTPS server to scanners.
+	if relayTo != "" {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		logger.Info("starting in relay mode", "listen", cfg.ListenAddr, "upstream", relayTo)
+		if err := runRelay(ctx, cfg.ListenAddr, relayTo, logger); err != nil {
+			logger.Error("relay error", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+	// ── End relay mode ────────────────────────────────────────────────────────
 
 	tun, err := OpenTun("vpn0")
 	if err != nil {
