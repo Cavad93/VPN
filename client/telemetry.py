@@ -96,6 +96,14 @@ class TelemetryReport:
     memory_mb: float = 0.0
     battery_percent: int = 0
 
+    # Transport & bypass info (sent to server for AI bypass/speed analysis)
+    sni_host: str = ""                # SNI cover domain used in this session
+    transport_mode: str = ""          # "udp" or "tcp"
+    bond_count: int = 0               # TCP parallel bonds (0 = N/A)
+    padding_mode: str = ""            # "none", "light", "balanced", "paranoid"
+    handshake_attempts: int = 0       # attempts before successful connect (>1 = DPI reset)
+    isp_name: str = ""                # detected ISP/carrier name
+
 
 def _detect_platform() -> str:
     """Return normalized platform name."""
@@ -220,6 +228,9 @@ class TelemetryConfig:
     send_timeout: float = 10.0
     app_version: str = "1.0.0"
     device_id: str = ""  # auto-generated if empty
+    # Callback invoked when a new ActionableConfig arrives from the server.
+    # Signature: on_config_update(config: dict) -> None
+    on_config_update: Optional[Callable] = None
 
 
 class TelemetryCollector:
@@ -247,6 +258,15 @@ class TelemetryCollector:
         self._bytes_in = 0
         self._bytes_out = 0
         self._prev_bytes_in = 0
+        # Transport & bypass state (set externally).
+        self._sni_host = ""
+        self._transport_mode = ""
+        self._bond_count = 0
+        self._padding_mode = ""
+        self._handshake_attempts = 0
+        self._isp_name = ""
+        # Last actionable config received from server (for change detection).
+        self._last_config_hash = ""
         self._prev_bytes_out = 0
         self._prev_sample_time = 0.0
         self._reconnect_count = 0
@@ -299,6 +319,38 @@ class TelemetryCollector:
         with self._lock:
             self._dpi_detected = True
 
+    def set_transport_info(
+        self,
+        transport_mode: str = "",
+        bond_count: int = 0,
+        sni_host: str = "",
+        padding_mode: str = "",
+    ) -> None:
+        """Update transport/bypass metadata sent with each telemetry report."""
+        with self._lock:
+            if transport_mode:
+                self._transport_mode = transport_mode
+            self._bond_count = bond_count
+            if sni_host:
+                self._sni_host = sni_host
+            if padding_mode:
+                self._padding_mode = padding_mode
+
+    def record_handshake_attempt(self) -> None:
+        """Increment handshake attempt counter (call on each failed attempt)."""
+        with self._lock:
+            self._handshake_attempts += 1
+
+    def reset_handshake_attempts(self) -> None:
+        """Reset attempt counter after a successful connect."""
+        with self._lock:
+            self._handshake_attempts = 0
+
+    def set_isp_name(self, isp: str) -> None:
+        """Set detected ISP/carrier name for DPI correlation."""
+        with self._lock:
+            self._isp_name = isp
+
     # -- Lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
@@ -333,7 +385,7 @@ class TelemetryCollector:
     # -- Internal ----------------------------------------------------------
 
     def _run_loop(self) -> None:
-        """Background loop: collect and send at interval."""
+        """Background loop: collect and send at interval, then poll for config updates."""
         # Initial delay: let VPN connect first.
         self._stop_event.wait(30)
 
@@ -341,6 +393,8 @@ class TelemetryCollector:
             try:
                 report = self._collect()
                 self._send(report)
+                # After each send, check if the server has a new ActionableConfig.
+                self._fetch_and_apply_config()
             except Exception as e:
                 self._log.warning("telemetry_error", error=str(e))
             self._stop_event.wait(self._config.collect_interval)
@@ -458,6 +512,13 @@ class TelemetryCollector:
                 dns_resolve_ms=dns_ms,
                 download_speed_kbps=download_kbps,
                 upload_speed_kbps=upload_kbps,
+                # Transport & bypass fields
+                sni_host=self._sni_host,
+                transport_mode=self._transport_mode,
+                bond_count=self._bond_count,
+                padding_mode=self._padding_mode,
+                handshake_attempts=self._handshake_attempts,
+                isp_name=self._isp_name,
             )
 
         return report
@@ -485,6 +546,50 @@ class TelemetryCollector:
         except Exception as e:
             self._log.warning("telemetry_send_error", error=str(e))
             return False
+
+    def _fetch_and_apply_config(self) -> None:
+        """Poll /api/v1/telemetry/config for AI-generated ActionableConfig.
+
+        Calls on_config_update callback when a new (changed) config arrives.
+        This runs after every telemetry send (~every 5 minutes), so the client
+        automatically picks up bypass and speed recommendations within one cycle
+        after the hourly AI analysis completes.
+        """
+        if not self._config.on_config_update:
+            return  # no consumer registered
+
+        url = self._config.server_url.rstrip("/") + "/api/v1/telemetry/config"
+        try:
+            req = urllib.request.Request(url, method="GET")
+            resp = urllib.request.urlopen(req, timeout=self._config.send_timeout)
+            raw = resp.read()
+            resp.close()
+
+            if not raw or raw == b"{}":
+                return  # no config yet
+
+            config = json.loads(raw)
+            if not config:
+                return
+
+            # Only fire callback when the config actually changed.
+            import hashlib as _hl
+            config_hash = _hl.md5(raw).hexdigest()
+            if config_hash == self._last_config_hash:
+                return
+
+            self._last_config_hash = config_hash
+            self._log.info("telemetry_config_updated",
+                           transport=config.get("transport_mode"),
+                           padding=config.get("padding_mode"),
+                           sni_count=len(config.get("sni_hosts") or []))
+            try:
+                self._config.on_config_update(config)
+            except Exception as e:
+                self._log.warning("telemetry_config_callback_error", error=str(e))
+
+        except Exception as e:
+            self._log.debug("telemetry_config_fetch_error", error=str(e))
 
 
 # ---------------------------------------------------------------------------

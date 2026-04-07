@@ -83,6 +83,14 @@ type TelemetryReport struct {
 	CPUPercent    float64 `json:"cpu_percent,omitempty"`     // app CPU usage
 	MemoryMB      float64 `json:"memory_mb,omitempty"`       // app memory usage
 	BatteryPercent int    `json:"battery_percent,omitempty"` // device battery level
+
+	// Transport & bypass info (new fields for AI bypass/speed analysis)
+	SNIHost           string `json:"sni_host,omitempty"`           // SNI cover domain used in this session
+	TransportMode     string `json:"transport_mode,omitempty"`     // "udp" or "tcp"
+	BondCount         int    `json:"bond_count,omitempty"`         // TCP parallel bonds (0 = N/A)
+	PaddingMode       string `json:"padding_mode,omitempty"`       // "none", "light", "balanced", "paranoid"
+	HandshakeAttempts int    `json:"handshake_attempts,omitempty"` // attempts before successful connect (>1 = DPI reset)
+	ISPName           string `json:"isp_name,omitempty"`           // detected ISP / carrier for DPI correlation
 }
 
 // AnalysisResult is the output of AI-powered telemetry analysis.
@@ -92,7 +100,13 @@ type AnalysisResult struct {
 	DeviceCount  int                `json:"device_count"`   // unique devices
 	Summary      string             `json:"summary"`        // human-readable summary
 	Issues       []DiagnosticIssue  `json:"issues"`         // detected problems
-	Recommendations []string        `json:"recommendations"` // suggested actions
+	Recommendations []string        `json:"recommendations"` // backward-compat general actions
+
+	// Focused AI analysis results
+	BypassRecommendations []BypassRecommendation `json:"bypass_recommendations,omitempty"`
+	SpeedRecommendations  []SpeedRecommendation  `json:"speed_recommendations,omitempty"`
+	ActionableConfig      *ActionableConfig      `json:"actionable_config,omitempty"` // auto-applicable settings
+
 	RawPrompt    string             `json:"raw_prompt,omitempty"` // the prompt sent to AI (debug)
 	RawResponse  string             `json:"raw_response,omitempty"` // raw AI response (debug)
 	Error        string             `json:"error,omitempty"` // if analysis failed
@@ -104,6 +118,35 @@ type DiagnosticIssue struct {
 	Category    string   `json:"category"`     // "latency", "packet_loss", "throughput", "dpi", "connection"
 	Description string   `json:"description"`  // human-readable description
 	AffectedDevices []string `json:"affected_devices,omitempty"` // device IDs
+}
+
+// BypassRecommendation is a single actionable DPI-bypass recommendation.
+type BypassRecommendation struct {
+	Priority    int                    `json:"priority"`              // 1=urgent, 2=recommended, 3=optional
+	Action      string                 `json:"action"`                // "rotate_sni", "enable_padding", "switch_transport", "add_relay", "increase_jitter"
+	Description string                 `json:"description"`           // human-readable explanation
+	Config      map[string]interface{} `json:"config,omitempty"`      // action-specific parameters
+}
+
+// SpeedRecommendation is a single actionable speed optimization.
+type SpeedRecommendation struct {
+	Priority     int                    `json:"priority"`
+	ExpectedGain string                 `json:"expected_gain"`         // e.g. "20-40% throughput increase"
+	Action       string                 `json:"action"`                // "switch_to_udp", "increase_bonds", "reduce_mtu", "switch_to_tcp"
+	Description  string                 `json:"description"`
+	Config       map[string]interface{} `json:"config,omitempty"`
+}
+
+// ActionableConfig is a machine-readable config the client can auto-apply without manual intervention.
+type ActionableConfig struct {
+	TransportMode  string   `json:"transport_mode,omitempty"` // "udp" or "tcp"
+	BondCount      int      `json:"bond_count,omitempty"`     // TCP parallel bonds (0 = default)
+	MTU            int      `json:"mtu,omitempty"`            // packet MTU (0 = default)
+	SNIHosts       []string `json:"sni_hosts,omitempty"`      // SNI cover domains to rotate through
+	PaddingEnabled bool     `json:"padding_enabled"`          // enable traffic padding
+	PaddingMode    string   `json:"padding_mode,omitempty"`   // "light", "balanced", "paranoid"
+	JitterMs       int      `json:"jitter_ms,omitempty"`      // inter-packet timing jitter in ms (0 = off)
+	RelayAddr      string   `json:"relay_addr,omitempty"`     // suggest relay hop if direct path is blocked
 }
 
 // ---------------------------------------------------------------------------
@@ -390,25 +433,31 @@ func SonnetAnalyze(ctx context.Context, reports []TelemetryReport, apiKey string
 }
 
 // buildAnalysisPrompt creates the prompt for Sonnet from telemetry data.
+// It produces a two-task analysis: (a) DPI bypass, (b) speed optimization.
 func buildAnalysisPrompt(reports []TelemetryReport, serverPerf *ServerPerfSummary, serverMetrics *ServerMetrics) string {
 	// Aggregate per-device stats.
 	type deviceStats struct {
-		Platform       string
-		ReportCount    int
-		AvgPingMs      float64
-		MaxPingMs      float64
-		AvgLossPercent float64
-		MaxLossPercent float64
-		AvgThroughIn   float64
-		AvgThroughOut  float64
-		Reconnects     int
-		DPIDetected    int
-		TLSErrors      int
-		AvgDNSMs       float64
-		AvgDownloadKbps float64
-		AvgUploadKbps  float64
-		NetworkTypes   map[string]int
-		States         map[string]int
+		Platform          string
+		ReportCount       int
+		AvgPingMs         float64
+		MaxPingMs         float64
+		AvgLossPercent    float64
+		MaxLossPercent    float64
+		AvgThroughIn      float64
+		AvgThroughOut     float64
+		Reconnects        int
+		DPIDetected       int
+		TLSErrors         int
+		AvgDNSMs          float64
+		AvgDownloadKbps   float64
+		AvgUploadKbps     float64
+		NetworkTypes      map[string]int
+		States            map[string]int
+		TransportModes    map[string]int
+		SNIHosts          map[string]int
+		PaddingModes      map[string]int
+		MaxHandshakeAttempts int
+		ISPs              map[string]int
 	}
 
 	devices := make(map[string]*deviceStats)
@@ -416,9 +465,13 @@ func buildAnalysisPrompt(reports []TelemetryReport, serverPerf *ServerPerfSummar
 		ds, ok := devices[r.DeviceID]
 		if !ok {
 			ds = &deviceStats{
-				Platform:     r.Platform,
-				NetworkTypes: make(map[string]int),
-				States:       make(map[string]int),
+				Platform:       r.Platform,
+				NetworkTypes:   make(map[string]int),
+				States:         make(map[string]int),
+				TransportModes: make(map[string]int),
+				SNIHosts:       make(map[string]int),
+				PaddingModes:   make(map[string]int),
+				ISPs:           make(map[string]int),
 			}
 			devices[r.DeviceID] = ds
 		}
@@ -443,6 +496,23 @@ func buildAnalysisPrompt(reports []TelemetryReport, serverPerf *ServerPerfSummar
 		ds.AvgUploadKbps += r.UploadSpeedKbps
 		ds.NetworkTypes[r.NetworkType]++
 		ds.States[r.ConnectionState]++
+		if r.TransportMode != "" {
+			ds.TransportModes[r.TransportMode]++
+		}
+		if r.SNIHost != "" {
+			ds.SNIHosts[r.SNIHost]++
+		}
+		mode := r.PaddingMode
+		if mode == "" {
+			mode = "none"
+		}
+		ds.PaddingModes[mode]++
+		if r.HandshakeAttempts > ds.MaxHandshakeAttempts {
+			ds.MaxHandshakeAttempts = r.HandshakeAttempts
+		}
+		if r.ISPName != "" {
+			ds.ISPs[r.ISPName]++
+		}
 	}
 
 	// Compute averages.
@@ -453,13 +523,9 @@ func buildAnalysisPrompt(reports []TelemetryReport, serverPerf *ServerPerfSummar
 			ds.AvgThroughIn /= float64(ds.ReportCount)
 			ds.AvgThroughOut /= float64(ds.ReportCount)
 			ds.AvgDNSMs /= float64(ds.ReportCount)
-			// Speed tests run less frequently; average only non-zero values.
 			downloadCount := 0.0
 			uploadCount := 0.0
 			for _, r := range reports {
-				if r.DeviceID == "" {
-					continue
-				}
 				if r.DownloadSpeedKbps > 0 {
 					downloadCount++
 				}
@@ -476,73 +542,165 @@ func buildAnalysisPrompt(reports []TelemetryReport, serverPerf *ServerPerfSummar
 		}
 	}
 
-	prompt := "You are a VPN network diagnostics expert. Analyze the following telemetry data from CavadVPN clients and identify causes of slow connections or connectivity issues.\n\n"
-	prompt += "## VPN Architecture\n"
-	prompt += "Protocol: Noise_XX handshake + ChaCha20-Poly1305 encryption over TLS-obfuscated TCP.\n"
-	prompt += "Transport: TCP with TLS 1.3 obfuscation wrapper (anti-DPI). Mux multiplexing over single connection.\n"
-	prompt += "Server location: Russia (may be subject to DPI/throttling by ISP or РКН).\n\n"
+	// --- Compute bypass signals across all devices ---
+	totalDPI := 0
+	totalTLSErrors := 0
+	totalReconnects := 0
+	totalHandshakeAttempts := 0
+	for _, ds := range devices {
+		totalDPI += ds.DPIDetected
+		totalTLSErrors += ds.TLSErrors
+		totalReconnects += ds.Reconnects
+		totalHandshakeAttempts += ds.MaxHandshakeAttempts
+	}
 
-	prompt += fmt.Sprintf("## Telemetry Summary (%d reports from %d devices, last hour)\n\n", len(reports), len(devices))
+	prompt := "You are an expert VPN security engineer specializing in DPI bypass and performance optimization.\n"
+	prompt += "The VPN is operated in Russia and must evade Roskomnadzor (РКН) deep packet inspection.\n\n"
+
+	prompt += "## System Architecture\n"
+	prompt += "- Protocol: Noise_XX handshake + ChaCha20-Poly1305 end-to-end encryption\n"
+	prompt += "- Obfuscation: TLS 1.3-like record framing (anti-DPI), SNI spoofing with cover domains\n"
+	prompt += "- Transport: UDP+BBR (default) or TCP with N parallel bonds\n"
+	prompt += "- Topology: Client → [optional SPb relay] → Astana VPN server\n"
+	prompt += "- Active-probe protection: non-TLS probes get nginx 400 decoy response\n\n"
+
+	prompt += fmt.Sprintf("## Telemetry Window: %d reports from %d devices\n\n", len(reports), len(devices))
 
 	for id, ds := range devices {
 		shortID := id
 		if len(shortID) > 8 {
 			shortID = shortID[:8]
 		}
-		prompt += fmt.Sprintf("### Device %s (%s) — %d reports\n", shortID, ds.Platform, ds.ReportCount)
-		prompt += fmt.Sprintf("- Avg ping: %.1f ms, Max ping: %.1f ms\n", ds.AvgPingMs, ds.MaxPingMs)
-		prompt += fmt.Sprintf("- Avg packet loss: %.2f%%, Max: %.2f%%\n", ds.AvgLossPercent, ds.MaxLossPercent)
-		prompt += fmt.Sprintf("- Avg throughput: ↓%.1f kbps, ↑%.1f kbps\n", ds.AvgThroughIn, ds.AvgThroughOut)
-		prompt += fmt.Sprintf("- Reconnects: %d, DPI detections: %d, TLS errors: %d\n", ds.Reconnects, ds.DPIDetected, ds.TLSErrors)
-		prompt += fmt.Sprintf("- Avg DNS resolve: %.1f ms\n", ds.AvgDNSMs)
-		if ds.AvgDownloadKbps > 0 || ds.AvgUploadKbps > 0 {
-			prompt += fmt.Sprintf("- Speed test: ↓%.0f kbps, ↑%.0f kbps\n", ds.AvgDownloadKbps, ds.AvgUploadKbps)
+		prompt += fmt.Sprintf("### Device %s (%s)\n", shortID, ds.Platform)
+		prompt += fmt.Sprintf("- Avg/max ping: %.1f / %.1f ms\n", ds.AvgPingMs, ds.MaxPingMs)
+		prompt += fmt.Sprintf("- Avg/max packet loss: %.2f%% / %.2f%%\n", ds.AvgLossPercent, ds.MaxLossPercent)
+		prompt += fmt.Sprintf("- Avg throughput: ↓%.1f kbps ↑%.1f kbps\n", ds.AvgThroughIn, ds.AvgThroughOut)
+		prompt += fmt.Sprintf("- Reconnects: %d, DPI flags: %d/%d, TLS errors: %d\n",
+			ds.Reconnects, ds.DPIDetected, ds.ReportCount, ds.TLSErrors)
+		if ds.MaxHandshakeAttempts > 1 {
+			prompt += fmt.Sprintf("- Max handshake attempts before success: %d (>1 indicates DPI reset)\n", ds.MaxHandshakeAttempts)
+		}
+		prompt += fmt.Sprintf("- DNS: %.1f ms\n", ds.AvgDNSMs)
+		if ds.AvgDownloadKbps > 0 {
+			prompt += fmt.Sprintf("- Speed test: ↓%.0f kbps ↑%.0f kbps\n", ds.AvgDownloadKbps, ds.AvgUploadKbps)
 		}
 		prompt += fmt.Sprintf("- Network types: %v\n", ds.NetworkTypes)
-		prompt += fmt.Sprintf("- Connection states: %v\n\n", ds.States)
-	}
-
-	// Server-side performance data.
-	if serverPerf != nil {
-		prompt += "## Server Per-Layer Latency (P95, microseconds)\n\n"
-		prompt += fmt.Sprintf("- TLS obfuscation write: %.0f µs, read: %.0f µs\n", serverPerf.ObfsWriteP95Us, serverPerf.ObfsReadP95Us)
-		prompt += fmt.Sprintf("- Noise encrypt: %.0f µs, decrypt: %.0f µs\n", serverPerf.NoiseEncryptP95Us, serverPerf.NoiseDecryptP95Us)
-		prompt += fmt.Sprintf("- Mux write: %.0f µs, read: %.0f µs\n", serverPerf.MuxWriteP95Us, serverPerf.MuxReadP95Us)
-		prompt += fmt.Sprintf("- TUN write: %.0f µs, read: %.0f µs\n", serverPerf.TunWriteP95Us, serverPerf.TunReadP95Us)
-		prompt += fmt.Sprintf("- Full ingress (socket→TUN): %.0f µs, egress (TUN→socket): %.0f µs\n", serverPerf.FullIngressP95Us, serverPerf.FullEgressP95Us)
-		prompt += fmt.Sprintf("- Handshake mean: %.0f µs\n", serverPerf.HandshakeMeanUs)
-		prompt += fmt.Sprintf("- TCP retransmits: %d, lost segments: %d, cwnd: %d segs\n", serverPerf.RetransmitCount, serverPerf.TCPLostSegs, serverPerf.TCPCwndSegs)
-		if serverPerf.TCPRTTUs > 0 {
-			prompt += fmt.Sprintf("- TCP RTT: %d µs (%.1f ms)\n", serverPerf.TCPRTTUs, float64(serverPerf.TCPRTTUs)/1000)
+		prompt += fmt.Sprintf("- States: %v\n", ds.States)
+		if len(ds.TransportModes) > 0 {
+			prompt += fmt.Sprintf("- Transports: %v\n", ds.TransportModes)
+		}
+		if len(ds.SNIHosts) > 0 {
+			prompt += fmt.Sprintf("- SNI hosts used: %v\n", ds.SNIHosts)
+		}
+		if len(ds.PaddingModes) > 0 {
+			prompt += fmt.Sprintf("- Padding modes: %v\n", ds.PaddingModes)
+		}
+		if len(ds.ISPs) > 0 {
+			prompt += fmt.Sprintf("- ISPs: %v\n", ds.ISPs)
 		}
 		prompt += "\n"
 	}
 
-	// Server resource usage.
-	if serverMetrics != nil {
-		prompt += "## Server Resources\n\n"
-		prompt += fmt.Sprintf("- CPU: %.1f%%\n", serverMetrics.CPUPercent)
-		prompt += fmt.Sprintf("- Memory (RSS): %.1f MB, Heap: %.1f MB\n", serverMetrics.MemoryMB, serverMetrics.HeapAllocMB)
-		prompt += fmt.Sprintf("- Goroutines: %d\n", serverMetrics.NumGoroutines)
-		prompt += fmt.Sprintf("- GC pauses: %.0f µs, total cycles: %d\n", serverMetrics.GCPauseUs, serverMetrics.NumGC)
-		prompt += fmt.Sprintf("- Uptime: %.0f sec\n\n", serverMetrics.UptimeSec)
+	// DPI bypass signal summary
+	prompt += "## DPI / Block Signals (Aggregated)\n"
+	prompt += fmt.Sprintf("- Total DPI detection flags: %d\n", totalDPI)
+	prompt += fmt.Sprintf("- Total TLS errors: %d\n", totalTLSErrors)
+	prompt += fmt.Sprintf("- Total reconnects: %d\n", totalReconnects)
+	if totalHandshakeAttempts > len(devices) {
+		prompt += fmt.Sprintf("- Elevated handshake attempts (sum): %d — indicates active connection resets\n", totalHandshakeAttempts)
+	}
+	prompt += "\n"
+
+	// Server-side performance data.
+	if serverPerf != nil {
+		prompt += "## Server Per-Layer Latency (P95, microseconds)\n"
+		prompt += fmt.Sprintf("- Obfs write/read: %.0f / %.0f µs\n", serverPerf.ObfsWriteP95Us, serverPerf.ObfsReadP95Us)
+		prompt += fmt.Sprintf("- Noise encrypt/decrypt: %.0f / %.0f µs\n", serverPerf.NoiseEncryptP95Us, serverPerf.NoiseDecryptP95Us)
+		prompt += fmt.Sprintf("- Mux write/read: %.0f / %.0f µs\n", serverPerf.MuxWriteP95Us, serverPerf.MuxReadP95Us)
+		prompt += fmt.Sprintf("- TUN write/read: %.0f / %.0f µs\n", serverPerf.TunWriteP95Us, serverPerf.TunReadP95Us)
+		prompt += fmt.Sprintf("- Full ingress/egress: %.0f / %.0f µs\n", serverPerf.FullIngressP95Us, serverPerf.FullEgressP95Us)
+		prompt += fmt.Sprintf("- Handshake mean: %.0f µs\n", serverPerf.HandshakeMeanUs)
+		prompt += fmt.Sprintf("- TCP retransmits: %d, cwnd: %d segs\n", serverPerf.RetransmitCount, serverPerf.TCPCwndSegs)
+		if serverPerf.TCPRTTUs > 0 {
+			prompt += fmt.Sprintf("- TCP RTT: %.1f ms\n", float64(serverPerf.TCPRTTUs)/1000)
+		}
+		prompt += "\n"
 	}
 
-	prompt += `## Instructions
-Analyze the data above and identify the bottleneck causing slow VPN speed.
-Consider: DPI throttling, server CPU/memory, encryption overhead, obfuscation latency, TCP retransmits, packet loss, network jitter, congestion window.
-Respond with EXACTLY this JSON structure (no markdown, no extra text):
+	if serverMetrics != nil {
+		prompt += "## Server Resources\n"
+		prompt += fmt.Sprintf("- CPU: %.1f%%, Memory RSS: %.1f MB, Heap: %.1f MB\n",
+			serverMetrics.CPUPercent, serverMetrics.MemoryMB, serverMetrics.HeapAllocMB)
+		prompt += fmt.Sprintf("- Goroutines: %d, GC pauses: %.0f µs\n\n",
+			serverMetrics.NumGoroutines, serverMetrics.GCPauseUs)
+	}
+
+	prompt += `## Your Task
+
+Perform TWO analyses and produce ONE unified JSON response:
+
+### Task 1 — DPI Bypass Analysis
+Identify signs of ISP/РКН interference and recommend specific bypass actions.
+Key signals: high reconnects (>3/hour = DPI resets), dpi_detected flags, TLS errors, handshake_attempts > 1.
+Bypass action options (use exact action names):
+- "rotate_sni"      → config: {"sni_hosts": ["youtube.com", "google.com", "apple.com"]}  (3–5 cover domains)
+- "enable_padding"  → config: {"padding_mode": "balanced", "jitter_ms": 15}
+- "switch_transport"→ config: {"transport_mode": "udp"} or {"transport_mode": "tcp", "bond_count": 64}
+- "increase_jitter" → config: {"jitter_ms": 20}
+- "add_relay"       → config: {"relay_addr": "suggest adding SPb relay hop"}
+
+### Task 2 — Speed Optimization
+Identify the primary throughput bottleneck and recommend the single highest-impact change.
+Bottleneck hierarchy: packet_loss > server_latency > transport_mode > bond_count > MTU.
+Speed action options (use exact action names):
+- "switch_to_udp"    → config: {"transport_mode": "udp", "mtu": 1400}           (best for low-loss links)
+- "switch_to_tcp"    → config: {"transport_mode": "tcp", "bond_count": 64}      (best for high-loss/CIS links)
+- "increase_bonds"   → config: {"bond_count": 128}                               (more TCP bonds)
+- "reduce_mtu"       → config: {"mtu": 1300}                                     (for fragmented links)
+- "reduce_padding"   → config: {"padding_mode": "light"}                         (reduce overhead)
+
+### actionable_config
+Synthesize the TOP bypass + speed recommendations into ONE actionable_config object the client will auto-apply.
+Only include fields that differ from current baseline. Do NOT include relay_addr unless direct path is clearly blocked.
+
+Respond with EXACTLY this JSON (no markdown, no extra text):
 {
-  "summary": "One paragraph overview of the network health and bottleneck location",
+  "summary": "One paragraph: overall network health, DPI risk level, and primary speed bottleneck.",
   "issues": [
     {
       "severity": "critical|warning|info",
-      "category": "latency|packet_loss|throughput|dpi|connection|obfuscation|server_resources|tcp",
-      "description": "Description of the issue with specific numbers",
+      "category": "dpi|connection|throughput|latency|packet_loss|obfuscation|server_resources",
+      "description": "Issue description with specific numbers from the data above.",
       "affected_devices": ["device_id_prefix"]
     }
   ],
-  "recommendations": ["Specific action item 1", "Specific action item 2"]
+  "recommendations": ["General action 1", "General action 2"],
+  "bypass_recommendations": [
+    {
+      "priority": 1,
+      "action": "rotate_sni",
+      "description": "Why this helps bypass DPI in this specific case.",
+      "config": {"sni_hosts": ["youtube.com", "google.com"]}
+    }
+  ],
+  "speed_recommendations": [
+    {
+      "priority": 1,
+      "expected_gain": "30-50% throughput increase",
+      "action": "switch_to_udp",
+      "description": "Why this improves speed based on the observed metrics.",
+      "config": {"transport_mode": "udp", "mtu": 1400}
+    }
+  ],
+  "actionable_config": {
+    "transport_mode": "udp",
+    "bond_count": 0,
+    "mtu": 1400,
+    "sni_hosts": ["youtube.com", "google.com"],
+    "padding_enabled": true,
+    "padding_mode": "balanced",
+    "jitter_ms": 10
+  }
 }
 `
 	return prompt
@@ -557,16 +715,22 @@ func parseAnalysisResponse(text string, reportCount int) *AnalysisResult {
 
 	// Try direct JSON parse.
 	var parsed struct {
-		Summary         string            `json:"summary"`
-		Issues          []DiagnosticIssue `json:"issues"`
-		Recommendations []string          `json:"recommendations"`
+		Summary               string                `json:"summary"`
+		Issues                []DiagnosticIssue     `json:"issues"`
+		Recommendations       []string              `json:"recommendations"`
+		BypassRecommendations []BypassRecommendation `json:"bypass_recommendations"`
+		SpeedRecommendations  []SpeedRecommendation  `json:"speed_recommendations"`
+		ActionableConfig      *ActionableConfig      `json:"actionable_config"`
 	}
 
 	if err := json.Unmarshal([]byte(text), &parsed); err == nil {
 		result.Summary = parsed.Summary
 		result.Issues = parsed.Issues
 		result.Recommendations = parsed.Recommendations
-		// Count unique devices.
+		result.BypassRecommendations = parsed.BypassRecommendations
+		result.SpeedRecommendations = parsed.SpeedRecommendations
+		result.ActionableConfig = parsed.ActionableConfig
+		// Count unique devices from issues.
 		deviceSet := make(map[string]struct{})
 		for _, issue := range parsed.Issues {
 			for _, d := range issue.AffectedDevices {
@@ -599,6 +763,8 @@ func (a *APIServer) SetTelemetryStore(ts *TelemetryStore, analyzer *TelemetryAna
 	a.mux.HandleFunc("GET /api/v1/telemetry/analysis", a.auth(a.handleGetAnalysis))
 	// Trigger immediate analysis — auth required.
 	a.mux.HandleFunc("POST /api/v1/telemetry/analyze", a.auth(a.handleTriggerAnalysis))
+	// Get actionable config from latest analysis — no auth (clients poll this every 5 min).
+	a.mux.HandleFunc("GET /api/v1/telemetry/config", a.handleGetTelemetryConfig)
 }
 
 // handleSubmitTelemetry receives a telemetry report from a client.
@@ -655,6 +821,22 @@ func (a *APIServer) handleListTelemetry(w http.ResponseWriter, r *http.Request) 
 		reports = []TelemetryReport{}
 	}
 	writeJSON(w, http.StatusOK, reports)
+}
+
+// handleGetTelemetryConfig returns only the ActionableConfig from the latest analysis.
+// Clients poll this endpoint every 5 minutes to auto-apply bypass/speed improvements.
+// No authentication required — the config contains no secrets.
+func (a *APIServer) handleGetTelemetryConfig(w http.ResponseWriter, _ *http.Request) {
+	if a.telemetryStore == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{})
+		return
+	}
+	analysis := a.telemetryStore.LastAnalysis()
+	if analysis == nil || analysis.ActionableConfig == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{})
+		return
+	}
+	writeJSON(w, http.StatusOK, analysis.ActionableConfig)
 }
 
 // handleGetAnalysis returns the latest AI analysis.
