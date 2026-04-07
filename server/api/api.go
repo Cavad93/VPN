@@ -173,6 +173,9 @@ func (a *APIServer) registerRoutes() {
 	// Client auto-update — GET is public so headless clients can poll freely.
 	a.mux.HandleFunc("GET /api/v1/client/version", a.handleGetClientVersion)
 	a.mux.HandleFunc("POST /api/v1/client/version", a.auth(a.handleSetClientVersion))
+
+	// Runtime profiling — all routes behind auth.
+	a.RegisterPprofRoutes()
 }
 
 // ---------------------------------------------------------------------------

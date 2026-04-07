@@ -1209,11 +1209,91 @@ else:
 
 ---
 
+## Запуск 24 — 2026-04-07
+
+### Выполнено: pprof CPU профилирование — /debug/pprof/ за Bearer-токеном
+
+**Файлы:** `server/api/pprof_api.go` (новый), `server/api/pprof_api_test.go` (новый), `server/api/api.go`
+
+**Задача:**
+Hot path имеет нулевых heap-аллокаций после Запусков 9–15. Следующий уровень оптимизации —
+CPU profiling под нагрузкой: где конкретно уходит CPU time в runtime (GC sweep, goroutine scheduling, syscall latency, mutex contention остатки).
+
+**Решение:**
+
+Зарегистрированы все стандартные Go pprof endpoints (`net/http/pprof`) в API mux за существующим Bearer-токен auth middleware:
+
+```
+GET  /debug/pprof/             — индекс доступных профилей
+GET  /debug/pprof/cmdline      — аргументы командной строки процесса
+GET  /debug/pprof/profile      — CPU profile (?seconds=N, default 30)
+GET  /debug/pprof/symbol       — символьная таблица для адресов
+POST /debug/pprof/symbol       — bulk lookup (go tool pprof протокол)
+GET  /debug/pprof/trace        — execution trace (?seconds=N, default 1)
+GET  /debug/pprof/{name}       — именованные профили: heap, goroutine,
+                                  allocs, mutex, block, threadcreate
+```
+
+**Детали реализации:**
+
+- Blank import `_ "net/http/pprof"` регистрирует хэндлеры в `http.DefaultServeMux`.
+- `RegisterPprofRoutes()` проксирует все `/debug/pprof/` запросы туда через `a.auth(http.DefaultServeMux.ServeHTTP)`.
+- Catch-all `GET /debug/pprof/` — method-qualified паттерн, чтобы не конфликтовать с `GET /` дашборда (Go 1.22 ServeMux pattern conflict rules).
+- `POST /debug/pprof/symbol` — явный маршрут для bulk symbol resolution от `go tool pprof`.
+
+**Безопасность:**
+- API server уже слушает на `127.0.0.1:8080` (только loopback), поэтому pprof endpoint недоступен из внешней сети.
+- Дополнительно защищён Bearer-токеном — defence in depth для shared hosting / container environments.
+- Без токена → `401 Unauthorized` (проверено тестами).
+
+**Тесты (16 новых):**
+- `TestPprof*_RequiresAuth` (7 тестов) — каждый path возвращает 401 без токена
+- `TestPprofIndex_AuthedReturns200` — index страница содержит goroutine/heap/allocs
+- `TestPprofCmdline_AuthedReturns200`, `TestPprofHeap_AuthedReturnsNonEmptyBinary`, `TestPprofGoroutine_AuthedReturnsNonEmptyBinary`, `TestPprofAllocs_AuthedReturns200`, `TestPprofSymbol_AuthedReturns200`
+- `TestPprofIndex_XAPIKeyGrantsAccess` — X-API-Key header тоже работает
+- `TestPprofIndex_WrongToken401` — неверный токен → 401
+- `TestPprofIndex_EmptyToken_ServesOK` — пустой токен (dev mode) → 200
+
+`go test ./api/ -run TestPprof -v` — 16/16 PASS.
+`go test ./... -count=1` — 7/8 пакетов зелёные; 2 падения в пакете `server` — pre-existing flakiness в `decoy_test.go` (race при параллельных тестах; в изоляции `-count=3` стабильно PASS).
+
+**Использование (с живым сервером):**
+
+```bash
+TOKEN="$(./vpnserver -print-token)"  # или из stderr при старте
+
+# CPU profile — 30 секунд под нагрузкой
+curl -s -H "Authorization: Bearer $TOKEN" \
+     "http://127.0.0.1:8080/debug/pprof/profile?seconds=30" -o cpu.prof
+go tool pprof -http=:8090 cpu.prof
+
+# Heap snapshot — что живёт в памяти
+curl -s -H "Authorization: Bearer $TOKEN" \
+     "http://127.0.0.1:8080/debug/pprof/heap" -o heap.prof
+go tool pprof -http=:8090 heap.prof
+
+# Goroutine dump — стеки всех горутин
+curl -s -H "Authorization: Bearer $TOKEN" \
+     "http://127.0.0.1:8080/debug/pprof/goroutine?debug=1"
+
+# Execution trace — 5 секунд timeline
+curl -s -H "Authorization: Bearer $TOKEN" \
+     "http://127.0.0.1:8080/debug/pprof/trace?seconds=5" -o trace.out
+go tool trace trace.out
+
+# Alloc profile — что аллоцируется (должно быть минимум после оптимизаций 9-15)
+curl -s -H "Authorization: Bearer $TOKEN" \
+     "http://127.0.0.1:8080/debug/pprof/allocs" -o allocs.prof
+go tool pprof -http=:8090 allocs.prof
+```
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
-1. **pprof CPU профилирование** — поиск скрытых узких мест под нагрузкой (теперь когда hot path имеет нулевых аллокаций).
+1. **IPv6 inner tunnel** — `markECNCE` только IPv4. При расширении туннеля до IPv6 нужен путь для Traffic Class field.
 
-2. **IPv6 inner tunnel** — `markECNCE` только IPv4. При расширении туннеля до IPv6 нужен путь для Traffic Class field.
+2. **pprof под нагрузкой** — ~~ДОБАВЛЕНО~~ (Запуск 24). Следующий шаг: реально проанализировать профили при 30 Mbps нагрузке и найти CPU hotspots.
 
 ---
 
