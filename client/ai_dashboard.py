@@ -176,15 +176,21 @@ def telemetry_loop(base: str, token: str, vpn_host: str, vpn_port: int,
 
 class State:
     def __init__(self):
-        self.lock          = threading.Lock()
-        self.server_ok     = False
+        self.lock             = threading.Lock()
+        self.server_ok        = False
         self.ai_enabled: bool | None = None
-        self.report_count  = 0
+        self.report_count     = 0
         self.last_report_time = ""
-        self.analysis: dict = {}
-        self.error         = ""
-        self.status_msg    = ""
-        self.status_time   = 0.0
+        self.analysis: dict   = {}
+        self.error            = ""
+        self.status_msg       = ""
+        self.status_time      = 0.0
+        # Step 2: applied config + decision log
+        self.applied: dict    = {}          # current config AI chose
+        self.prev_applied: dict = {}        # previous config (for diff highlight)
+        self.decisions: list  = []          # last N decisions from server
+        self.config_changed   = False       # flash flag when config changes
+        self.config_change_t  = 0.0        # time of last change (for flash duration)
 
     def set_status(self, msg: str):
         self.status_msg  = msg
@@ -325,6 +331,54 @@ def render(state: State, tel: TelState, base: str) -> None:
                            f"{iss.get('description','')[:width-22]}")
             out.append("")
 
+    # ── Применённый конфиг (что AI выбрал) ──
+    cfg = state.applied
+    if cfg:
+        prev = state.prev_applied
+        flash = state.config_changed and (time.monotonic() - state.config_change_t < 10)
+        hdr_color = GREEN + BOLD if flash else BOLD
+        out.append(f"  {hdr_color}{'★ КОНФИГ ОБНОВЛЁН  ' if flash else ''}Активный конфиг AI:{RESET}")
+        cfg_fields = [
+            ("transport", cfg.get("transport_mode")),
+            ("bonds",     cfg.get("bond_count") or None),
+            ("mtu",       cfg.get("mtu") or None),
+            ("padding",   cfg.get("padding_mode")),
+            ("jitter",    f"{cfg.get('jitter_ms')} ms" if cfg.get("jitter_ms") else None),
+            ("sni",       cfg.get("sni_hosts", [None])[0] if cfg.get("sni_hosts") else None),
+        ]
+        row = "   "
+        for name, val in cfg_fields:
+            if val is None:
+                continue
+            old_val = None
+            if name == "transport":
+                old_val = prev.get("transport_mode")
+            elif name == "padding":
+                old_val = prev.get("padding_mode")
+            changed = prev and old_val is not None and old_val != val
+            col = GREEN if changed else CYAN
+            row += f"{col}{name}:{RESET}{BOLD}{val}{RESET}  "
+        out.append(row)
+        out.append("")
+
+    # ── История решений AI ──
+    decs = state.decisions
+    if decs:
+        out.append(f"  {BOLD}История решений AI:{RESET}")
+        for d in reversed(decs[-4:]):   # последние 4, от новых к старым
+            ts  = _fmt_ts(d.get("timestamp", ""))
+            cnt = d.get("report_count", 0)
+            changes = d.get("changes") or []
+            if d.get("no_change") or not changes:
+                out.append(f"   {GRAY}{ts}  без изменений  ({cnt} отч.){RESET}")
+            else:
+                parts = []
+                for ch in changes:
+                    parts.append(f"{ch.get('field')} {GRAY}{ch.get('old_value','?')}{RESET}"
+                                 f"→{GREEN}{ch.get('new_value','?')}{RESET}")
+                out.append(f"   {YELLOW}{ts}{RESET}  " + "  ".join(parts))
+        out.append("")
+
     # ── Нижняя панель ──
     out.append(BOLD + WHITE + "─" * width + RESET)
     ai_key = f"{GREEN}a: ВЫКЛ AI" if state.ai_enabled else f"{YELLOW}a: ВКЛ AI"
@@ -389,6 +443,25 @@ def fetch_loop(base: str, token: str, state: State, interval: int) -> None:
             if data and "timestamp" in data:
                 state.analysis = data
                 state.report_count = data.get("report_count", state.report_count)
+        except APIError:
+            pass
+
+        # Step 2: fetch applied config + decision history
+        try:
+            applied = _req("GET", f"{base}/api/v1/telemetry/config/applied", "") or {}
+            cfg = applied.get("config") or applied  # server wraps in {config:…}
+            if cfg and cfg != state.applied:
+                state.prev_applied  = state.applied
+                state.applied       = cfg
+                state.config_changed = True
+                state.config_change_t = time.monotonic()
+        except APIError:
+            pass
+
+        try:
+            decs = _req("GET", f"{base}/api/v1/telemetry/decisions?limit=5", token)
+            if isinstance(decs, list):
+                state.decisions = decs
         except APIError:
             pass
 
