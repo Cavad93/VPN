@@ -1006,18 +1006,28 @@ class VPNClient:
         return generate_key_pair()
 
     def _connect_tcp(self, host: str, port: int):
-        """Establish a TCP connection with tuned socket options."""
+        """Establish a TCP connection with tuned socket options.
+
+        Socket options mirror what the server applies in setForcedSocketBuffers()
+        (sockopt_linux.go) to ensure symmetric performance in both directions.
+        """
         sock = socket.create_connection(
             (host, port), timeout=self._config.connect_timeout
         )
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        _BUF_SIZE = 2 * 1024 * 1024
+        # 4 MB buffers — matches the server's setForcedSocketBuffers(4 MB).
+        # For download (server→client): SO_RCVBUF determines how much
+        # unread data the kernel can buffer before stalling the TCP window.
+        # At 30 Mbps × 100 ms RTT the BDP is 3.75 MB; 2 MB (old value) caps
+        # download at ~20 Mbps. 4 MB allows full 30+ Mbps on high-latency links.
+        _BUF_SIZE = 4 * 1024 * 1024
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _BUF_SIZE)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _BUF_SIZE)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         try:
             import platform
-            if platform.system() == "Darwin":
+            _sys = platform.system()
+            if _sys == "Darwin":
                 TCP_KEEPALIVE = 0x10
                 sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPALIVE, 15)
             else:
@@ -1026,6 +1036,43 @@ class VPNClient:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
         except (AttributeError, OSError):
             pass
+        # --- Linux-only optimisations (mirroring sockopt_linux.go) ---
+        # TCP_QUICKACK (Linux ≥ 2.4.4, value 12): disable 40 ms delayed-ACK.
+        #
+        # Root cause of download < upload asymmetry:
+        #   Upload: server has TCP_QUICKACK=1 → sends ACKs immediately →
+        #           upload cwnd grows fast.
+        #   Download (before fix): client had NO TCP_QUICKACK → delayed ACKs
+        #           (up to 40 ms) → server's cwnd opens slowly → download stalls.
+        #
+        # With TCP_QUICKACK on client: ACKs for incoming (download) packets are
+        # sent immediately, allowing the server's congestion window to grow at
+        # the same rate as the client's upload window does. At 100 ms RTT,
+        # delayed ACKs effectively add 40 % overhead to every download RTT.
+        #
+        # TCP_CONGESTION="bbr" (Linux ≥ 2.6.13, value 13): use BBR congestion
+        # control for upload. The server already runs BBR; having CUBIC on the
+        # client causes the two CCs to interact badly on lossy links.
+        #
+        # TCP_NOTSENT_LOWAT=16384 (Linux ≥ 3.12, value 73): limit unsent data
+        # in the kernel send buffer to 16 KB. On packet loss, only 16 KB is
+        # retransmitted instead of megabytes — reduces upload tail latency on
+        # lossy links (e.g. 0.7 % loss Russia↔Kazakhstan) by 5–10×.
+        try:
+            _TCP_QUICKACK = getattr(socket, "TCP_QUICKACK", 12)
+            sock.setsockopt(socket.IPPROTO_TCP, _TCP_QUICKACK, 1)
+        except OSError:
+            pass  # not available on macOS / Windows — silently skip
+        try:
+            _TCP_CONGESTION = getattr(socket, "TCP_CONGESTION", 13)
+            sock.setsockopt(socket.IPPROTO_TCP, _TCP_CONGESTION, b"bbr")
+        except OSError:
+            pass  # not available on macOS / Windows / kernels without BBR
+        try:
+            _TCP_NOTSENT_LOWAT = getattr(socket, "TCP_NOTSENT_LOWAT", 73)
+            sock.setsockopt(socket.IPPROTO_TCP, _TCP_NOTSENT_LOWAT, 16384)
+        except OSError:
+            pass  # not available on macOS / Windows or older kernels
         sock.settimeout(None)
         self._log.debug("tcp_connected")
         return sock

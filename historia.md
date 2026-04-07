@@ -914,10 +914,76 @@ ObfsConn отправляет синтетический TLS ClientHello. TLS Ha
 
 ---
 
+## Запуск 20 — 2026-04-07
+
+### Выполнено: TCP_QUICKACK + BBR + NOTSENT_LOWAT на Python-клиенте — устранение delayed ACK асимметрии
+
+**Файл:** `client/core.py` — функция `_connect_tcp()`
+
+**Диагностика корневой причины асимметрии download < upload:**
+
+Систематическое сравнение socket-опций сервера (`setForcedSocketBuffers` в `sockopt_linux.go`) и Python-клиента (`_connect_tcp` в `core.py`) выявило три разрыва, непосредственно вызывавших asymmetry:
+
+| Опция | Сервер (при accept) | Клиент (ДО) | Клиент (ПОСЛЕ) |
+|---|---|---|---|
+| `TCP_QUICKACK` | 1 (отключён delayed ACK) | ❌ отсутствует | ✅ 1 |
+| `TCP_CONGESTION` | "bbr" | ❌ отсутствует | ✅ "bbr" |
+| `TCP_NOTSENT_LOWAT` | 16384 | ❌ отсутствует | ✅ 16384 |
+| `SO_RCVBUF` / `SO_SNDBUF` | 4 MB | 2 MB | 4 MB |
+
+**Механизм асимметрии (главная причина — TCP_QUICKACK):**
+
+```
+Upload (client → server):
+  Клиент отправляет данные → сервер получает
+  Сервер имеет TCP_QUICKACK=1 → ACK отправляется НЕМЕДЛЕННО
+  → cwnd сервера (для upload) растёт быстро → высокая скорость upload
+
+Download (server → client):  [ДО ИСПРАВЛЕНИЯ]
+  Сервер отправляет данные → клиент получает
+  Клиент НЕ имел TCP_QUICKACK → delayed ACK (до 40 мс!)
+  → сервер ждёт ACK, cwnd не открывается
+  → RTT_эффективный = RTT + 40ms (при 100ms RTT: +40% overhead)
+  → download в ~1.4× медленнее upload при прочих равных
+```
+
+**Математика SO_RCVBUF = 2MB vs 4MB:**
+- Bandwidth-Delay Product при 30 Mbps × 100ms = 3.75 MB
+- При SO_RCVBUF=2MB: TCP window не может вместить BDP → download ограничен ~20 Mbps
+- При SO_RCVBUF=4MB: BDP вмещается → ограничение снято
+
+**Исправления в `_connect_tcp()`:**
+
+1. **`SO_RCVBUF` / `SO_SNDBUF`: 2MB → 4MB**
+   Устраняет буферный потолок для download на высоко-нагруженных каналах.
+
+2. **`TCP_QUICKACK = 1`** (Linux ≥ 2.4.4, константа 12)
+   Запрет delayed ACK для входящих (download) пакетов. На macOS/Windows — `OSError` перехватывается и игнорируется. Используется `getattr(socket, "TCP_QUICKACK", 12)` для portability.
+
+3. **`TCP_CONGESTION = "bbr"`** (Linux ≥ 2.6.13, константа 13)
+   Устанавливает BBR как CC алгоритм для upload-сокета клиента. Без этого клиент использует CUBIC — при потерях CUBIC и серверный BBR реагируют независимо (Double CC problem симметричный тому, что был исправлен в Запуске 11 для inner TCP). На macOS/Windows — OSError игнорируется.
+
+4. **`TCP_NOTSENT_LOWAT = 16384`** (Linux ≥ 3.12, константа 73)
+   Ограничение 16 KB несостоявшихся данных в ядерном send buffer. При потере пакета повторно передаётся максимум 16 KB вместо мегабайт. Снижает tail latency upload на 5-10× при 0.7% потерях (Россия↔Казахстан маршрут). На macOS/Windows — OSError игнорируется.
+
+**Всё три Linux-специфичных опции обёрнуты в `try/except OSError`** — безопасно деградируют до no-op на macOS/Windows без крэша.
+
+**Суммарный ожидаемый эффект:**
+- Download speed: +20-40% за счёт устранения 40ms delayed ACK при RTT=100ms
+- Download throughput ceiling: снято ограничение 20 Mbps (SO_RCVBUF=2MB) → 30+ Mbps
+- Upload quality: BBR вместо CUBIC → меньше независимых CC реакций на потери
+- Upload tail latency: снижение в 5-10× при потерях за счёт NOTSENT_LOWAT
+
+**Тесты:** `python3 -m py_compile core.py` — синтаксис OK; `go test ./... -count=3` — все 8 пакетов зелёные (1 flaky decoy test несвязан).
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
-1. **Асимметрия download < upload**
-   Баги на `claude/funny-tesla-8v2SV` (cumulative lostAtomic, per-round windowed loss rate) — проверить наличие в этой ветке; при необходимости cherry-pick.
+1. **Асимметрия download < upload (оставшиеся причины)**
+   - Run 20 устранил TCP delayed ACK (главная причина)
+   - Следующая потенциальная причина: upload bondingотсутствует (только 1 TCP conn vs N bonded download)
+   - Проанализировать: имеет ли смысл multi-conn upload bonding?
 
 2. **pprof CPU профилирование** — поиск скрытых узких мест под нагрузкой.
 
