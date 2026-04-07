@@ -191,6 +191,9 @@ class State:
         self.decisions: list  = []          # last N decisions from server
         self.config_changed   = False       # flash flag when config changes
         self.config_change_t  = 0.0        # time of last change (for flash duration)
+        # Step 3: generated command
+        self.new_cmd: str     = ""          # new cavadvpn command to run
+        self.new_cmd_reason: str = ""       # why AI suggests this command
 
     def set_status(self, msg: str):
         self.status_msg  = msg
@@ -361,6 +364,15 @@ def render(state: State, tel: TelState, base: str) -> None:
         out.append(row)
         out.append("")
 
+    # ── Новая команда от AI (Step 3) ──
+    if state.new_cmd:
+        out.append(f"  {BOLD}{YELLOW}★ AI рекомендует перезапустить VPN:{RESET}")
+        if state.new_cmd_reason:
+            out.append(f"    {GRAY}Причина: {state.new_cmd_reason}{RESET}")
+        out.append(f"    {GREEN}{state.new_cmd}{RESET}")
+        out.append(f"    {GRAY}c — скопировать команду в буфер обмена{RESET}")
+        out.append("")
+
     # ── История решений AI ──
     decs = state.decisions
     if decs:
@@ -382,8 +394,9 @@ def render(state: State, tel: TelState, base: str) -> None:
     # ── Нижняя панель ──
     out.append(BOLD + WHITE + "─" * width + RESET)
     ai_key = f"{GREEN}a: ВЫКЛ AI" if state.ai_enabled else f"{YELLOW}a: ВКЛ AI"
-    out.append(f"  {ai_key}{RESET}   {CYAN}t: анализ сейчас{RESET}   "
-               f"{GRAY}r: обновить   q: выход{RESET}")
+    cmd_key = f"   {GREEN}c: скопировать команду{RESET}" if state.new_cmd else ""
+    out.append(f"  {ai_key}{RESET}   {CYAN}t: анализ{RESET}   "
+               f"{GRAY}r: обновить   q: выход{RESET}{cmd_key}")
     out.append(BOLD + WHITE + "─" * width + RESET)
 
     # Нижняя панель (3 строки) всегда приклеена к низу экрана.
@@ -415,7 +428,9 @@ def render(state: State, tel: TelState, base: str) -> None:
 
 # ── Фон: обновления с сервера ─────────────────────────────────────────────────
 
-def fetch_loop(base: str, token: str, state: State, interval: int) -> None:
+def fetch_loop(base: str, token: str, state: State, interval: int,
+               vpn_server: str = "", server_key: str = "",
+               orig_bonds: int = 0) -> None:
     while True:
         try:
             _req("GET", f"{base}/api/v1/health", "")
@@ -451,10 +466,12 @@ def fetch_loop(base: str, token: str, state: State, interval: int) -> None:
             applied = _req("GET", f"{base}/api/v1/telemetry/config/applied", "") or {}
             cfg = applied.get("config") or applied  # server wraps in {config:…}
             if cfg and cfg != state.applied:
-                state.prev_applied  = state.applied
-                state.applied       = cfg
+                state.prev_applied   = state.applied
+                state.applied        = cfg
                 state.config_changed = True
                 state.config_change_t = time.monotonic()
+                # Step 3: regenerate cavadvpn command
+                update_cmd_from_config(state, vpn_server, server_key, orig_bonds)
         except APIError:
             pass
 
@@ -491,6 +508,66 @@ def _read_key_win() -> str:
     return ""
 
 read_key = _read_key_win if os.name == "nt" else _read_key_unix
+
+
+# ── Генерация команды cavadvpn ────────────────────────────────────────────────
+
+def build_vpn_cmd(vpn_server: str, server_key: str, bonds: int, mtu: int,
+                  transport: str) -> str:
+    """Собирает команду запуска cavadvpn с нужными параметрами."""
+    parts = ["sudo cavadvpn"]
+    if vpn_server:
+        parts.append(f"-server {vpn_server}")
+    if server_key:
+        parts.append(f"-server-key {server_key}")
+    if bonds > 0:
+        parts.append(f"-bonds {bonds}")
+    if mtu and mtu > 0:
+        parts.append(f"-mtu {mtu}")
+    # transport_mode: tcp = с bonds, udp = без bonds (справочно)
+    return " ".join(parts)
+
+def copy_to_clipboard(text: str) -> bool:
+    """Копирует текст в буфер обмена (macOS pbcopy / Linux xclip)."""
+    import subprocess
+    try:
+        if platform.system() == "Darwin":
+            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        else:
+            subprocess.run(["xclip", "-selection", "clipboard"],
+                           input=text.encode(), check=True)
+        return True
+    except Exception:
+        return False
+
+def update_cmd_from_config(state: State, vpn_server: str, server_key: str,
+                           orig_bonds: int) -> None:
+    """Обновляет state.new_cmd если AI поменял bonds/mtu/transport."""
+    cfg  = state.applied
+    prev = state.prev_applied
+    if not cfg:
+        return
+
+    new_bonds     = cfg.get("bond_count") or orig_bonds
+    new_mtu       = cfg.get("mtu") or 0
+    new_transport = cfg.get("transport_mode") or ""
+    old_bonds     = prev.get("bond_count") or orig_bonds
+    old_mtu       = prev.get("mtu") or 0
+
+    cmd_changed = (new_bonds != old_bonds or new_mtu != old_mtu)
+    if not cmd_changed and not state.config_changed:
+        return
+
+    state.new_cmd = build_vpn_cmd(vpn_server, server_key, new_bonds,
+                                   new_mtu, new_transport)
+    changes = []
+    if new_bonds != old_bonds:
+        changes.append(f"bonds {old_bonds}→{new_bonds}")
+    if new_mtu and new_mtu != old_mtu:
+        changes.append(f"mtu {old_mtu}→{new_mtu}")
+    if new_transport:
+        changes.append(f"режим {new_transport}")
+    state.new_cmd_reason = ", ".join(changes) if changes else "обновлён AI"
 
 
 # ── Действия ──────────────────────────────────────────────────────────────────
@@ -542,6 +619,8 @@ def main() -> None:
                         help="адрес VPN сервера для измерения ping/loss (напр. 45.8.228.67:443)")
     parser.add_argument("--bonds", type=int, default=0, metavar="N",
                         help="число bonds (64 если запускаешь с -bonds 64)")
+    parser.add_argument("--server-key", default="", metavar="KEY",
+                        help="публичный ключ сервера (-server-key из команды cavadvpn)")
     parser.add_argument("--refresh", type=int, default=10, metavar="SEC",
                         help="интервал обновления дашборда в секундах (default: 10)")
     args = parser.parse_args()
@@ -569,7 +648,9 @@ def main() -> None:
 
     # Фоновый поток: обновления с сервера
     threading.Thread(
-        target=fetch_loop, args=(base, args.token, state, args.refresh),
+        target=fetch_loop,
+        args=(base, args.token, state, args.refresh,
+              args.vpn_server, args.server_key, args.bonds),
         daemon=True,
     ).start()
 
@@ -606,6 +687,10 @@ def main() -> None:
                 threading.Thread(
                     target=trigger_analysis, args=(base, args.token, state), daemon=True
                 ).start()
+            elif key == "c" and state.new_cmd:
+                ok = copy_to_clipboard(state.new_cmd)
+                state.set_status("Команда скопирована в буфер обмена ✓" if ok
+                                 else "Не удалось скопировать (pbcopy/xclip не найден)")
     except KeyboardInterrupt:
         pass
     finally:
