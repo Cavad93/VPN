@@ -1289,6 +1289,64 @@ go tool pprof -http=:8090 allocs.prof
 
 ---
 
+## Запуск 25 — 2026-04-07
+
+### Выполнено: decoyReadDeadline data race — atomic.Int64 вместо plain var
+
+**Файлы:** `server/decoy.go`, `server/decoy_test.go`
+
+**Проблема (pre-existing flakiness из Запуска 24):**
+
+`decoyReadDeadline` был объявлен как `var decoyReadDeadline = 5 * time.Second` — обычная `time.Duration` переменная.
+
+Два теста `decoy_test.go` временно перезаписывали её:
+```go
+decoyReadDeadline = 50 * time.Millisecond   // TestPeekAndRouteSilentlyClosesOnTimeout
+decoyReadDeadline = 50 * time.Millisecond   // TestPeekAndRouteByte0x16IsOnlyVPNPath
+```
+
+Параллельно запускался `TestServerRun` (с `t.Parallel()`) из `main_test.go`, который создавал настоящий VPN-сервер и вызывал `peekAndRoute` → читал `decoyReadDeadline` без синхронизации.
+
+Итог: data race между write (тест) и read (goroutine сервера). При запуске `-race` — failure; без race-детектора — нестабильное поведение deadlines (5 s вместо 50 ms).
+
+**Исправление:**
+
+Заменил `var decoyReadDeadline = 5*time.Second` на:
+```go
+var decoyReadDeadlineNs atomic.Int64
+
+func init() { decoyReadDeadlineNs.Store(int64(5 * time.Second)) }
+
+func decoyReadDeadline() time.Duration     { return time.Duration(decoyReadDeadlineNs.Load()) }
+func setDecoyReadDeadline(d time.Duration) { decoyReadDeadlineNs.Store(int64(d)) }
+```
+
+В `peekAndRoute`: `conn.SetReadDeadline(time.Now().Add(decoyReadDeadline()))`.
+
+В тестах:
+```go
+orig := decoyReadDeadline()
+setDecoyReadDeadline(50 * time.Millisecond)
+t.Cleanup(func() { setDecoyReadDeadline(orig) })
+```
+
+**Почему atomic, а не mutex:**
+Читается на каждое входящее соединение (горячий путь), пишется только в тестах. `atomic.Int64.Load()` = 1 инструкция без блокировки vs `mu.RLock/RUnlock` = ~5 инструкций + contention. Для duration нет потери точности: `int64` хранит наносекунды до 292 лет.
+
+**Тесты:** `go test . -race -count=3` — PASS. `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Анализ веток — 2026-04-07
+
+**Проверены ветки:**
+- `claude/amazing-edison-jYEOh` — идентична `claude/gallant-goldberg-C4sZQ` (тот же HEAD `e92a0fb`). Merge не нужен.
+- `origin/claude/create-claude-md-zT6Gk` — параллельная ветка с неродственной историей. **Ни одного файла не удалено** относительно `gallant-goldberg-C4sZQ`; последняя имеет 200 дополнительных файлов (Android UI, iOS CI, клиентские модули и т.д.) и является **надмножеством** `create-claude-md-zT6Gk`. Merge не нужен и технически невозможен без конфликтов (239 изменённых файлов при неродственных историях).
+
+**Вывод:** `claude/gallant-goldberg-C4sZQ` — активная и наиболее полная ветка разработки.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **IPv6 inner tunnel** — `markECNCE` только IPv4. При расширении туннеля до IPv6 нужен путь для Traffic Class field.

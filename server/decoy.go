@@ -25,6 +25,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,11 +34,27 @@ import (
 // with this byte (0x16 = 22 decimal).
 const tlsHandshakeRecordType = byte(0x16)
 
-// decoyReadDeadline is how long we wait for the client to send its first byte.
+// decoyReadDeadlineNs stores the read deadline duration in nanoseconds.
+// Using atomic.Int64 prevents data races when unit tests temporarily override
+// the value while TestServerRun concurrently calls peekAndRoute.
 // Real VPN clients connect and immediately send a ClientHello; 5 s is generous.
 // Scanners that send nothing (SYN-only probes) will be dropped after this.
-// Declared as a variable (not const) so unit tests can override it.
-var decoyReadDeadline = 5 * time.Second
+var decoyReadDeadlineNs atomic.Int64
+
+func init() {
+	decoyReadDeadlineNs.Store(int64(5 * time.Second))
+}
+
+// decoyReadDeadline returns the current read deadline duration.
+func decoyReadDeadline() time.Duration {
+	return time.Duration(decoyReadDeadlineNs.Load())
+}
+
+// setDecoyReadDeadline sets the read deadline duration.
+// Used only in tests; the production default is 5 s (set in init).
+func setDecoyReadDeadline(d time.Duration) {
+	decoyReadDeadlineNs.Store(int64(d))
+}
 
 // decoyHTTPResponse is the response served to non-VPN probes.
 // It mimics nginx's standard "400 The plain HTTP request was sent to HTTPS
@@ -118,7 +135,7 @@ func (p *peekConn) Read(b []byte) (int, error) {
 //     Caller must not touch conn.
 func peekAndRoute(conn net.Conn) (net.Conn, bool) {
 	// Give the client a short window to send its first byte.
-	_ = conn.SetReadDeadline(time.Now().Add(decoyReadDeadline))
+	_ = conn.SetReadDeadline(time.Now().Add(decoyReadDeadline()))
 
 	var first [1]byte
 	if _, err := conn.Read(first[:]); err != nil {

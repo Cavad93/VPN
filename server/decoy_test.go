@@ -236,9 +236,9 @@ func TestPeekAndRouteRawTCPScannerGetsDecoy(t *testing.T) {
 
 func TestPeekAndRouteSilentlyClosesOnTimeout(t *testing.T) {
 	// Override the read deadline to something short so the test finishes fast.
-	orig := decoyReadDeadline
-	decoyReadDeadline = 50 * time.Millisecond
-	t.Cleanup(func() { decoyReadDeadline = orig })
+	orig := decoyReadDeadline()
+	setDecoyReadDeadline(50 * time.Millisecond)
+	t.Cleanup(func() { setDecoyReadDeadline(orig) })
 
 	cConn, sConn := newLocalTCPPair(t)
 
@@ -268,9 +268,9 @@ func TestPeekAndRouteSilentlyClosesOnTimeout(t *testing.T) {
 
 func TestPeekAndRouteByte0x16IsOnlyVPNPath(t *testing.T) {
 	// Override deadline so sub-tests run quickly.
-	orig := decoyReadDeadline
-	decoyReadDeadline = 50 * time.Millisecond
-	t.Cleanup(func() { decoyReadDeadline = orig })
+	orig := decoyReadDeadline()
+	setDecoyReadDeadline(50 * time.Millisecond)
+	t.Cleanup(func() { setDecoyReadDeadline(orig) })
 
 	nonVPNBytes := []byte{0x00, 0x01, 0x14, 0x15, 0x17, 0x47 /*'G'*/, 0xFF}
 
