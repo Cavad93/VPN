@@ -189,10 +189,9 @@ func SummarizePerf(snap perf.Snapshot) ServerPerfSummary {
 func (a *APIServer) registerDiagnosticsRoutes() {
 	// Server system metrics — auth required.
 	a.mux.HandleFunc("GET /api/v1/server/metrics", a.auth(a.handleServerMetrics))
-	// Speed test — download direction (no auth, needs to work from clients).
-	a.mux.HandleFunc("GET /api/v1/speedtest/download", a.handleSpeedTestDownload)
-	// Speed test — upload direction.
-	a.mux.HandleFunc("POST /api/v1/speedtest/upload", a.handleSpeedTestUpload)
+	// Speed test — auth required (dashboard uses Bearer token from the UI).
+	a.mux.HandleFunc("GET /api/v1/speedtest/download", a.auth(a.handleSpeedTestDownload))
+	a.mux.HandleFunc("POST /api/v1/speedtest/upload", a.auth(a.handleSpeedTestUpload))
 	// Combined diagnostics: server metrics + perf + latest telemetry analysis.
 	a.mux.HandleFunc("GET /api/v1/diagnostics", a.auth(a.handleDiagnostics))
 }

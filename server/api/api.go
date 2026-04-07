@@ -64,7 +64,9 @@ type Config struct {
 	// ListenAddr is the TCP address to listen on (e.g. "127.0.0.1:8080").
 	ListenAddr string
 	// APIToken is the Bearer token required for all calls except GET /health.
-	// If empty, authentication is disabled (dev/testing only; not for production).
+	// Production: startAPIServer in main.go auto-generates a secure token when
+	// this field is empty. An empty token here disables auth only in unit tests
+	// that call NewAPIServer directly.
 	APIToken string
 }
 

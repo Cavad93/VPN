@@ -795,3 +795,80 @@ lossRate := float64(cumulativeLost) / float64(total) // всегда > 2%
 - `TestInflightResetClearsRoundCounters` — проверяет Reset сбрасывает per-round счётчики
 
 `cd server && go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Запуск 18 — 2026-04-07
+
+### Выполнено: Защита API — обязательный токен + auth на speedtest endpoints
+
+**Файлы:** `server/main.go`, `server/api/api.go`, `server/api/diagnostics.go`
+
+**Обнаруженные проблемы безопасности:**
+
+1. **`auth` middleware bypass** — когда `APIToken == ""` (значение по умолчанию), функция `auth()` пропускала все запросы без проверки. Оператор без флага `-api-token` → весь REST API (`/sessions`, `/keys`, `/stats`, `/logs`, `/qr/generate` и т.д.) доступен **любому процессу на машине** без аутентификации.
+
+2. **Speed test endpoints без auth** — `GET /api/v1/speedtest/download` и `POST /api/v1/speedtest/upload` не имели middleware `auth()` вообще: любой мог потреблять bandwidth сервера (до 10 MB/запрос) или перегружать сервер параллельными запросами.
+
+**Исправления:**
+
+1. **`server/main.go` — автогенерация токена в `startAPIServer`:**
+   ```go
+   if cfg.APIToken == "" {
+       b := make([]byte, 32)
+       rand.Read(b)
+       cfg.APIToken = hex.EncodeToString(b)
+       logger.Warn("... Auto-generated API TOKEN: <token> ...")
+   }
+   ```
+   При запуске без `-api-token` генерируется криптографически случайный 32-байтный hex-токен (256 бит энтропии). Логируется в stderr в рамке. Рекомендуется зафиксировать через `-api-token=<значение>` для постоянства.
+
+2. **`server/api/diagnostics.go` — auth на speed test:**
+   ```go
+   a.mux.HandleFunc("GET /api/v1/speedtest/download", a.auth(a.handleSpeedTestDownload))
+   a.mux.HandleFunc("POST /api/v1/speedtest/upload", a.auth(a.handleSpeedTestUpload))
+   ```
+
+3. **`server/api/api.go` — уточнён комментарий к `APIToken`.**
+
+**Публичные endpoints (намеренно без auth):**
+- `GET /api/v1/health` — health check
+- `GET /api/v1/client/version` — headless клиенты проверяют обновления
+- `POST /api/v1/telemetry` — клиенты отправляют метрики
+- `GET /join/{token}` + `/config.json` + `/qr.png` — invite links (токен=секрет)
+
+**Тесты:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Следующие задачи (приоритетный бэклог)
+
+1. **Защита от активного сканирования (заглушка/decoy page)**
+   Реализовать peek-and-route: если первые 5 байт не TLS record — подать HTTP decoy HTML; иначе пустить в ObfsConn/VPN.
+   *Файлы:* `server/main.go` (TCP accept loop), `server/transport/obfs.go`.
+
+2. **Асимметрия download < upload**
+   Баги на `claude/funny-tesla-8v2SV` (cumulative lostAtomic, per-round windowed loss rate) — проверить наличие в этой ветке; при необходимости cherry-pick.
+
+3. **pprof CPU профилирование** — поиск скрытых узких мест под нагрузкой.
+
+4. **IPv6 inner tunnel** — `markECNCE` только IPv4.
+
+---
+
+### Инструкция: настройка сервера с защитой API
+
+```bash
+# Вариант 1: auto-generated token (не рекомендуется для продакшна — меняется при перезапуске)
+./vpnserver -addr 0.0.0.0:443 -api-addr 127.0.0.1:8080
+# Токен появится в stderr при старте. Сохраните его.
+
+# Вариант 2: явный токен (рекомендуется)
+./vpnserver -addr 0.0.0.0:443 -api-addr 127.0.0.1:8080 -api-token $(openssl rand -hex 32)
+
+# Использование API с токеном:
+curl -H "Authorization: Bearer <TOKEN>" http://127.0.0.1:8080/api/v1/sessions
+curl -H "X-API-Key: <TOKEN>" http://127.0.0.1:8080/api/v1/stats
+
+# Веб-дашборд: открыть http://127.0.0.1:8080 и ввести токен в поле "API Token"
+```

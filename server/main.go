@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -1397,7 +1398,7 @@ func main() {
 	flag.StringVar(&cfg.PrivKeyFile, "privkey", cfg.PrivKeyFile, "path to hex-encoded private key file")
 	flag.StringVar(&cfg.Transport, "transport", cfg.Transport, "transport protocol: tcp (kernel CC) or udp (user-space BBR)")
 	flag.StringVar(&apiCfg.ListenAddr, "api-addr", apiCfg.ListenAddr, "REST API listen address (empty to disable)")
-	flag.StringVar(&apiCfg.APIToken, "api-token", "", "Bearer token for the REST API (empty disables auth)")
+	flag.StringVar(&apiCfg.APIToken, "api-token", "", "Bearer token for the REST API (empty = auto-generate a secure random token on startup)")
 	flag.StringVar(&vlessAddr, "vless-addr", "", "VLESS+WS+TLS listen address (e.g. 0.0.0.0:443)")
 	flag.StringVar(&vlessCert, "vless-cert", "cert.pem", "TLS certificate file for VLESS")
 	flag.StringVar(&vlessKey, "vless-key", "key.pem", "TLS private key file for VLESS")
@@ -1516,6 +1517,28 @@ func startAPIServer(ctx context.Context, cfg api.Config, srv *Server, logger *sl
 	if cfg.ListenAddr == "" {
 		return nil
 	}
+
+	// Security: API token is mandatory. If the operator did not supply one via
+	// -api-token, generate a cryptographically-random token and print it once.
+	// This ensures the management API is never accessible without authentication
+	// — even on loopback — preventing privilege escalation via local processes.
+	if cfg.APIToken == "" {
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			logger.Error("failed to generate API token", "err", err)
+			os.Exit(1)
+		}
+		cfg.APIToken = hex.EncodeToString(b)
+		logger.Warn("╔══════════════════════════════════════════════════════════╗")
+		logger.Warn("║  No -api-token supplied. Auto-generated a secure token.  ║")
+		logger.Warn("║  Use this token for all REST API requests:                ║")
+		logger.Warn("║                                                           ║")
+		logger.Warn("║  API TOKEN: "+cfg.APIToken+"  ║")
+		logger.Warn("║                                                           ║")
+		logger.Warn("║  Set -api-token=<above> to keep the same token on restart.║")
+		logger.Warn("╚══════════════════════════════════════════════════════════╝")
+	}
+
 	// Create the push notification service and attach it to the server so that
 	// session connect/disconnect events trigger push alerts.
 	notifSvc := notify.NewNotificationService(logger)
