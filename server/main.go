@@ -619,18 +619,20 @@ func (s *Server) runPrimaryConn(ctx context.Context, rawConn net.Conn, session *
 		cancel:       cancel,
 	}
 
-	// If this client key already has an active session, close it first.
-	// This prevents IP pool exhaustion when a client reconnects without
-	// cleanly closing the previous connection (e.g. Android app crash,
-	// network switch, or routing loop causing rapid reconnects).
+	// Register the new session.
+	// NOTE: we intentionally allow multiple concurrent sessions with the same
+	// static key.  A user may legitimately run the same key on several devices
+	// (e.g. MacBook and Android both imported the same QR code).  Cancelling
+	// the old session would disconnect the other device unexpectedly.
+	//
+	// Dead sessions clean up automatically: the mux keepalive loop sends a
+	// FramePing every 15 s; a write failure closes the session and releases
+	// the IP back to the pool.  IP exhaustion is not a concern for personal
+	// VPN use (/24 = 254 addresses).
+	//
+	// If per-device isolation is required, generate a separate QR code
+	// (and therefore a unique key) for each device via /api/v1/qr/generate.
 	s.mu.Lock()
-	for id, existing := range s.sessions {
-		if existing.remoteKey == session.RemoteStatic && id != cs.id {
-			s.logger.Info("replacing existing session for same key",
-				"old_id", id, "new_id", cs.id)
-			existing.cancel()
-		}
-	}
 	s.sessions[cs.id] = cs
 	s.mu.Unlock()
 
