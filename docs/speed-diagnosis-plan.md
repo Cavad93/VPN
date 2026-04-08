@@ -330,3 +330,39 @@ sysctl -w net.ipv4.tcp_wmem="4096 1048576 16777216"
 **Теоретический потолок download:** ограничен upload СПБ сервера = 7.64 Мбит/с. С overhead VPN ~3-5% → максимум ~7.2 Мбит/с.
 
 **Теоретический потолок upload:** ограничен upload MacBook → СПБ. Нужно измерить чистый iperf3 MacBook → СПБ для определения потолка.
+
+---
+
+## Прогресс диагностики
+
+### Сеанс 1 — 2026-04-08 — UDP socket buffers (гипотеза #6)
+
+**Гипотеза:** #6 — Малые буферы (применена к UDP транспорту, который является транспортом по умолчанию)
+
+**Что сделано:** Проведён полный анализ кода по гипотезам #1–#3 и #6:
+
+- **Гипотеза #2 (Traffic shaping)** — ОПРОВЕРГНУТА. В `VPNConfig` нет `TrafficShaper`/`StatisticalObfuscator` по умолчанию. Эти модули подключаются только явно пользователем.
+
+- **Гипотеза #3 (Двойной VPN relay)** — ОПРОВЕРГНУТА. Изучен `server/relay.go` — relay это прозрачный TCP/UDP прокси (`io.Copy`). SPB сервер НЕ расшифровывает трафик, не делает второй Noise handshake. VPN стек (Noise_XX, Mux) работает end-to-end MacBook → Астана. Двойного шифрования нет.
+
+- **Гипотеза #1 (TCP-in-TCP meltdown)** — ЧАСТИЧНО ОПРОВЕРГНУТА. Транспорт по умолчанию — **UDP** (`transport: str = "udp"` в `VPNConfig`). Для TCP режима: все оптимизации уже есть — TCP_NODELAY, BBR, 4MB SO_RCVBUF/SO_SNDBUF, TCP_QUICKACK, TCP_NOTSENT_LOWAT=16KB, TCP_WINDOW_CLAMP — в `server/sockopt_linux.go` и `client/core.py:_connect_tcp`. TCP meltdown для TCP режима смягчён.
+
+- **Гипотеза #6 (Малые буферы) → UDP** — ПОДТВЕРЖДЕНА. Найдено КРИТИЧЕСКОЕ расхождение:
+  - Сервер (`server/transport/udp.go:932`): `udpSocketBufSize = 4 * 1024 * 1024` — явно устанавливает 4MB SO_RCVBUF/SO_SNDBUF
+  - Клиент (`client/reliable_udp.py:connect_udp`): НЕ устанавливал буферы — использовались OS defaults
+  - macOS default: `net.inet.udp.recvspace` ≈ 42,080 байт (41 KB)
+  - При 7.64 Мбит/с download: буфер заполняется за **~44 мс** → ядро дропает пакеты
+  - Каждый дроп → Reno multiplicative decrease (cwnd → max(cwnd/2, 2)) → каскадный коллапс
+  - Результат: throughput ограничен 3–4 Мбит/с вместо 7+ Мбит/с
+
+**Результат:** ИСПРАВЛЕНО
+
+**Найденные проблемы:**
+- `client/reliable_udp.py:353-373` — `connect_udp()` создавал UDP сокет без SO_RCVBUF/SO_SNDBUF → OS default ~42 KB на macOS vs 4 MB на сервере
+
+**Изменённые файлы:**
+- `client/reliable_udp.py` — в `connect_udp()` добавлены `setsockopt(SO_RCVBUF, 4MB)` и `setsockopt(SO_SNDBUF, 4MB)` с silent fallback при OS limit, с комментарием почему это критично
+
+**Тесты:** 17/17 passed (`test_reliable_udp.py`)
+
+**Следующий шаг:** Проверить гипотезу #7 (Python GIL bottleneck) — изучить threading model в `reliable_udp.py` и `core.py`: `_recv_loop`, `_write_packet`, `_retransmit_loop` держат GIL при I/O? Есть ли блокирующие вызовы в main thread? Рассмотреть `io.CopyBuffer` с увеличенным буфером в relay (`server/relay.go:135`).

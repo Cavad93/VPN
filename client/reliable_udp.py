@@ -359,6 +359,21 @@ def connect_udp(host: str, port: int, timeout: float = 30.0) -> ReliableUDP:
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
+    # Match the server's udpSocketBufSize (transport/udp.go: 4 MB).
+    # Default UDP socket buffers are very small on macOS (~42 KB recv) and
+    # Linux (~212 KB recv, capped by net.core.rmem_max).  At 7.64 Mbps
+    # download, the receive buffer fills in ~44 ms on macOS.  When it
+    # overflows, the kernel silently drops incoming packets.  Each drop
+    # triggers a Reno multiplicative-decrease (cwnd → ssthresh = cwnd/2),
+    # causing a throughput collapse cascade that limits download to 3-4 Mbps
+    # despite the server having 7+ Mbps available.  4 MB matches the server
+    # and gives ≈4 s of headroom at 7.64 Mbps — enough for any GIL pause.
+    _UDP_BUF = 4 * 1024 * 1024  # 4 MB — matches server udpSocketBufSize
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _UDP_BUF)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _UDP_BUF)
+    except OSError:
+        pass  # OS may cap at kern.ipc.maxsockbuf — silently accept the cap
     addr = (host, port)
 
     # Send a trigger packet so the server's listener detects this client.
