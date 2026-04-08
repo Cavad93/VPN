@@ -662,3 +662,149 @@ func TestListenInvalidAddress(t *testing.T) {
 		t.Error("Listen should fail on invalid address")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Fast retransmit (RFC 5681 §3.2)
+// ---------------------------------------------------------------------------
+
+// makeTestConnWithPending creates a Conn that has one pending packet at seq=0
+// with sendBase=0, simulating the server waiting for an ACK for seq=0.
+func makeTestConnWithPending(t *testing.T) *Conn {
+	t.Helper()
+	c := makeTestConn(t)
+	c.sendMu.Lock()
+	c.sendBase = 0
+	c.pending[0] = &pendingPacket{
+		pkt:           &Packet{Type: PacketTypeData, SeqNum: 0, Payload: []byte("lost-packet")},
+		firstSentAt:   time.Now().Add(-50 * time.Millisecond),
+		sentAt:        time.Now().Add(-50 * time.Millisecond),
+		deliveredTime: time.Now().Add(-100 * time.Millisecond),
+	}
+	c.bbr.inflight.OnSend(len("lost-packet"))
+	c.sendMu.Unlock()
+	return c
+}
+
+// TestFastRetransmitTriggerOnThirdDupACK verifies that a duplicate ACK at
+// sendBase is counted and that the 3rd consecutive dup ACK triggers an
+// immediate retransmit of the head-of-line packet (RFC 5681 §3.2).
+func TestFastRetransmitTriggerOnThirdDupACK(t *testing.T) {
+	t.Parallel()
+	c := makeTestConnWithPending(t)
+
+	// Send 1st dup ACK — counter increments but no retransmit yet.
+	c.processACK(0)
+	c.sendMu.Lock()
+	cnt1 := c.dupAckCount
+	retx1 := c.pending[0].retransmits
+	c.sendMu.Unlock()
+	if cnt1 != 1 {
+		t.Errorf("after 1st dup ACK: dupAckCount want 1, got %d", cnt1)
+	}
+	if retx1 != 0 {
+		t.Errorf("after 1st dup ACK: retransmits want 0, got %d", retx1)
+	}
+
+	// Send 2nd dup ACK — counter increments, still no retransmit.
+	c.processACK(0)
+	c.sendMu.Lock()
+	cnt2 := c.dupAckCount
+	retx2 := c.pending[0].retransmits
+	c.sendMu.Unlock()
+	if cnt2 != 2 {
+		t.Errorf("after 2nd dup ACK: dupAckCount want 2, got %d", cnt2)
+	}
+	if retx2 != 0 {
+		t.Errorf("after 2nd dup ACK: retransmits want 0, got %d", retx2)
+	}
+
+	// Send 3rd dup ACK — must trigger fast retransmit immediately.
+	c.processACK(0)
+	c.sendMu.Lock()
+	cnt3 := c.dupAckCount
+	retx3 := c.pending[0].retransmits
+	c.sendMu.Unlock()
+	// Counter resets to 0 after the 3rd dup ACK triggers the retransmit.
+	if cnt3 != 0 {
+		t.Errorf("after 3rd dup ACK: dupAckCount want 0 (reset), got %d", cnt3)
+	}
+	// The pending packet must have been retransmitted.
+	if retx3 != 1 {
+		t.Errorf("after 3rd dup ACK: retransmits want 1, got %d", retx3)
+	}
+}
+
+// TestFastRetransmitResetOnNewACK verifies that the dup ACK counter is cleared
+// when a new cumulative ACK (ackNum > sendBase) arrives.
+func TestFastRetransmitResetOnNewACK(t *testing.T) {
+	t.Parallel()
+	c := makeTestConnWithPending(t)
+
+	// Simulate 2 dup ACKs, then a real ACK that clears the packet.
+	c.processACK(0) // dup 1
+	c.processACK(0) // dup 2
+
+	c.sendMu.Lock()
+	cnt := c.dupAckCount
+	c.sendMu.Unlock()
+	if cnt != 2 {
+		t.Fatalf("pre-condition: want dupAckCount=2, got %d", cnt)
+	}
+
+	// New ACK advancing past seq 0.
+	c.processACK(1)
+
+	c.sendMu.Lock()
+	cntAfter := c.dupAckCount
+	pendingCount := len(c.pending)
+	c.sendMu.Unlock()
+
+	if cntAfter != 0 {
+		t.Errorf("dupAckCount should reset to 0 after new ACK, got %d", cntAfter)
+	}
+	if pendingCount != 0 {
+		t.Errorf("pending should be empty after ACK=1, got %d", pendingCount)
+	}
+}
+
+// TestFastRetransmitNoDupACKWithNoPending verifies that dup ACKs are ignored
+// when there are no outstanding packets (nothing to retransmit).
+func TestFastRetransmitNoDupACKWithNoPending(t *testing.T) {
+	t.Parallel()
+	c := makeTestConn(t)
+
+	// Send 3 dup ACKs with nothing pending — should not panic or increment counter.
+	c.processACK(0)
+	c.processACK(0)
+	c.processACK(0)
+
+	c.sendMu.Lock()
+	cnt := c.dupAckCount
+	c.sendMu.Unlock()
+	// Counter should be 0 since no pending data means we skip the dup ACK path.
+	if cnt != 0 {
+		t.Errorf("dupAckCount should remain 0 with no pending, got %d", cnt)
+	}
+}
+
+// TestFastRetransmitStaleACKIgnored verifies that stale ACKs (ackNum < sendBase)
+// are completely ignored and do not affect the dup ACK counter.
+func TestFastRetransmitStaleACKIgnored(t *testing.T) {
+	t.Parallel()
+	c := makeTestConnWithPending(t)
+
+	// Advance sendBase past 0 by ACKing seq 0.
+	c.sendMu.Lock()
+	c.sendBase = 5
+	c.sendMu.Unlock()
+
+	// Stale ACK: ackNum=3 < sendBase=5 — must be silently discarded.
+	c.processACK(3)
+
+	c.sendMu.Lock()
+	cnt := c.dupAckCount
+	c.sendMu.Unlock()
+	if cnt != 0 {
+		t.Errorf("stale ACK should not increment dupAckCount, got %d", cnt)
+	}
+}

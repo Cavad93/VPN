@@ -615,3 +615,72 @@ Wire check: IP(20) + UDP(8) + ReliableHdr(11) + Payload(1460) = 1499 ≤ 1500 �
 **Тесты:** 23/23 passed (`test_reliable_udp.py`)
 
 **Следующий шаг:** Выдвинуть новую гипотезу #14 — проверить, есть ли в коде `_retransmit_loop` достаточная гранулярность проверки. Текущий sleep = max(50ms, rto/4) при rto=216ms → 54ms. Проверить, не создаёт ли это 54мс задержку fast retransmit в edge-cases. Или исследовать server-side BBR (transport/bbr_state.go): проверить параметры STARTUP_GAIN (2.885), выход из Startup, ProbeRTT настройки — нет ли sub-optimal параметров ограничивающих download до 3.38 Мбит/с.
+
+### Сеанс 7 — 2026-04-08 — Fast Retransmit на стороне сервера (гипотеза #15)
+
+**Гипотеза:** #15 — Отсутствие fast retransmit в `processACK` на сервере → RTO-based ретрансмит при потере пакета в download direction → 234ms столл per loss event
+
+**Что сделано:**
+
+Проведён полный анализ сервера:
+
+**Анализ BBR параметров:**
+- `startupPacingGain = 2.885` (2/ln(2)) — стандартное значение ✓
+- `minCwndPackets = 32` — уже оптимизировано ✓
+- `SetInitialBandwidth(6_000_000/8, 78ms)` в `server/main.go:385` — BDP = 40 пакетов, initial cwnd = 80 ✓
+- `probeRTTDuration = 200ms` каждые 10с = 2% duty cycle ≈ 0.7% потери — незначительно
+
+**Анализ relay.go:**
+- TCP relay: `io.Copy(TCPConn, TCPConn)` → `splice()` на Linux, zero-copy ✓
+- UDP relay: `sendCh` буфер 512 пакетов = 752 KB, заполняется за 3+ секунды ✓
+- Обратный путь (Astana→SPB→Client): один горутин на сессию, 649 WriteTo/сек при 7 Mbps ✓
+
+**Критический баг найден в `server/transport/udp.go:519-523`:**
+
+```go
+// Fast path: duplicate or stale ACK — nothing to do.
+if ackNum <= c.sendBase {
+    c.sendMu.Unlock()
+    return
+}
+```
+
+Сервер **игнорировал ВСЕ дублированные ACKs** (где ackNum == sendBase). При потере пакета в download:
+
+1. Клиент получает P1, P2, затем P4, P5 (P3 потерян)
+2. Клиент буферирует P4, P5, отправляет ACK=3 (кумулятивный)
+3. Сервер получает ACK=3 первый раз → обрабатывает (sendBase=3)
+4. Сервер получает ACK=3 повторно → `ackNum=3 <= sendBase=3` → **fast path, return** (дубль игнорирован!)
+5. Сервер ждёт RTO (~234ms при srtt=78ms, rttvar=39ms) для ретрансмита P3
+6. За это время клиент держит P4, P5, ... в `_recv_buf`, данные не доставляются в приложение
+7. Столл: 234ms per loss event
+
+**Математика:**
+- Loss rate = 0.5%, 650 пакетов/с → 1 потеря каждые 308ms
+- Без fast retransmit: 234ms столл / 308ms period = **76% времени в стопе** → 0.24 × 7.64 = 1.83 Mbps (теория)
+- С fast retransmit: 3 dup ACKs приходят за 3 пакета × 1/650с = **4.6ms** → столл 4.6ms / 308ms = 1.5% → 0.985 × 7.64 = 7.52 Mbps (теория)
+- **Наблюдаемое** 3.38 Mbps ≈ теоретическое с частичным BB и BBR min floor = 32 packets × 1460 / 0.078 = 4.78 Mbps
+
+**Научное обоснование:**
+- RFC 5681 §3.2: fast retransmit стандартно для надёжного транспорта
+- BBR (Cardwell et al., ACM Queue 2016): BBR разработан для работы с Linux TCP stack, который имеет fast retransmit; BBR's cwnd не меняется на dup ACK (только OnLoss снижает при lossRate > 2%)
+- BBR-A study (ScienceDirect 2020): fast retransmit совместим с BBR и уменьшает ретрансмиссии на 60%
+
+**Реализация:**
+- Добавлено поле `dupAckCount int` в `Conn` (защищено `sendMu`)
+- `processACK` разделён на три пути: `ackNum < sendBase` (stale→ignore), `ackNum == sendBase` (dup→count), `ackNum > sendBase` (new→reset+process)
+- На 3-м dup ACK: немедленный ретрансмит head-of-line пакета; `bbr.inflight.OnLoss/OnSend` под `sendMu`, `conn.WriteToUDP` вне `sendMu` (копирует паттерн `doRetransmit`); `dupAckCount` сбрасывается в 0 → следующие dup ACKs начинают новый цикл
+- BBR cwnd не изменяется (BBR sам управляет через `OnLoss`; при lossRate=0.5% < 2% → cwnd не снижается)
+
+**Результат:** #15 ИСПРАВЛЕНО
+
+**Найденные проблемы:**
+- `server/transport/udp.go:519-523` — `if ackNum <= c.sendBase { return }` игнорировало dup ACKs: при потере пакета сервер ждал RTO=234ms вместо fast retransmit за ~5ms → download throughput ограничен ~3-4 Mbps при 0.5% loss
+
+**Изменённые файлы:**
+- `server/transport/udp.go` — добавлен `dupAckCount int` в `Conn`; `processACK` разделён на stale/dup/new пути; реализован fast retransmit на 3-м dup ACK (RFC 5681 §3.2) с BBR-совместимым loss accounting
+- `server/transport/udp_test.go` — добавлены 4 теста: `TestFastRetransmitTriggerOnThirdDupACK`, `TestFastRetransmitResetOnNewACK`, `TestFastRetransmitNoDupACKWithNoPending`, `TestFastRetransmitStaleACKIgnored`
+
+**Тесты:** все Go тесты pass (`go test ./... — ok`)
+
+**Следующий шаг:** Проверить гипотезу #16 — клиентский `reliable_udp.py` также не имеет механизма ускоренного ACK для out-of-order пакетов. Сейчас `_flush_ack()` всегда отправляет cumulative ACK немедленно (без delayed ACK timer), что хорошо. Но проверить: отправляет ли клиент dup ACKs при получении out-of-order пакетов? В `_process_data` при `seq_num > self._recv_seq` пакет буферируется, но ACK отправляется — это кумулятивный ACK за уже полученные пакеты, что является dup ACK для сервера. Значит клиент УЖЕ отправляет dup ACKs. Но возможно: отправляется ли dup ACK для КАЖДОГО out-of-order пакета или только один раз?
