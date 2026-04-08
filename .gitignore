@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+# Runtime-generated key files — may contain sensitive material
+server/allowed_keys.txt
