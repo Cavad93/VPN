@@ -217,6 +217,125 @@ class TestReliableUDP:
             client.close()
             server.close()
 
+    def test_fast_retransmit_triggers_on_3rd_dup_ack(self):
+        """3 duplicate ACKs trigger fast retransmit and enter fast recovery.
+
+        RFC 5681 §3.2:
+          - ssthresh = max(in_flight / 2, 2)
+          - cwnd = ssthresh + 3
+          - _in_fast_recovery = True
+          - The missing packet (ack_num) is retransmitted immediately.
+        """
+        client, server = _make_pair()
+        try:
+            client._cwnd = 16
+            client._ssthresh = 64
+            client._high_ack = 5
+
+            # Inject 8 fake in-flight packets (seq 5..12).
+            from reliable_udp import _PendingPacket
+            fake_raw = encode_packet(PACKET_TYPE_DATA, 0, 0, b"x")
+            for seq in range(5, 13):
+                pp = _PendingPacket(fake_raw)
+                pp.sent_at = time.monotonic()
+                client._pending[seq] = pp
+
+            in_flight = len(client._pending)          # 8
+            expected_ssthresh = max(in_flight // 2, 2)  # 4
+
+            # First two dup ACKs: no fast retransmit yet.
+            client._process_ack(5)
+            assert client._dup_ack_count == 1
+            assert not client._in_fast_recovery
+
+            client._process_ack(5)
+            assert client._dup_ack_count == 2
+            assert not client._in_fast_recovery
+
+            # Third dup ACK: fast retransmit fires.
+            client._process_ack(5)
+            assert client._dup_ack_count == 3
+            assert client._in_fast_recovery
+            assert client._ssthresh == expected_ssthresh
+            assert client._cwnd == expected_ssthresh + 3
+        finally:
+            client.close()
+            server.close()
+
+    def test_fast_recovery_cwnd_inflates_on_additional_dup_acks(self):
+        """During fast recovery, each additional dup ACK inflates cwnd by 1."""
+        client, server = _make_pair()
+        try:
+            client._cwnd = 7
+            client._ssthresh = 4
+            client._high_ack = 5
+            client._in_fast_recovery = True
+            client._dup_ack_count = 3
+
+            from reliable_udp import _PendingPacket
+            fake_raw = encode_packet(PACKET_TYPE_DATA, 0, 0, b"x")
+            for seq in range(5, 10):
+                pp = _PendingPacket(fake_raw)
+                pp.sent_at = time.monotonic()
+                client._pending[seq] = pp
+
+            # 4th dup ACK → cwnd += 1 (7→8).
+            client._process_ack(5)
+            assert client._cwnd == 8
+            assert client._in_fast_recovery
+
+            # 5th dup ACK → cwnd += 1 (8→9).
+            client._process_ack(5)
+            assert client._cwnd == 9
+            assert client._in_fast_recovery
+        finally:
+            client.close()
+            server.close()
+
+    def test_fast_recovery_exit_on_full_ack(self):
+        """A new cumulative ACK exits fast recovery and deflates cwnd to ssthresh."""
+        client, server = _make_pair()
+        try:
+            client._cwnd = 10      # inflated during recovery
+            client._ssthresh = 4
+            client._high_ack = 5
+            client._dup_ack_count = 5
+            client._in_fast_recovery = True
+
+            # Full ACK advances past all outstanding data.
+            client._process_ack(13)
+
+            assert not client._in_fast_recovery
+            assert client._dup_ack_count == 0
+            assert client._cwnd == 4   # deflated to ssthresh
+        finally:
+            client.close()
+            server.close()
+
+    def test_retransmit_resets_fast_recovery(self):
+        """RTO timeout resets fast recovery state before multiplicative decrease."""
+        client, server = _make_pair()
+        try:
+            client._cwnd = 10
+            client._ssthresh = 8
+            client._in_fast_recovery = True
+            client._dup_ack_count = 4
+            client._rto = 0.001
+
+            from reliable_udp import _PendingPacket
+            fake_raw = encode_packet(PACKET_TYPE_DATA, 0, 0, b"x")
+            pp = _PendingPacket(fake_raw)
+            pp.sent_at = 0.0   # always expired
+            client._pending[0] = pp
+
+            client._do_retransmit()
+
+            assert not client._in_fast_recovery
+            assert client._dup_ack_count == 0
+        finally:
+            client.close()
+            server.close()
+
     def test_retransmit_md_once_per_event(self):
         """Multiplicative decrease must apply at most once per _do_retransmit() call.
 

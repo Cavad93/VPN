@@ -129,6 +129,14 @@ class ReliableUDP:
         # ACK lock — protects sendto from concurrent callers.
         self._ack_lock = threading.Lock()
 
+        # Fast retransmit / fast recovery state (RFC 5681 §3.2).
+        # _high_ack: highest cumulative ACK received; used to detect dup ACKs.
+        # _dup_ack_count: consecutive duplicate ACK counter.
+        # _in_fast_recovery: True while in Reno fast recovery phase.
+        self._high_ack: int = 0
+        self._dup_ack_count: int = 0
+        self._in_fast_recovery: bool = False
+
         # Background threads.
         self._read_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._retransmit_thread = threading.Thread(target=self._retransmit_loop, daemon=True)
@@ -231,27 +239,86 @@ class ReliableUDP:
         self._rto = max(0.2, self._srtt + 4 * self._rttvar)
 
     def _process_ack(self, ack_num: int) -> None:
-        """Handle incoming ACK — release pending packets, grow window, update RTT."""
+        """Handle incoming ACK with fast retransmit + fast recovery (RFC 5681 §3.2).
+
+        New cumulative ACK (ack_num > _high_ack):
+          - Exit fast recovery: cwnd = ssthresh.
+          - Reset dup-ACK counter.
+          - Clear acknowledged packets, update RTT, grow cwnd normally.
+
+        Duplicate ACK (ack_num == _high_ack, pending packets exist):
+          - On 3rd dup ACK: fast retransmit the expected packet immediately
+            (no RTO wait), set ssthresh = max(in_flight/2, 2),
+            cwnd = ssthresh + 3.  Enter fast recovery.
+          - On subsequent dup ACKs in fast recovery: inflate cwnd +1 per dup ACK
+            (each represents one more segment buffered at receiver).
+
+        Timeout (_do_retransmit) resets fast recovery state before applying
+        standard multiplicative decrease.
+        """
         now = time.monotonic()
+        cleared = 0
         with self._send_lock:
-            cleared = 0
-            for seq in list(self._pending.keys()):
-                if seq < ack_num:
-                    pp = self._pending.pop(seq)
-                    cleared += 1
-                    # RTT sample only from un-retransmitted packets (Karn's algorithm).
-                    if pp.retransmits == 0:
-                        self._update_rto(now - pp.sent_at)
-                    # Congestion window growth.
-                    if self._cwnd < self._ssthresh:
-                        # Slow start: +1 per ACK.
-                        self._cwnd = min(self._cwnd + 1, MAX_WINDOW_SIZE)
-                    elif self._cwnd < MAX_WINDOW_SIZE:
-                        # Congestion avoidance (Reno): +1/cwnd per ACK → +1 per RTT.
-                        self._cwnd_remainder += 1.0 / self._cwnd
-                        if self._cwnd_remainder >= 1.0:
-                            self._cwnd += 1
-                            self._cwnd_remainder -= 1.0
+            if ack_num > self._high_ack:
+                # --- New cumulative ACK ---
+                if self._in_fast_recovery:
+                    # RFC 5681 §3.2: deflate cwnd to ssthresh on full ACK exit.
+                    self._cwnd = self._ssthresh
+                    self._cwnd_remainder = 0.0
+                    self._in_fast_recovery = False
+
+                self._dup_ack_count = 0
+                self._high_ack = ack_num
+
+                for seq in list(self._pending.keys()):
+                    if seq < ack_num:
+                        pp = self._pending.pop(seq)
+                        cleared += 1
+                        # RTT sample only from un-retransmitted packets (Karn's algorithm).
+                        if pp.retransmits == 0:
+                            self._update_rto(now - pp.sent_at)
+                        # Congestion window growth (not during fast recovery).
+                        if not self._in_fast_recovery:
+                            if self._cwnd < self._ssthresh:
+                                # Slow start: +1 per ACK.
+                                self._cwnd = min(self._cwnd + 1, MAX_WINDOW_SIZE)
+                            elif self._cwnd < MAX_WINDOW_SIZE:
+                                # Congestion avoidance: +1/cwnd per ACK → +1 per RTT.
+                                self._cwnd_remainder += 1.0 / self._cwnd
+                                if self._cwnd_remainder >= 1.0:
+                                    self._cwnd += 1
+                                    self._cwnd_remainder -= 1.0
+
+            elif ack_num == self._high_ack and self._pending:
+                # --- Duplicate ACK (only meaningful with outstanding data) ---
+                self._dup_ack_count += 1
+
+                if self._dup_ack_count == 3:
+                    # RFC 5681 §3.2 Fast Retransmit entry:
+                    # Use FlightSize (actual in-flight) rather than cwnd for
+                    # ssthresh — more accurate under burst loss (RFC 5681 §3.2).
+                    in_flight = len(self._pending)
+                    self._ssthresh = max(in_flight // 2, 2)
+                    # Retransmit the expected-but-missing packet immediately.
+                    if ack_num in self._pending:
+                        pp = self._pending[ack_num]
+                        try:
+                            self._sock.sendto(pp.raw, self._addr)
+                        except OSError:
+                            pass
+                        pp.sent_at = now
+                        pp.retransmits += 1
+                    # Inflate cwnd to ssthresh + 3 (3 segments buffered at receiver).
+                    self._cwnd = self._ssthresh + 3
+                    self._cwnd_remainder = 0.0
+                    self._in_fast_recovery = True
+
+                elif self._dup_ack_count > 3 and self._in_fast_recovery:
+                    # Additional dup ACK during fast recovery — inflate cwnd by 1.
+                    # Reflects one more segment safely buffered at the receiver.
+                    self._cwnd = min(self._cwnd + 1, MAX_WINDOW_SIZE)
+            # ack_num < _high_ack: stale ACK — ignore silently.
+
         if cleared > 0:
             self._window_open.set()
 
@@ -311,6 +378,11 @@ class ReliableUDP:
         dropped = 0
         did_reduce = False   # MD/RTO-backoff applied at most once per event
         with self._send_lock:
+            # RTO expiry exits fast recovery — the dup-ACK count is stale and
+            # further inflation would be incorrect.  Reset before applying MD.
+            if self._in_fast_recovery:
+                self._in_fast_recovery = False
+                self._dup_ack_count = 0
             for seq in list(self._pending.keys()):
                 pp = self._pending[seq]
                 if now - pp.sent_at < self._rto:

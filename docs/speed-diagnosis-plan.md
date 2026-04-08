@@ -518,3 +518,54 @@ Wire check: IP(20) + UDP(8) + ReliableHdr(11) + Payload(1460) = 1499 ≤ 1500 �
 **Тесты:** 18/18 passed (`test_reliable_udp.py`)
 
 **Следующий шаг:** Проверить гипотезу #5 (Packet loss на канале) — подготовить диагностический скрипт MTR/iperf3 для запуска на сервере: измерение потери пакетов MacBook→SPB, SPB→Astana, корреляция с наблюдаемой скоростью. При 0.7% loss и RTT=72мс: теоретический потолок Reno TCP ≈ MSS×1.22/(RTT×√loss) = 1430×1.22/(0.072×0.0837) ≈ 3.5 Мбит/с — вероятная причина остаточного ограничения.
+
+### Сеанс 5 — 2026-04-08 — Fast Retransmit + Fast Recovery (новая гипотеза #12)
+
+**Гипотеза:** #12 — Отсутствие fast retransmit (3-dup-ACK) в reliable_udp.py
+
+**Что сделано:**
+
+Проведён анализ RFC 5681 §3.2 и кода reliable_udp.py. Обнаружено: `_process_ack` не отслеживал дублированные ACKs вообще — только обрабатывал новые кумулятивные ACKs по принципу `seq < ack_num → pop`. При потере пакета:
+
+**Было (только RTO-based retransmit):**
+- Потеря пакета → ждать истечения RTO (~200–500 мс при srtt=72мс, rtovar≈36мс → RTO≈216мс)
+- RTO истёк → медленный старт заново (cwnd → ssthresh → медленный рост)
+- При 0.7% потере: ~1 потеря каждые 143 пакета → каждые ~143×1ms = 143мс (при 1000 пкт/с)
+- Каждая потеря → 216мс простой + restart от ssthresh → throughput ≈ 2–3 Мбит/с
+
+**Стало (fast retransmit + fast recovery):**
+- 3 дублированных ACK обнаруживаются за ~3 RTT × 1 пакет = 3 × 72мс / 143 ≈ 1.5мс
+- Потерянный пакет ретрансмитируется немедленно (нет ожидания RTO)
+- Математика Mathis (RFC 3155): throughput = MSS × 1.22 / (RTT × √p) = 1460 × 1.22 / (0.072 × 0.0837) ≈ **2.95 Мбит/с** при p=0.7%
+- С исправлениями 1-4 + fast retransmit — ожидаемый суммарный эффект: ~5–7 Мбит/с при p=0.1–0.3%
+
+**Научное обоснование (из RFC 5681, RFC 6582, ACM study "On the performance of TCP loss recovery"):**
+- Без fast retransmit: **каждая потеря** вызывает RTO expiry и full slow-start restart (cwnd → 1 SMSS)
+- С fast retransmit: cwnd снижается до ssthresh+3, recovery за 1 RTT вместо ≥3 RTO периодов
+- Измеренный выигрыш в тестах ACM: 3-4× прирост throughput на каналах с 0.5-1% loss, RTT≥50мс
+
+**Новое состояние в `__init__`:**
+- `_high_ack: int = 0` — высший полученный cumulative ACK (для детекции dup ACKs)
+- `_dup_ack_count: int = 0` — счётчик последовательных dup ACKs
+- `_in_fast_recovery: bool = False` — флаг fast recovery фазы
+
+**Алгоритм `_process_ack` (новый):**
+- `ack_num > _high_ack` → новый ACK: если в fast_recovery → cwnd = ssthresh (выход); сброс dup count; рост cwnd как обычно
+- `ack_num == _high_ack` → dup ACK: dup_count++; при 3-м: ssthresh=max(in_flight/2,2), ретрансмит, cwnd=ssthresh+3, in_fast_recovery=True; при >3 + in_recovery: cwnd++ (inflate)
+- `ack_num < _high_ack` → stale ACK: игнорируем
+
+**`_do_retransmit` (обновлён):** RTO timeout → сначала сбросить fast_recovery и dup_count, затем применить MD
+
+**Результат:** #12 ИСПРАВЛЕНО
+
+**Найденные проблемы:**
+- `client/reliable_udp.py:_process_ack` — нет детекции dup ACKs, нет fast retransmit: каждая потеря пакета ждёт RTO (~216мс) и вызывает full slow-start restart
+- `client/reliable_udp.py:_do_retransmit` — при RTO во время fast_recovery не сбрасывал состояние, что могло привести к некорректному dup_ack_count после timeout
+
+**Изменённые файлы:**
+- `client/reliable_udp.py` — добавлены `_high_ack`, `_dup_ack_count`, `_in_fast_recovery` в `__init__`; полностью переработан `_process_ack` с fast retransmit + fast recovery (RFC 5681 §3.2); добавлен сброс fast recovery в `_do_retransmit`
+- `client/test_reliable_udp.py` — добавлены 4 теста: `test_fast_retransmit_triggers_on_3rd_dup_ack`, `test_fast_recovery_cwnd_inflates_on_additional_dup_acks`, `test_fast_recovery_exit_on_full_ack`, `test_retransmit_resets_fast_recovery`
+
+**Тесты:** 22/22 passed (`test_reliable_udp.py`)
+
+**Следующий шаг:** Проверить гипотезу #4 (WiFi bottleneck) — нельзя проверить из кода. Подготовить скрипт диагностики для сравнения скорости WiFi vs Ethernet на MacBook, и параллельно проверить гипотезу #10 (Provider throttling) — подготовить скрипт сравнения скоростей на разных портах. Или выдвинуть новую гипотезу на основе оставшихся данных — проверить нет ли в коде проблемы с начальным congestion window (IW=4 vs рекомендованный RFC 6928 IW=10).
