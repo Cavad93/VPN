@@ -67,10 +67,9 @@ object QrConfig {
             if (host.isBlank()) throw IllegalArgumentException("server host is empty")
         }
 
-        val key = map["key"] ?: map["private_key"]
-            ?: throw IllegalArgumentException("QR config missing 'key' or 'private_key' field")
-
-        validateKey(key)
+        // private_key is optional: if absent the app auto-generates a key on first connect.
+        val key = map["key"] ?: map["private_key"] ?: ""
+        if (key.isNotEmpty()) validateKey(key)
 
         return VpnConfig(
             serverHost        = host,
@@ -117,10 +116,10 @@ object QrConfig {
             if (host.isBlank()) throw IllegalArgumentException("server host is empty")
         }
 
-        // Accept "key" (old) or "private_key" (server-generated) for the client private key
-        val key = params["key"] ?: params["private_key"]
-            ?: throw IllegalArgumentException("URI config missing 'key' or 'private_key' parameter")
-        validateKey(key)
+        // Accept "key" (old) or "private_key" (server-generated) for the client private key.
+        // If absent (shared QR format), the app auto-generates a key on first connect.
+        val key = params["key"] ?: params["private_key"] ?: ""
+        if (key.isNotEmpty()) validateKey(key)
 
         return VpnConfig(
             serverHost        = host,

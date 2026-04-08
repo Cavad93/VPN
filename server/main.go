@@ -1528,11 +1528,13 @@ func main() {
 	var anthropicKey string
 	var relayTo string
 	var diagnosticsFile string
+	var openAccess bool
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
 	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
 	flag.StringVar(&cfg.PrivKeyFile, "privkey", cfg.PrivKeyFile, "path to hex-encoded private key file")
 	flag.StringVar(&cfg.Transport, "transport", cfg.Transport, "transport protocol: tcp (kernel CC) or udp (user-space BBR)")
 	flag.StringVar(&cfg.AllowedKeysFile, "allowed-keys-file", cfg.AllowedKeysFile, "path to file with allowed client public keys (one hex key per line); persists across restarts")
+	flag.BoolVar(&openAccess, "open", false, "allow any client key — ignore allowed_keys.txt (use with shared QR)")
 	flag.StringVar(&apiCfg.ListenAddr, "api-addr", apiCfg.ListenAddr, "REST API listen address (empty to disable)")
 	flag.StringVar(&apiCfg.APIToken, "api-token", "", "Bearer token for the REST API (empty = auto-generate a secure random token on startup)")
 	flag.StringVar(&vlessAddr, "vless-addr", "", "VLESS+WS+TLS listen address (e.g. 0.0.0.0:443)")
@@ -1605,12 +1607,19 @@ func main() {
 	}
 
 	// Load the persisted allowed-keys list (if any).
-	persistedKeys, err := loadAllowedKeysFile(cfg.AllowedKeysFile)
-	if err != nil {
-		logger.Warn("failed to load allowed_keys file — starting in open-access mode", "err", err)
-		persistedKeys = nil
-	} else if len(persistedKeys) > 0 {
-		logger.Info("loaded allowed_keys", "path", cfg.AllowedKeysFile, "count", len(persistedKeys))
+	// -open flag bypasses the file entirely (allow any client key).
+	var persistedKeys [][32]byte
+	if openAccess {
+		logger.Info("open-access mode — any client key accepted (shared QR)")
+	} else {
+		var err error
+		persistedKeys, err = loadAllowedKeysFile(cfg.AllowedKeysFile)
+		if err != nil {
+			logger.Warn("failed to load allowed_keys file — starting in open-access mode", "err", err)
+			persistedKeys = nil
+		} else if len(persistedKeys) > 0 {
+			logger.Info("loaded allowed_keys", "path", cfg.AllowedKeysFile, "count", len(persistedKeys))
+		}
 	}
 
 	srv, err := NewServer(cfg, kp, tun, persistedKeys, logger)

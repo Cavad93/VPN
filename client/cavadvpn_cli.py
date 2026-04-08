@@ -63,6 +63,31 @@ def cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _ensure_client_key(key_file: str) -> str:
+    """Return path to client key file, generating a key pair if it doesn't exist."""
+    path = Path(key_file)
+    if path.exists():
+        return key_file
+    # Auto-generate a new X25519 key pair and save the private key as hex.
+    try:
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    except ImportError:
+        print("ERROR: cryptography package not installed. Run: pip install cryptography", file=sys.stderr)
+        sys.exit(1)
+    priv = X25519PrivateKey.generate()
+    priv_bytes = priv.private_bytes_raw()
+    # RFC 7748 clamp
+    b = bytearray(priv_bytes)
+    b[0] &= 0xF8
+    b[31] &= 0x7F
+    b[31] |= 0x40
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(b.hex())
+    path.chmod(0o600)
+    print(f"Generated new client key → {path}")
+    return key_file
+
+
 def cmd_connect(args: argparse.Namespace) -> int:
     """Connect to VPN server."""
     config_path = Path(args.config)
@@ -76,9 +101,13 @@ def cmd_connect(args: argparse.Namespace) -> int:
         )
         return 1
 
-    key_file = args.key or cfg.get("private_key_file") or str(
-        Path.home() / ".config" / "cavadvpn" / "client.key"
+    key_file = _ensure_client_key(
+        args.key or cfg.get("private_key_file") or str(
+            Path.home() / ".config" / "cavadvpn" / "client.key"
+        )
     )
+
+    server_key_hex = args.server_key or cfg.get("server_key") or ""
 
     # Telemetry: server URL for sending metrics (API port, not VPN port).
     # Defaults to http://<server_host>:8080, overridable via config or --telemetry-url.
@@ -118,13 +147,15 @@ def cmd_connect(args: argparse.Namespace) -> int:
             auto_detect_done = False
 
     print(f"Connecting to {server} ...")
+    if server_key_hex:
+        print(f"Server key pinned: {server_key_hex[:16]}…")
 
     try:
         from core import VPNConfig, VPNClient  # type: ignore
 
+        # server is already in "host:port" format — pass directly.
         vpn_cfg = VPNConfig(
-            server_addr=server.split(":")[0],
-            server_port=int(server.split(":")[1]) if ":" in server else 443,
+            server_addr=server,
             private_key_file=key_file,
         )
         client = VPNClient(vpn_cfg)
@@ -300,6 +331,8 @@ def build_parser() -> argparse.ArgumentParser:
     conn = subs.add_parser("connect", help="connect to VPN server")
     conn.add_argument("--server", metavar="HOST:PORT", help="server address")
     conn.add_argument("--key", metavar="FILE", help="private key file")
+    conn.add_argument("--server-key", metavar="HEX",
+                      help="server public key (64 hex chars); from GET /api/v1/qr/shared")
     conn.add_argument("--telemetry-url", metavar="URL",
                        help="telemetry endpoint (default: http://<server>:8080)")
     conn.add_argument(

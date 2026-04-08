@@ -60,6 +60,9 @@ func (a *APIServer) SetQRServer(qrs QRServerIface) {
 	a.mux.HandleFunc("POST /api/v1/qr/generate", a.auth(a.handleQRGenerate))
 	a.mux.HandleFunc("GET /api/v1/qr/generate", a.auth(a.handleQRGenerate))
 	a.mux.HandleFunc("GET /api/v1/qr/server-info", a.auth(a.handleQRServerInfo))
+	// Shared QR: only server public key + address, no client private key.
+	// Any device that scans this can connect (server must be in open-access mode).
+	a.mux.HandleFunc("GET /api/v1/qr/shared", a.auth(a.handleQRShared))
 }
 
 // handleQRGenerate генерирует новую клиентскую пару ключей, добавляет публичный ключ
@@ -116,6 +119,61 @@ func (a *APIServer) handleQRGenerate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("X-VPN-Host", host)
 	w.Header().Set("X-VPN-Server-Key", cfg.ServerKey)
+	w.WriteHeader(http.StatusOK)
+	w.Write(png) //nolint:errcheck
+}
+
+// handleQRShared generates a shareable QR containing ONLY server info (host, port, server_key).
+// No client private key is included — each device auto-generates its own key pair on scan.
+// The server must be in open-access mode (no allowed_keys.txt) for all devices to connect.
+//
+// URI format: cavadvpn://config?host=HOST&port=PORT&server_key=HEX&dns=DNS
+func (a *APIServer) handleQRShared(w http.ResponseWriter, r *http.Request) {
+	if a.qrSrv == nil {
+		writeError(w, http.StatusServiceUnavailable, "QR server not configured")
+		return
+	}
+
+	dns := r.URL.Query().Get("dns")
+	if dns == "" {
+		dns = "1.1.1.1"
+	}
+
+	host, port, err := splitHostPort(a.qrSrv.VPNListenAddr())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "invalid server listen address: "+err.Error())
+		return
+	}
+
+	serverPub := a.qrSrv.PublicKey()
+	serverKeyHex := hex.EncodeToString(serverPub[:])
+
+	if r.URL.Query().Get("format") == "json" {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"host":       host,
+			"port":       port,
+			"server_key": serverKeyHex,
+			"dns":        dns,
+			"note":       "scan with any device — client key is auto-generated on device",
+		})
+		return
+	}
+
+	// URI without private_key — Android/Python clients auto-generate their own key.
+	uri := "cavadvpn://config?host=" + host +
+		"&port=" + strconv.Itoa(port) +
+		"&server_key=" + serverKeyHex +
+		"&dns=" + dns
+
+	png, err := qrcode.Encode(uri, qrcode.Medium, 256)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "QR encode failed: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("X-VPN-Host", host)
+	w.Header().Set("X-VPN-Server-Key", serverKeyHex)
 	w.WriteHeader(http.StatusOK)
 	w.Write(png) //nolint:errcheck
 }

@@ -15,6 +15,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.cavadvpn.R
 import com.cavadvpn.config.ConfigStore
+import com.cavadvpn.crypto.generateKeyPair
 import com.cavadvpn.vpn.ACTION_CONNECT
 import com.cavadvpn.vpn.ACTION_DISCONNECT
 import com.cavadvpn.vpn.ACTION_STATS_UPDATE
@@ -173,11 +174,22 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // If the QR was a shared config (no private_key), auto-generate a key pair
+        // and persist it so reconnects reuse the same identity.
+        val privateKeyHex = if (config.privateKeyHex.isBlank()) {
+            val kp = generateKeyPair()
+            val hex = kp.privateKey.joinToString("") { "%02x".format(it) }
+            prefs.edit().putString(ConfigStore.KEY_PRIVATE_KEY, hex).apply()
+            hex
+        } else {
+            config.privateKeyHex
+        }
+
         val intent = Intent(this, CavadVpnService::class.java).apply {
             action = ACTION_CONNECT
             putExtra(EXTRA_SERVER_HOST,       config.serverHost)
             putExtra(EXTRA_SERVER_PORT,       config.serverPort)
-            putExtra(EXTRA_PRIVATE_KEY,       config.privateKeyHex)
+            putExtra(EXTRA_PRIVATE_KEY,       privateKeyHex)
             putExtra(EXTRA_SERVER_PUBLIC_KEY, config.serverPublicKeyHex)
         }
         startService(intent)
