@@ -466,3 +466,55 @@ for seq in list(self._pending.keys()):
 **Тесты:** 18/18 passed (`test_reliable_udp.py`)
 
 **Следующий шаг:** Проверить гипотезу #9 (MTU/фрагментация) — изучить MTU настройки TUN интерфейса на клиенте и сервере: `tun_linux.go`, `tun_macos.py`. Соответствует ли TUN MTU расчёту из reliable_udp.py (1370 байт)? Проверить нет ли IP-фрагментации на пути MacBook→SPB→Astana.
+
+### Сеанс 4 — 2026-04-08 — MAX_PAYLOAD_SIZE/TUN MTU mismatch (гипотеза #9)
+
+**Гипотеза:** #9 — MTU/фрагментация: несоответствие TUN MTU и MAX_PAYLOAD_SIZE в reliable_udp.py
+
+**Что сделано:**
+
+Проведён анализ MTU-цепочки по всем слоям VPN стека с применением формул из WireGuard/OpenVPN RFC 1191:
+
+**Анализ MTU-цепочки:**
+
+| Слой | Размер | Источник |
+|------|--------|---------|
+| Ethernet MTU | 1500 байт | физический |
+| Outer IP header | -20 байт | IPv4 |
+| Outer UDP header | -8 байт | UDP |
+| Reliable UDP header | -11 байт | HEADER_SIZE |
+| **Max UDP payload** | **1461 байт** → 1460 (выровненный) | расчёт |
+| VPN overhead (mux+noise+obfs) | -30 байт | тот же во всех слоях |
+| **Max inner IP packet** | **1430 байт** | 1460 - 30 |
+
+**Найдено критическое несоответствие:**
+- `tun_macos.py:63` — `DEFAULT_MTU = 1430` — kernel генерирует inner IP пакеты ≤ 1430 байт ✓
+- `reliable_udp.py:51` — `MAX_PAYLOAD_SIZE = 1350` — пакеты обрезались до 1350 байт **✗ BUG**
+
+**Механизм потери производительности:**
+- Inner IP (1430 байт) + VPN overhead (30 байт) = **1460 байт** payload
+- Старый MAX_PAYLOAD_SIZE = 1350 < 1460 → каждый пакет разбивался на **2 UDP датаграммы** (1350 + 110)
+- 2 датаграммы = 2 слота в cwnd → эффективная ёмкость cwnd вдвое меньше
+- При cwnd = N → пропускная способность upload = N×1430/RTT вместо 2N×1350/RTT
+- Реальный эффект: **upload ограничен ~50% от максимума**
+
+**Доказательство (расчёт):**
+```
+Старый MAX_PAYLOAD_SIZE=1350:  1460 байт → ceiling(1460/1350) = 2 датаграммы на IP-пакет
+Новый MAX_PAYLOAD_SIZE=1460:  1460 байт → ceiling(1460/1460) = 1 датаграмма на IP-пакет
+Wire check: IP(20) + UDP(8) + ReliableHdr(11) + Payload(1460) = 1499 ≤ 1500 ✓
+```
+
+Комментарий в `reliable_udp.py` сам описывал проблему: *"Until that's wired up, we shrink MAX_PAYLOAD_SIZE to 1350"* — TUN MTU был «wired up» в `tun_macos.py` (DEFAULT_MTU=1430) но `reliable_udp.py` не обновлён. Два независимых изменения создали рассинхронизацию.
+
+**Результат:** #9 ИСПРАВЛЕНО
+
+**Найденные проблемы:**
+- `client/reliable_udp.py:51` — `MAX_PAYLOAD_SIZE = 1350` при `tun_macos.py` TUN MTU = 1430: каждый inner IP пакет (1430 байт) с VPN overhead (30 байт) = 1460 байт > 1350 → 2 UDP датаграммы вместо 1 → эффективно вдвое больше cwnd слотов на пакет → upload throughput урезан вдвое
+
+**Изменённые файлы:**
+- `client/reliable_udp.py` — `MAX_PAYLOAD_SIZE`: 1350 → 1460; полностью переписан комментарий с правильной математикой формулы расчёта (Ethernet MTU − IP − UDP − ReliableHdr = 1461 → 1460 payload; 1460 − 30 overhead = 1430 max inner IP = DEFAULT_MTU в tun_macos.py)
+
+**Тесты:** 18/18 passed (`test_reliable_udp.py`)
+
+**Следующий шаг:** Проверить гипотезу #5 (Packet loss на канале) — подготовить диагностический скрипт MTR/iperf3 для запуска на сервере: измерение потери пакетов MacBook→SPB, SPB→Astana, корреляция с наблюдаемой скоростью. При 0.7% loss и RTT=72мс: теоретический потолок Reno TCP ≈ MSS×1.22/(RTT×√loss) = 1430×1.22/(0.072×0.0837) ≈ 3.5 Мбит/с — вероятная причина остаточного ограничения.

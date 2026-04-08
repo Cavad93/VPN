@@ -33,6 +33,13 @@ HEADER_SIZE = 11
 # IP datagram without IP-level fragmentation (path MTU ≈ 1500 bytes including
 # IP+UDP headers of ~28 bytes → effective MTU for UDP payload = 1472 bytes).
 #
+#   Ethernet MTU        : 1500 bytes
+#   outer IP header     :  -20 bytes
+#   outer UDP header    :   -8 bytes
+#   reliable UDP header :  -11 bytes  (HEADER_SIZE)
+#   ────────────────────────────────
+#   Max UDP payload     : 1461 bytes  → round down to 1460 for alignment
+#
 # The VPN adds protocol overhead PER IP PACKET on top of the UDP payload:
 #   ObfsConn TLS record header :  5 bytes
 #   Noise length prefix        :  2 bytes
@@ -41,14 +48,15 @@ HEADER_SIZE = 11
 #   ─────────────────────────────────────
 #   Total inner overhead       : 30 bytes
 #
-# So the max inner IP packet size that fits in one UDP payload = 1400 - 30 = 1370 B.
-# The VPN TUN MTU should be set to 1370 to prevent the kernel from generating
-# IP packets that overflow this.  Until that's wired up, we shrink MAX_PAYLOAD_SIZE
-# to 1350 (giving 20 B margin for any additional framing) so that a full-MTU
-# inner IP packet still exits as a single UDP datagram — halving UDP packet count
-# and ACK traffic vs the previous behaviour where 1400-byte IP frames were split
-# into (1400 B + 30 B overhead) = 1430 B → 2 UDP datagrams.
-MAX_PAYLOAD_SIZE = 1350
+# Max inner IP packet = MAX_PAYLOAD_SIZE − 30 = 1460 − 30 = 1430 bytes.
+# tun_macos.py sets DEFAULT_MTU = 1430, ensuring that every inner IP packet
+# produces EXACTLY ONE UDP datagram — matching the Go server's MaxPayloadSize
+# (transport/udp.go) and halving the UDP packet count vs a 1350-byte payload
+# (which split every 1430-byte inner-IP+overhead into two datagrams, effectively
+# halving cwnd utilisation and upload throughput).
+#
+# Wire check: HEADER(11) + MAX_PAYLOAD_SIZE(1460) = 1471 ≤ 1472 max UDP payload. ✓
+MAX_PAYLOAD_SIZE = 1460
 MAX_WINDOW_SIZE = 512    # was 64 — old cap hit at ~5 Mbps @ 136ms RTT
 INITIAL_RTO = 0.5        # initial RTO; replaced by adaptive RTT-based RTO (RFC 6298)
 MAX_RETRANSMITS = 10
