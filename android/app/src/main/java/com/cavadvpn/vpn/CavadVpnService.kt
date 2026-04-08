@@ -140,6 +140,7 @@ class CavadVpnService : VpnService() {
                     serverAddr = currentServerAddr,
                 )
             },
+            onConfigUpdate = { aiCfg -> onAiConfigUpdate(config, aiCfg) },
         )
 
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -173,8 +174,9 @@ class CavadVpnService : VpnService() {
                 updateNotification("Connected — ${route.assignedIp}")
                 broadcastState("CONNECTED")
 
-                // Start telemetry collection.
+                // Start telemetry with current transport info.
                 telemetry?.recordConnect()
+                telemetry?.setTransportInfo(transport = "tcp", bonds = 0)
                 telemetry?.start()
 
                 // Start stats broadcast coroutine
@@ -393,5 +395,64 @@ class CavadVpnService : VpnService() {
     private fun updateNotification(text: String) {
         getSystemService(NotificationManager::class.java)
             .notify(NOTIFICATION_ID, buildNotification(text))
+    }
+
+    // -----------------------------------------------------------------------
+    // AI config update handler
+    // -----------------------------------------------------------------------
+
+    /**
+     * Called by TelemetryCollector (on IO thread) when the AI has changed
+     * the active config. Applies what can be applied without reconnect, and
+     * schedules a reconnect when bond_count or mtu changes.
+     */
+    private fun onAiConfigUpdate(currentConfig: VpnConfig, aiCfg: TelemetryCollector.AiConfig) {
+        Log.i(TAG, "AI config update: transport=${aiCfg.transportMode} " +
+                   "bonds=${aiCfg.bondCount} mtu=${aiCfg.mtu} " +
+                   "padding=${aiCfg.paddingMode} jitter=${aiCfg.jitterMs}ms")
+
+        // Update telemetry transport info so next report reflects AI settings.
+        telemetry?.setTransportInfo(
+            transport = aiCfg.transportMode,
+            bonds     = aiCfg.bondCount,
+            padding   = aiCfg.paddingMode,
+            sni       = aiCfg.sniHosts.firstOrNull() ?: "",
+        )
+
+        // If MTU changed, reconnect is required (TUN interface must be rebuilt).
+        val mtuChanged  = aiCfg.mtu > 0 && aiCfg.mtu != currentConfig.mtu
+        if (mtuChanged) {
+            Log.i(TAG, "AI changed MTU ${currentConfig.mtu}→${aiCfg.mtu}, scheduling reconnect")
+            val newConfig = currentConfig.copy(mtu = aiCfg.mtu)
+            updateNotification("AI: MTU updated to ${aiCfg.mtu} — reconnecting…")
+            serviceScope?.launch {
+                delay(2_000) // brief delay so logs flush
+                cleanupResources()
+                startVpn(newConfig)
+            }
+            return
+        }
+
+        // Non-reconnect changes: just log and update notification.
+        val changes = buildList {
+            if (aiCfg.paddingMode.isNotEmpty()) add("padding=${aiCfg.paddingMode}")
+            if (aiCfg.jitterMs > 0)             add("jitter=${aiCfg.jitterMs}ms")
+            if (aiCfg.transportMode.isNotEmpty()) add("transport=${aiCfg.transportMode}")
+            if (aiCfg.sniHosts.isNotEmpty())     add("sni=${aiCfg.sniHosts.first()}")
+        }
+        if (changes.isNotEmpty()) {
+            updateNotification("AI tuned: ${changes.joinToString(", ")}")
+        }
+
+        // Broadcast so MainActivity can show the update.
+        val intent = Intent("com.cavadvpn.AI_CONFIG_UPDATE").apply {
+            putExtra("transport_mode", aiCfg.transportMode)
+            putExtra("bond_count",     aiCfg.bondCount)
+            putExtra("mtu",            aiCfg.mtu)
+            putExtra("padding_mode",   aiCfg.paddingMode)
+            putExtra("jitter_ms",      aiCfg.jitterMs)
+            setPackage(packageName)
+        }
+        sendBroadcast(intent)
     }
 }

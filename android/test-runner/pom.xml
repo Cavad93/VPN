@@ -27,7 +27,12 @@
             <artifactId>junit</artifactId>
             <version>4.13.2</version>
         </dependency>
-        <!-- Stub for android.content.SharedPreferences (we provide our own fake) -->
+        <!-- org.json for JSONObject used by TelemetryCollector -->
+        <dependency>
+            <groupId>org.json</groupId>
+            <artifactId>json</artifactId>
+            <version>20231013</version>
+        </dependency>
     </dependencies>
 
     <build>
