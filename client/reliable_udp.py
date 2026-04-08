@@ -28,7 +28,27 @@ PACKET_TYPE_FIN = 0x04
 
 # Protocol constants — match server values.
 HEADER_SIZE = 11
-MAX_PAYLOAD_SIZE = 1400
+# MAX_PAYLOAD_SIZE is the max bytes carried in one UDP packet's payload field.
+# The complete on-wire size is: HEADER(11) + payload, which must fit in one
+# IP datagram without IP-level fragmentation (path MTU ≈ 1500 bytes including
+# IP+UDP headers of ~28 bytes → effective MTU for UDP payload = 1472 bytes).
+#
+# The VPN adds protocol overhead PER IP PACKET on top of the UDP payload:
+#   ObfsConn TLS record header :  5 bytes
+#   Noise length prefix        :  2 bytes
+#   ChaCha20-Poly1305 AEAD tag : 16 bytes
+#   Mux frame header           :  7 bytes
+#   ─────────────────────────────────────
+#   Total inner overhead       : 30 bytes
+#
+# So the max inner IP packet size that fits in one UDP payload = 1400 - 30 = 1370 B.
+# The VPN TUN MTU should be set to 1370 to prevent the kernel from generating
+# IP packets that overflow this.  Until that's wired up, we shrink MAX_PAYLOAD_SIZE
+# to 1350 (giving 20 B margin for any additional framing) so that a full-MTU
+# inner IP packet still exits as a single UDP datagram — halving UDP packet count
+# and ACK traffic vs the previous behaviour where 1400-byte IP frames were split
+# into (1400 B + 30 B overhead) = 1430 B → 2 UDP datagrams.
+MAX_PAYLOAD_SIZE = 1350
 MAX_WINDOW_SIZE = 512    # was 64 — old cap hit at ~5 Mbps @ 136ms RTT
 INITIAL_RTO = 0.5        # initial RTO; replaced by adaptive RTT-based RTO (RFC 6298)
 MAX_RETRANSMITS = 10
@@ -311,6 +331,23 @@ class ReliableUDP:
 
     def setsockopt(self, *args):
         pass  # no-op for compatibility
+
+    def recv_into(self, buffer) -> int:
+        """Fill *buffer* with the next available reassembled payload.
+
+        Implements the socket.recv_into() interface so that ObfsConn (which
+        calls recv_into on whatever transport it wraps) works over UDP.
+
+        ReliableUDP delivers one reassembled packet at a time (up to
+        MAX_PAYLOAD_SIZE=1400 bytes).  The staging buffer that ObfsConn passes
+        is 262 144 bytes — we only use as many bytes as the payload needs.
+        The ObfsConn._recv_exactly loop accumulates chunks in its sock_buf, so
+        partial fills are perfectly fine.
+        """
+        data = self.read()
+        n = min(len(data), len(buffer))
+        buffer[:n] = data[:n]
+        return n
 
 
 def connect_udp(host: str, port: int, timeout: float = 30.0) -> ReliableUDP:

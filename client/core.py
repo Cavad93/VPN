@@ -564,6 +564,10 @@ class NoiseConn:
         self._session = session
         self._read_buf = b""
         self._perf = perf  # optional PerfCollector
+        # Pre-allocated 2-byte header buffer — reused on every write_message call
+        # to avoid the struct.pack(">H", ...) allocation on the hot send path.
+        # struct.pack_into writes in-place; no new bytes object is created.
+        self._len_hdr = bytearray(2)
 
     def write_message(self, plaintext: bytes) -> None:
         if self._perf:
@@ -574,9 +578,15 @@ class NoiseConn:
             self._perf.track_latency(Stage.NOISE_ENCRYPT, _t.monotonic() - _t0)
         else:
             ciphertext = self._session.send_cipher.encrypt(plaintext)
-        # Build length prefix + ciphertext in one concatenation (bytes + bytes
-        # is faster than bytearray construction for typical packet sizes ≤1500).
-        self._obfs.write(struct.pack(">H", len(ciphertext)) + ciphertext)
+        # Build length-prefixed frame in a single bytearray (1 alloc + 1 copy).
+        # Original: pack(">H",...) + ciphertext = 2 allocs + 2 copies.
+        # New: bytearray(2+n), pack_into header in-place, slice-assign payload.
+        n = len(ciphertext)
+        frame = bytearray(2 + n)
+        frame[0] = n >> 8
+        frame[1] = n & 0xFF
+        frame[2:] = ciphertext
+        self._obfs.write(frame)
 
     def read_message(self) -> bytes:
         # Read 2-byte length prefix — int.from_bytes avoids tuple alloc.

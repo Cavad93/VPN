@@ -376,8 +376,14 @@ func (s *Server) runUDP(ctx context.Context) error {
 				continue
 			}
 		}
-		// Seed BBR: 15 Mbps @ 65ms RTT — skip slow Startup phase.
-		conn.SetInitialBandwidth(15_000_000/8, 65*time.Millisecond)
+		// Seed BBR: 8 Mbps @ 120ms RTT — typical CIS (Russia↔Kazakhstan) path.
+		// Old seed was 15 Mbps @ 65ms, which overshoots on high-latency links:
+		// BBR Startup cwnd = 2×BDP = 2×(1.875 MB × 65ms) ≈ 30 KB; at real
+		// 166ms that's too small and BBR probes aggressively, filling buffers,
+		// causing loss, and measuring artificially high RTT.
+		// 8 Mbps @ 120ms: BDP = 120 KB, cwnd starts at 240 KB — enough headroom
+		// for Startup without overfilling shallow ISP buffers.
+		conn.SetInitialBandwidth(8_000_000/8, 120*time.Millisecond)
 		go s.handleConn(ctx, conn) //nolint:errcheck
 	}
 }
