@@ -89,6 +89,34 @@ def cmd_connect(args: argparse.Namespace) -> int:
         or f"http://{server_host}:8080"
     )
 
+    # Smart routing: probe blocklist BEFORE VPN connects if --auto-detect is on,
+    # so probes go through the direct connection (not yet tunnelled).
+    smart_router = None
+    if getattr(args, "smart_route", False):
+        try:
+            from smart_route import create_smart_router  # type: ignore
+            auto_detect = getattr(args, "auto_detect", False)
+            if auto_detect:
+                print("Smart route: probing blocked sites (this takes ~10 seconds)…")
+            smart_router = create_smart_router(
+                vpn_interface=cfg.get("tun_interface", ""),
+                use_default_blocklist=True,
+                auto_detect=auto_detect,
+                probe_cache_file=str(
+                    Path.home() / ".config" / "cavadvpn" / "probe_cache.json"
+                ),
+            )
+            if auto_detect:
+                # Run the probe NOW, before VPN changes the default route.
+                smart_router._run_auto_detect()  # noqa: SLF001 — intentional pre-start probe
+                auto_detect_done = True
+            else:
+                auto_detect_done = False
+        except ImportError as exc:
+            print(f"Warning: smart_route not available: {exc}", file=sys.stderr)
+            smart_router = None
+            auto_detect_done = False
+
     print(f"Connecting to {server} ...")
 
     try:
@@ -100,8 +128,25 @@ def cmd_connect(args: argparse.Namespace) -> int:
             private_key_file=key_file,
         )
         client = VPNClient(vpn_cfg)
-        client.connect()
-        print("Connected.")
+        route = client.connect()
+        print(f"Connected. Assigned IP: {route.assigned_ip}/{route.prefix_len}  Gateway: {route.gateway}")
+
+        # Activate smart routing after VPN is up (routes now go through the tunnel).
+        if smart_router is not None:
+            try:
+                # If auto_detect already ran, skip re-running it inside start().
+                if auto_detect_done:
+                    smart_router._config.auto_detect = False  # noqa: SLF001
+                smart_router.start(vpn_gateway=route.gateway)
+                st = smart_router.stats()
+                print(
+                    f"Smart route active: {st.blocked_domains} blocked domains, "
+                    f"{st.blocked_ips} IPs → VPN, "
+                    f"{st.direct_domains} direct"
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"Warning: smart route failed to start: {exc}", file=sys.stderr)
+                smart_router = None
 
         # Start telemetry collector — sends metrics every 5 minutes.
         telemetry = None
@@ -157,6 +202,12 @@ def cmd_connect(args: argparse.Namespace) -> int:
 
         def _handle_signal(_sig, _frame):
             print("\nDisconnecting ...")
+            if smart_router is not None:
+                try:
+                    smart_router.stop()
+                    print("Smart route: routes removed.")
+                except Exception:  # noqa: BLE001
+                    pass
             if telemetry:
                 telemetry.record_disconnect()
                 telemetry.stop()
@@ -167,6 +218,8 @@ def cmd_connect(args: argparse.Namespace) -> int:
         signal.signal(signal.SIGINT, _handle_signal)
         signal.signal(signal.SIGTERM, _handle_signal)
 
+        if smart_router is not None:
+            print("Smart route ON: заблокированные сайты → VPN, российские → напрямую.")
         print("Press Ctrl+C to disconnect.")
         while True:
             time.sleep(1)
@@ -249,6 +302,24 @@ def build_parser() -> argparse.ArgumentParser:
     conn.add_argument("--key", metavar="FILE", help="private key file")
     conn.add_argument("--telemetry-url", metavar="URL",
                        help="telemetry endpoint (default: http://<server>:8080)")
+    conn.add_argument(
+        "--smart-route",
+        action="store_true",
+        default=False,
+        help=(
+            "включить умную маршрутизацию: заблокированные РКН сайты идут через VPN, "
+            "российские сайты (Яндекс, ВК, банки) — напрямую"
+        ),
+    )
+    conn.add_argument(
+        "--auto-detect",
+        action="store_true",
+        default=False,
+        help=(
+            "с --smart-route: автоопределить заблокированные сайты TCP-пробой "
+            "перед подключением (~10 с). Без этого флага используется встроенный список РКН."
+        ),
+    )
 
     subs.add_parser("disconnect", help="disconnect from VPN")
 
