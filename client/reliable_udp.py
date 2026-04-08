@@ -29,10 +29,9 @@ PACKET_TYPE_FIN = 0x04
 # Protocol constants — match server values.
 HEADER_SIZE = 11
 MAX_PAYLOAD_SIZE = 1400
-MAX_WINDOW_SIZE = 64
-RETRANSMIT_TIMEOUT = 0.2  # 200ms
+MAX_WINDOW_SIZE = 512    # was 64 — old cap hit at ~5 Mbps @ 136ms RTT
+INITIAL_RTO = 0.5        # initial RTO; replaced by adaptive RTT-based RTO (RFC 6298)
 MAX_RETRANSMITS = 10
-ACK_DELAY = 0.001  # 1ms delayed ACK
 
 
 def encode_packet(pkt_type: int, seq_num: int, ack_num: int, payload: bytes = b"") -> bytes:
@@ -79,8 +78,14 @@ class ReliableUDP:
         self._pending: dict[int, _PendingPacket] = {}
         self._cwnd = 4
         self._ssthresh = 32
+        self._cwnd_remainder: float = 0.0   # fractional accumulator for CA phase
         self._window_open = threading.Event()
         self._window_open.set()
+
+        # RTT estimation (RFC 6298).
+        self._srtt: Optional[float] = None
+        self._rttvar: float = 0.0
+        self._rto: float = INITIAL_RTO
 
         # Receive state.
         self._recv_lock = threading.Lock()
@@ -89,10 +94,8 @@ class ReliableUDP:
         self._read_queue: deque[bytes] = deque()
         self._read_event = threading.Event()
 
-        # Delayed ACK state.
+        # ACK lock — protects sendto from concurrent callers.
         self._ack_lock = threading.Lock()
-        self._ack_pending = False
-        self._ack_timer: Optional[threading.Timer] = None
 
         # Background threads.
         self._read_thread = threading.Thread(target=self._recv_loop, daemon=True)
@@ -162,9 +165,6 @@ class ReliableUDP:
         self._closed = True
         self._window_open.set()
         self._read_event.set()
-        with self._ack_lock:
-            if self._ack_timer:
-                self._ack_timer.cancel()
 
     # --- Private methods ---
 
@@ -189,24 +189,43 @@ class ReliableUDP:
             elif pkt_type in (PACKET_TYPE_DATA, PACKET_TYPE_SYN, PACKET_TYPE_FIN):
                 self._process_data(seq_num, payload)
 
+    def _update_rto(self, rtt: float) -> None:
+        """Update RTO using RFC 6298 algorithm (SRTT + 4×RTTVAR)."""
+        if self._srtt is None:
+            self._srtt = rtt
+            self._rttvar = rtt / 2
+        else:
+            self._rttvar = 0.75 * self._rttvar + 0.25 * abs(self._srtt - rtt)
+            self._srtt = 0.875 * self._srtt + 0.125 * rtt
+        self._rto = max(0.2, self._srtt + 4 * self._rttvar)
+
     def _process_ack(self, ack_num: int) -> None:
-        """Handle incoming ACK — release pending packets, grow window."""
+        """Handle incoming ACK — release pending packets, grow window, update RTT."""
+        now = time.monotonic()
         with self._send_lock:
             cleared = 0
             for seq in list(self._pending.keys()):
                 if seq < ack_num:
-                    del self._pending[seq]
+                    pp = self._pending.pop(seq)
                     cleared += 1
-                    # Simple window growth (client doesn't need BBR).
+                    # RTT sample only from un-retransmitted packets (Karn's algorithm).
+                    if pp.retransmits == 0:
+                        self._update_rto(now - pp.sent_at)
+                    # Congestion window growth.
                     if self._cwnd < self._ssthresh:
-                        self._cwnd += 1
+                        # Slow start: +1 per ACK.
+                        self._cwnd = min(self._cwnd + 1, MAX_WINDOW_SIZE)
                     elif self._cwnd < MAX_WINDOW_SIZE:
-                        self._cwnd += 1
+                        # Congestion avoidance (Reno): +1/cwnd per ACK → +1 per RTT.
+                        self._cwnd_remainder += 1.0 / self._cwnd
+                        if self._cwnd_remainder >= 1.0:
+                            self._cwnd += 1
+                            self._cwnd_remainder -= 1.0
         if cleared > 0:
             self._window_open.set()
 
     def _process_data(self, seq_num: int, payload: bytes) -> None:
-        """Handle incoming data — buffer, deliver in order, schedule ACK."""
+        """Handle incoming data — buffer, deliver in order, send immediate ACK."""
         with self._recv_lock:
             if seq_num == self._recv_seq:
                 if payload:
@@ -224,34 +243,26 @@ class ReliableUDP:
                 self._recv_buf[seq_num] = payload
             # Duplicate (seq < recv_seq): silently discard.
 
-        # Schedule delayed ACK.
-        with self._ack_lock:
-            self._ack_pending = True
-            if self._ack_timer is None:
-                self._ack_timer = threading.Timer(ACK_DELAY, self._flush_ack)
-                self._ack_timer.daemon = True
-                self._ack_timer.start()
+        # Send ACK immediately — no threading.Timer avoids GIL-induced 50-100ms
+        # jitter that triggers BBR's "near-zero delivery rate → cwnd collapse" spiral.
+        self._flush_ack()
 
     def _flush_ack(self) -> None:
-        """Send a cumulative ACK."""
-        with self._ack_lock:
-            self._ack_pending = False
-            self._ack_timer = None
-
+        """Send a cumulative ACK immediately."""
         with self._recv_lock:
             ack_num = self._recv_seq
 
         raw = encode_packet(PACKET_TYPE_ACK, 0, ack_num)
-        try:
-            self._sock.sendto(raw, self._addr)
-        except OSError:
-            pass
+        with self._ack_lock:
+            try:
+                self._sock.sendto(raw, self._addr)
+            except OSError:
+                pass
 
     def _retransmit_loop(self) -> None:
         """Background thread: retransmit timed-out packets."""
-        tick = RETRANSMIT_TIMEOUT / 4
         while not self._closed:
-            time.sleep(tick)
+            time.sleep(max(0.05, self._rto / 4))
             self._do_retransmit()
 
     def _do_retransmit(self) -> None:
@@ -261,7 +272,7 @@ class ReliableUDP:
         with self._send_lock:
             for seq in list(self._pending.keys()):
                 pp = self._pending[seq]
-                if now - pp.sent_at < RETRANSMIT_TIMEOUT:
+                if now - pp.sent_at < self._rto:
                     continue
                 if pp.retransmits >= MAX_RETRANSMITS:
                     del self._pending[seq]
@@ -273,9 +284,12 @@ class ReliableUDP:
                     pass
                 pp.sent_at = now
                 pp.retransmits += 1
-                # Multiplicative decrease (simple Reno for client side).
+                # Multiplicative decrease (Reno).
                 self._ssthresh = max(self._cwnd // 2, 2)
                 self._cwnd = self._ssthresh
+                self._cwnd_remainder = 0.0
+                # Exponential backoff on RTO (cap at 60s).
+                self._rto = min(self._rto * 2, 60.0)
         if dropped > 0:
             self._window_open.set()
 

@@ -109,6 +109,11 @@ def cmd_connect(args: argparse.Namespace) -> int:
 
     server_key_hex = args.server_key or cfg.get("server_key") or ""
 
+    # Bond count: parallel TCP connections for download bonding.
+    # Default 4 — balanced between overhead and speed on typical WAN links.
+    _raw_bonds = args.bonds if args.bonds is not None else cfg.get("bond_count", 4)
+    bond_count = max(1, min(int(_raw_bonds or 4), 8))
+
     # Telemetry: server URL for sending metrics (API port, not VPN port).
     # Defaults to http://<server_host>:8080, overridable via config or --telemetry-url.
     server_host = server.split(":")[0]
@@ -158,7 +163,9 @@ def cmd_connect(args: argparse.Namespace) -> int:
         vpn_cfg = VPNConfig(
             server_addr=server,
             private_key_file=key_file,
+            bond_count=bond_count,
         )
+        print(f"Bond count: {bond_count} parallel connection(s)")
         client = VPNClient(vpn_cfg)
         _hs_start = _time.monotonic()
         route = client.connect()
@@ -342,6 +349,8 @@ def build_parser() -> argparse.ArgumentParser:
     conn.add_argument("--key", metavar="FILE", help="private key file")
     conn.add_argument("--server-key", metavar="HEX",
                       help="server public key (64 hex chars); from GET /api/v1/qr/shared")
+    conn.add_argument("--bonds", metavar="N", type=int, default=None,
+                      help="parallel TCP connections for download bonding (default: 4, max: 8)")
     conn.add_argument("--telemetry-url", metavar="URL",
                        help="telemetry endpoint (default: http://<server>:8080)")
     conn.add_argument(
