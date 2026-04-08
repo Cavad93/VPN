@@ -164,37 +164,25 @@ func relayOne(client net.Conn, target string, logger *slog.Logger) {
 
 const udpSessionTimeout = 5 * time.Minute
 
-// udpBufSize is the per-goroutine read buffer.  65536 = max UDP datagram.
+// udpBufSize is the receive buffer size — max UDP datagram.
 const udpBufSize = 65536
-
-// udpRelayWorkers is the number of parallel goroutines draining the receive
-// socket.  Multiple readers on the same PacketConn are safe on Linux/macOS/
-// Windows — the kernel delivers each datagram to exactly one ReadFrom call.
-// 4 workers saturate a ~100 Mbps link even on a slow relay VM; more workers
-// add lock contention without benefit.
-const udpRelayWorkers = 4
-
-// udpPktPool recycles datagram buffers to avoid per-packet heap allocations.
-// Each buffer is exactly udpBufSize bytes; workers borrow, copy payload into a
-// trimmed slice, then return the original buffer.
-var udpPktPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, udpBufSize)
-		return &b
-	},
-}
 
 // udpSession tracks one client ↔ upstream mapping.
 type udpSession struct {
-	upstream  net.Conn
-	sendCh    chan []byte // buffered channel; upstream writer goroutine drains it
-	lastSeen  time.Time
+	upstream net.Conn
+	sendCh   chan []byte // async write queue: decouples ReadFrom from upstream Write
+	lastSeen time.Time
 }
 
 func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *slog.Logger) error {
 	local, err := net.ListenPacket("udp", listenAddr)
 	if err != nil {
 		return err
+	}
+	// Expand UDP receive buffer so bursts don't drop datagrams before ReadFrom picks them up.
+	if uc, ok := local.(*net.UDPConn); ok {
+		uc.SetReadBuffer(4 << 20)  //nolint:errcheck // 4 MB
+		uc.SetWriteBuffer(4 << 20) //nolint:errcheck // 4 MB
 	}
 	logger.Info("udp relay listening", "listen", listenAddr, "upstream", relayTarget)
 
@@ -228,92 +216,74 @@ func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *sl
 		}
 	}()
 
-	// worker handles one receive loop iteration: read a datagram, look up or
-	// create a session, and dispatch the packet without blocking other workers.
-	worker := func() {
-		for {
-			// Borrow a buffer from the pool — zero allocation per packet.
-			bp := udpPktPool.Get().(*[]byte)
-			buf := *bp
-
-			n, clientAddr, err := local.ReadFrom(buf)
-			if err != nil {
-				udpPktPool.Put(bp)
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					logger.Warn("udp relay: read error", "err", err)
-					continue
-				}
-			}
-
-			// Copy payload into a trimmed slice; return the pool buffer immediately
-			// so other workers can reuse it without waiting for upstream delivery.
-			pkt := make([]byte, n)
-			copy(pkt, buf[:n])
-			udpPktPool.Put(bp)
-
-			key := clientAddr.String()
-
-			mu.Lock()
-			sess, ok := sessions[key]
-			if !ok {
-				up, err := net.Dial("udp", relayTarget)
-				if err != nil {
-					mu.Unlock()
-					logger.Warn("udp relay: dial upstream failed", "target", relayTarget, "err", err)
-					continue
-				}
-				// sendCh buffers up to 256 packets so ReadFrom never blocks on
-				// a slow upstream write.  The upstream writer goroutine drains it.
-				ch := make(chan []byte, 256)
-				sess = &udpSession{upstream: up, sendCh: ch, lastSeen: time.Now()}
-				sessions[key] = sess
-
-				// Goroutine: client → upstream (async writer, never blocks ReadFrom).
-				go func(up net.Conn, ch <-chan []byte) {
-					for pkt := range ch {
-						up.Write(pkt) //nolint:errcheck
-					}
-				}(up, ch)
-
-				// Goroutine: upstream → client (one goroutine per session).
-				go func(up net.Conn, dst net.Addr) {
-					bp := udpPktPool.Get().(*[]byte)
-					rbuf := *bp
-					defer udpPktPool.Put(bp)
-					for {
-						m, err := up.Read(rbuf)
-						if err != nil {
-							return
-						}
-						// WriteTo on a PacketConn is goroutine-safe; multiple
-						// upstream→client goroutines can call it concurrently.
-						local.WriteTo(rbuf[:m], dst) //nolint:errcheck
-					}
-				}(up, clientAddr)
-			}
-			sess.lastSeen = time.Now()
-			mu.Unlock()
-
-			// Non-blocking send: if the channel is full the packet is dropped
-			// (BBR/ReliableUDP on the client will retransmit).
+	// Single receive loop — one goroutine owns ReadFrom (safe on all platforms).
+	// The key fix vs the original: upstream Write is now done in a per-session
+	// goroutine via sendCh, so ReadFrom never blocks waiting for SPb→Astana delivery.
+	buf := make([]byte, udpBufSize)
+	for {
+		n, clientAddr, err := local.ReadFrom(buf)
+		if err != nil {
 			select {
-			case sess.sendCh <- pkt:
+			case <-ctx.Done():
+				return nil
 			default:
-				logger.Warn("udp relay: send channel full, dropping packet", "client", key)
+				logger.Warn("udp relay: read error", "err", err)
+				continue
 			}
 		}
-	}
 
-	// Start parallel workers.  All share the same PacketConn; the kernel
-	// delivers each datagram to exactly one ReadFrom call (no duplication).
-	for i := 0; i < udpRelayWorkers; i++ {
-		go worker()
-	}
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		key := clientAddr.String()
 
-	// Block until context is cancelled.
-	<-ctx.Done()
-	return nil
+		mu.Lock()
+		sess, ok := sessions[key]
+		if !ok {
+			up, err := net.Dial("udp", relayTarget)
+			if err != nil {
+				mu.Unlock()
+				logger.Warn("udp relay: dial upstream failed", "target", relayTarget, "err", err)
+				continue
+			}
+			if uc, ok := up.(*net.UDPConn); ok {
+				uc.SetReadBuffer(4 << 20)  //nolint:errcheck
+				uc.SetWriteBuffer(4 << 20) //nolint:errcheck
+			}
+			// sendCh buffers up to 512 packets so ReadFrom never stalls on write.
+			ch := make(chan []byte, 512)
+			sess = &udpSession{upstream: up, sendCh: ch, lastSeen: time.Now()}
+			sessions[key] = sess
+
+			// Upstream writer goroutine: drains sendCh → upstream.
+			// Runs independently of ReadFrom; UDP writes are near-instant.
+			go func(up net.Conn, ch <-chan []byte) {
+				for pkt := range ch {
+					up.Write(pkt) //nolint:errcheck
+				}
+			}(up, ch)
+
+			// Upstream → client goroutine: one per session.
+			go func(up net.Conn, dst net.Addr) {
+				rbuf := make([]byte, udpBufSize)
+				for {
+					m, err := up.Read(rbuf)
+					if err != nil {
+						return
+					}
+					local.WriteTo(rbuf[:m], dst) //nolint:errcheck
+				}
+			}(up, clientAddr)
+		}
+		sess.lastSeen = time.Now()
+		mu.Unlock()
+
+		// Non-blocking enqueue: if channel is full, drop the packet.
+		// BBR/ReliableUDP on the client will retransmit; occasional drops
+		// here are better than blocking ReadFrom for all clients.
+		select {
+		case sess.sendCh <- pkt:
+		default:
+			logger.Warn("udp relay: send queue full, dropping packet", "client", key)
+		}
+	}
 }
