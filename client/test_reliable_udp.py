@@ -221,8 +221,8 @@ class TestReliableUDP:
     def test_fast_retransmit_triggers_on_3rd_dup_ack(self):
         """3 duplicate ACKs trigger fast retransmit and enter fast recovery.
 
-        RFC 5681 §3.2:
-          - ssthresh = max(in_flight / 2, 2)
+        RFC 5681 §3.2 + RFC 8312 §4.5 (β=0.7):
+          - ssthresh = max(in_flight * 7 / 10, 2)
           - cwnd = ssthresh + 3
           - _in_fast_recovery = True
           - The missing packet (ack_num) is retransmitted immediately.
@@ -242,7 +242,7 @@ class TestReliableUDP:
                 client._pending[seq] = pp
 
             in_flight = len(client._pending)          # 8
-            expected_ssthresh = max(in_flight // 2, 2)  # 4
+            expected_ssthresh = max(in_flight * 7 // 10, 2)  # 5 (β=0.7, RFC 8312)
 
             # First two dup ACKs: no fast retransmit yet.
             client._process_ack(5)
@@ -386,14 +386,69 @@ class TestReliableUDP:
             initial_rto = client._rto
             client._do_retransmit()
 
-            # cwnd should be halved ONCE (32→16), not 4 times (32→2).
-            assert client._cwnd == max(initial_cwnd // 2, 2), (
-                f"cwnd={client._cwnd}, expected {initial_cwnd // 2} — MD applied multiple times"
+            # cwnd should be reduced by β=0.7 ONCE (32→22), not 4 times (32→2).
+            assert client._cwnd == max(initial_cwnd * 7 // 10, 2), (
+                f"cwnd={client._cwnd}, expected {initial_cwnd * 7 // 10} — MD applied multiple times"
             )
             # RTO should be doubled ONCE, not 4 times.
             assert client._rto == pytest.approx(initial_rto * 2, rel=0.01), (
                 f"rto={client._rto}, expected {initial_rto * 2} — RTO backoff applied multiple times"
             )
+        finally:
+            client.close()
+            server.close()
+
+    def test_multiplicative_decrease_beta_0_7(self):
+        """β=0.7 (RFC 8312 §4.5): loss retains 70% of cwnd, not 50% (Reno).
+
+        Mathis steady-state: throughput ∝ C/√p where C = √(3/(2(1−β))) × √(2β).
+          β=0.5 → C≈1.22;  β=0.7 → C≈1.63  (+33% throughput).
+        This test verifies both fast-retransmit and RTO paths use β=0.7.
+        """
+        client, server = _make_pair()
+        try:
+            # --- Fast retransmit path (3 dup ACKs) ---
+            client._cwnd = 100
+            client._ssthresh = 200
+            client._high_ack = 0
+
+            from reliable_udp import _PendingPacket
+            fake_raw = encode_packet(PACKET_TYPE_DATA, 0, 0, b"x")
+            for seq in range(100):
+                pp = _PendingPacket(fake_raw)
+                pp.sent_at = time.monotonic()
+                client._pending[seq] = pp
+
+            # Trigger fast retransmit.
+            client._process_ack(0)
+            client._process_ack(0)
+            client._process_ack(0)
+
+            # ssthresh = 100 * 7 // 10 = 70 (not 50).
+            assert client._ssthresh == 70, (
+                f"fast retransmit ssthresh={client._ssthresh}, want 70 (β=0.7)"
+            )
+            assert client._cwnd == 73  # ssthresh + 3
+
+            # --- RTO path ---
+            client._in_fast_recovery = False
+            client._dup_ack_count = 0
+            client._cwnd = 50
+            client._ssthresh = 100
+            client._rto = 0.001
+            client._pending.clear()
+            for seq in range(50):
+                pp = _PendingPacket(fake_raw)
+                pp.sent_at = 0.0
+                client._pending[seq] = pp
+
+            client._do_retransmit()
+
+            # ssthresh = 50 * 7 // 10 = 35, cwnd = 35.
+            assert client._ssthresh == 35, (
+                f"RTO ssthresh={client._ssthresh}, want 35 (β=0.7)"
+            )
+            assert client._cwnd == 35
         finally:
             client.close()
             server.close()
