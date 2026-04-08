@@ -1532,6 +1532,7 @@ func main() {
 	var vlessAddr, vlessCert, vlessKey, vlessPath string
 	var anthropicKey string
 	var relayTo string
+	var relayMetricsAddr string
 	var diagnosticsFile string
 	var openAccess bool
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
@@ -1548,6 +1549,7 @@ func main() {
 	flag.StringVar(&vlessPath, "vless-path", "/tunnel", "WebSocket path for VLESS")
 	flag.StringVar(&anthropicKey, "anthropic-key", "", "Anthropic API key for telemetry analysis (or ANTHROPIC_API_KEY env)")
 	flag.StringVar(&relayTo, "relay-to", "", "relay VPN traffic to this upstream address (e.g. 193.124.93.240:8443); disables local VPN termination")
+	flag.StringVar(&relayMetricsAddr, "relay-metrics-addr", ":9092", "relay metrics HTTP server address (per-segment throughput for AI diagnostics; empty to disable)")
 	flag.StringVar(&diagnosticsFile, "diagnostics-file", "", "path to append telemetry reports as JSONL (e.g. /var/log/cavadvpn/diagnostics.jsonl)")
 	flag.Parse()
 
@@ -1583,6 +1585,10 @@ func main() {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 		logger.Info("starting in relay mode", "listen", cfg.ListenAddr, "upstream", relayTo)
+		// Start per-segment metrics server (used by AI diagnostics to identify bottleneck).
+		if relayMetricsAddr != "" {
+			go startRelayMetricsServer(relayMetricsAddr, logger)
+		}
 		// TCP relay: handles CavadVPN TCP transport + decoy for scanners.
 		go func() {
 			if err := runRelay(ctx, cfg.ListenAddr, relayTo, logger); err != nil {

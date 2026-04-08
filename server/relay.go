@@ -209,6 +209,7 @@ func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *sl
 						s.upstream.Close()
 						close(s.sendCh)
 						delete(sessions, k)
+						globalRelayMetrics.activeSessions.Add(-1)
 					}
 				}
 				mu.Unlock()
@@ -231,6 +232,9 @@ func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *sl
 				continue
 			}
 		}
+
+		// Segment A: count bytes received from VPN clients (MacBook → SPb).
+		globalRelayMetrics.clientRxBytes.Add(int64(n))
 
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
@@ -259,6 +263,8 @@ func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *sl
 			go func(up net.Conn, ch <-chan []byte) {
 				for pkt := range ch {
 					up.Write(pkt) //nolint:errcheck
+					// Segment B: count bytes forwarded to Astana.
+					globalRelayMetrics.upstreamTxBytes.Add(int64(len(pkt)))
 				}
 			}(up, ch)
 
@@ -270,9 +276,15 @@ func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *sl
 					if err != nil {
 						return
 					}
+					// Segment B: count bytes received from Astana.
+					globalRelayMetrics.upstreamRxBytes.Add(int64(m))
 					local.WriteTo(rbuf[:m], dst) //nolint:errcheck
+					// Segment A (reverse): count bytes delivered to the client.
+					globalRelayMetrics.clientTxBytes.Add(int64(m))
 				}
 			}(up, clientAddr)
+
+			globalRelayMetrics.activeSessions.Add(1)
 		}
 		sess.lastSeen = time.Now()
 		mu.Unlock()
@@ -283,6 +295,7 @@ func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *sl
 		select {
 		case sess.sendCh <- pkt:
 		default:
+			globalRelayMetrics.clientDrops.Add(1)
 			logger.Warn("udp relay: send queue full, dropping packet", "client", key)
 		}
 	}
