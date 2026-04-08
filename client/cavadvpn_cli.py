@@ -305,11 +305,14 @@ def build_parser() -> argparse.ArgumentParser:
     conn.add_argument(
         "--smart-route",
         action="store_true",
-        default=False,
-        help=(
-            "включить умную маршрутизацию: заблокированные РКН сайты идут через VPN, "
-            "российские сайты (Яндекс, ВК, банки) — напрямую"
-        ),
+        default=True,
+        help="умная маршрутизация (по умолчанию включена)",
+    )
+    conn.add_argument(
+        "--no-smart-route",
+        dest="smart_route",
+        action="store_false",
+        help="отключить умную маршрутизацию (весь трафик через VPN)",
     )
     conn.add_argument(
         "--auto-detect",
