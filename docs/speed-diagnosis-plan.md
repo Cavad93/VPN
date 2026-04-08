@@ -366,3 +366,49 @@ sysctl -w net.ipv4.tcp_wmem="4096 1048576 16777216"
 **Тесты:** 17/17 passed (`test_reliable_udp.py`)
 
 **Следующий шаг:** Проверить гипотезу #7 (Python GIL bottleneck) — изучить threading model в `reliable_udp.py` и `core.py`: `_recv_loop`, `_write_packet`, `_retransmit_loop` держат GIL при I/O? Есть ли блокирующие вызовы в main thread? Рассмотреть `io.CopyBuffer` с увеличенным буфером в relay (`server/relay.go:135`).
+
+### Сеанс 2 — 2026-04-08 — Python GIL analysis (гипотеза #7)
+
+**Гипотеза:** #7 — Python GIL / single-thread bottleneck
+
+**Что сделано:**
+
+Проведён полный анализ threading model клиента. Проверено по CPython source и Python docs:
+
+**Анализ GIL:**
+- `socket.recvfrom()`, `socket.sendto()`, `time.sleep()` — все **освобождают GIL** (CPython: `Py_BEGIN_ALLOW_THREADS`)
+- `ChaCha20Poly1305.encrypt()/decrypt()` через OpenSSL (C extension) — освобождает GIL ✓
+- `threading.Event.wait()` — освобождает GIL ✓
+- GIL switch interval в CPython 3.x = **5 мс**
+
+**Расчёт нагрузки (7.64 Мбит/с):**
+- ~1364 UDP датаграмм/с (1400-байт IP-пакет → 2 датаграммы из-за MAX_PAYLOAD_SIZE=1350)
+- Python CPU overhead per packet: ~25-30 мкс (struct + dict + deque)
+- Итого: 1364 × 30 мкс = **40 мс/с = 4% CPU** — НЕ bottleneck
+
+**Анализ lock contention:**
+- `_write_packet` держит `_send_lock` во время `sendto` → теоретически блокирует `_process_ack`
+- НО: `_flush_ack` для входящего download использует `_ack_lock`, НЕ `_send_lock` → download ACKs не блокируются ✓
+- cwnd: MAX_WINDOW_SIZE=512 >> требуемые ~51 пакет при 7.64 Мбит/с × 72мс ✓
+
+**Анализ relay TCP (relay.go):**
+- Go's `io.Copy(TCPConn, TCPConn)` → вызывает `TCPConn.ReadFrom()` → использует `splice()` на Linux (zero-copy)
+- Размер буфера 32KB не имеет значения для splice (page-based)
+- UDP relay не использует `io.Copy` → не релевантно для default UDP режима
+
+**Найденная проблема:**
+- `client/reliable_udp.py:_recv_loop` — `self._sock.settimeout(0.5)` вызывался на **каждой итерации**, хотя значение константно
+- В CPython `settimeout()` вызывает `internal_setblocking()` → `fcntl(F_GETFL)` syscall per call
+- При 1364 датаграмм/с → 1364 лишних `fcntl` syscalls/с (~1.4 мс/с overhead)
+
+**Результат:** #7 ОПРОВЕРГНУТА. GIL не является bottleneck. Исправлена минорная проблема syscall overhead.
+
+**Найденные проблемы:**
+- `client/reliable_udp.py:_recv_loop` — `settimeout(0.5)` внутри loop → fcntl syscall per packet
+
+**Изменённые файлы:**
+- `client/reliable_udp.py` — `settimeout(0.5)` перенесён в `__init__` (установить один раз), удалён из `_recv_loop`
+
+**Тесты:** 17/17 passed (`test_reliable_udp.py`)
+
+**Следующий шаг:** Проверить гипотезу #8 (Mux backpressure) — изучить `MuxStream._queue (maxsize=4096)` в `core.py`: может ли `_deliver()` заблокировать mux-reader thread? Является ли `ClientMux._read_loop` single-threaded bottleneck? Проверить `readCh` размер в `server/transport/mux.go` и блокировку `s.readCh <-` при полном канале.

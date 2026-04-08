@@ -91,6 +91,10 @@ class ReliableUDP:
         self._sock = sock
         self._addr = addr
         self._closed = False
+        # Set recv timeout ONCE here instead of on every _recv_loop iteration.
+        # Calling settimeout() in the loop triggers fcntl(F_GETFL) per packet
+        # (~1364 syscalls/s at 7 Mbps) even though the value never changes.
+        self._sock.settimeout(0.5)
 
         # Send state.
         self._send_lock = threading.Lock()
@@ -192,7 +196,6 @@ class ReliableUDP:
         """Background thread: receive and dispatch incoming packets."""
         while not self._closed:
             try:
-                self._sock.settimeout(0.5)
                 data, _ = self._sock.recvfrom(65536)
             except socket.timeout:
                 continue
