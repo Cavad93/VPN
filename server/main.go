@@ -306,12 +306,56 @@ func (s *Server) runTCP(ctx context.Context) error {
 // runUDP starts the server over UDP with user-space BBR congestion control.
 // This bypasses the OS TCP stack entirely — BBR runs inside the application,
 // making it work on any OS including Windows Server 2019 (which lacks BBR).
+//
+// A TCP listener is started on the same address so that TCP-only clients
+// (e.g. Android) can connect using the same ObfsConn/Noise/Mux pipeline.
+// TCP connections go through peekAndRoute (DPI decoy) before handleConn.
 func (s *Server) runUDP(ctx context.Context) error {
 	ln, err := transport.ListenUDP(s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("server: listen udp %s: %w", s.cfg.ListenAddr, err)
 	}
 	s.logger.Info("server listening", "transport", "udp+bbr", "addr", s.cfg.ListenAddr)
+
+	// Also accept TCP on the same address so TCP-only clients (Android) work.
+	tcpLn, tcpErr := net.Listen("tcp", s.cfg.ListenAddr)
+	if tcpErr != nil {
+		s.logger.Warn("TCP listener on UDP port failed — TCP clients will not be able to connect",
+			"addr", s.cfg.ListenAddr, "err", tcpErr)
+	} else {
+		s.logger.Info("server listening (TCP fallback for mobile clients)", "transport", "tcp", "addr", s.cfg.ListenAddr)
+		go func() {
+			<-ctx.Done()
+			tcpLn.Close()
+		}()
+		go func() {
+			for {
+				conn, err := tcpLn.Accept()
+				if err != nil {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						s.logger.Warn("tcp accept error", "err", err)
+						continue
+					}
+				}
+				if tc, ok := conn.(*net.TCPConn); ok {
+					setForcedSocketBuffers(tc, 4<<20)
+					tc.SetNoDelay(true)
+					tc.SetKeepAlive(true)
+					tc.SetKeepAlivePeriod(15 * time.Second)
+				}
+				go func(c net.Conn) {
+					routed, ok := peekAndRoute(c)
+					if !ok {
+						return
+					}
+					s.handleConn(ctx, routed)
+				}(conn)
+			}
+		}()
+	}
 
 	go s.routeFromTun(ctx)
 
