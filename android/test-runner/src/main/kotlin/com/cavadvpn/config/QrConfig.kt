@@ -48,12 +48,27 @@ object QrConfig {
     private fun parseJson(text: String): VpnConfig {
         val map = parseSimpleJson(text)
 
-        val server = map["server"]
-            ?: throw IllegalArgumentException("QR config missing 'server' field")
-        val key = map["key"]
-            ?: throw IllegalArgumentException("QR config missing 'key' field")
+        // Support both old format ("server":"HOST:PORT") and server-generated format
+        // ("host":"HOST", "port":443).  Accept "key" or "private_key" as the client key.
+        val host: String
+        val port: Int
+        val serverField = map["server"]
+        if (serverField != null) {
+            val (h, p) = splitHostPort(serverField)
+            host = h; port = p
+        } else {
+            host = map["host"]
+                ?: throw IllegalArgumentException("QR config missing 'server' or 'host' field")
+            val portStr = map["port"]
+                ?: throw IllegalArgumentException("QR config missing 'port' field")
+            port = portStr.toIntOrNull()
+                ?: throw IllegalArgumentException("Invalid port '$portStr' in QR config")
+            if (port !in 1..65535) throw IllegalArgumentException("port $port out of range")
+            if (host.isBlank()) throw IllegalArgumentException("server host is empty")
+        }
 
-        val (host, port) = splitHostPort(server)
+        val key = map["key"] ?: map["private_key"]
+            ?: throw IllegalArgumentException("QR config missing 'key' or 'private_key' field")
 
         validateKey(key)
 
@@ -67,7 +82,9 @@ object QrConfig {
     }
 
     private fun parseUri(text: String): VpnConfig {
-        // cavadvpn://config?server=host:port&key=hex64&dns=8.8.8.8
+        // Supports two URI formats:
+        //  Old: cavadvpn://config?server=host:port&key=hex64&dns=8.8.8.8
+        //  New (server-generated): cavadvpn://config?host=HOST&port=PORT&private_key=HEX&server_key=HEX&dns=DNS
         val queryStart = text.indexOf('?')
         if (queryStart < 0) {
             throw IllegalArgumentException("URI format missing query string")
@@ -82,12 +99,27 @@ object QrConfig {
             params[k] = v
         }
 
-        val server = params["server"]
-            ?: throw IllegalArgumentException("URI config missing 'server' parameter")
-        val key = params["key"]
-            ?: throw IllegalArgumentException("URI config missing 'key' parameter")
+        // Resolve host + port from either "server=HOST:PORT" or "host=HOST" + "port=PORT"
+        val host: String
+        val port: Int
+        val serverParam = params["server"]
+        if (serverParam != null) {
+            val (h, p) = splitHostPort(serverParam)
+            host = h; port = p
+        } else {
+            host = params["host"]
+                ?: throw IllegalArgumentException("URI config missing 'server' or 'host' parameter")
+            val portStr = params["port"]
+                ?: throw IllegalArgumentException("URI config missing 'port' parameter")
+            port = portStr.toIntOrNull()
+                ?: throw IllegalArgumentException("Invalid port '$portStr' in URI config")
+            if (port !in 1..65535) throw IllegalArgumentException("port $port out of range")
+            if (host.isBlank()) throw IllegalArgumentException("server host is empty")
+        }
 
-        val (host, port) = splitHostPort(server)
+        // Accept "key" (old) or "private_key" (server-generated) for the client private key
+        val key = params["key"] ?: params["private_key"]
+            ?: throw IllegalArgumentException("URI config missing 'key' or 'private_key' parameter")
         validateKey(key)
 
         return VpnConfig(

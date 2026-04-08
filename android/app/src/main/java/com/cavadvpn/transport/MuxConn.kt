@@ -11,10 +11,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 
-// Mux frame types
+// Mux frame types (must match server/transport/mux.go)
 private const val FRAME_SYN  : Byte = 0x01
 private const val FRAME_DATA : Byte = 0x02
 private const val FRAME_FIN  : Byte = 0x03
+private const val FRAME_PING : Byte = 0x04  // keepalive ping from server; streamID=0, no payload
 
 private const val MUX_HEADER_SIZE = 7   // streamID(4) + type(1) + payloadLen(2)
 private const val MAX_MUX_PAYLOAD = 0xFFFF
@@ -247,6 +248,7 @@ class ClientMux(private val conn: NoiseConn) {
             val stream = streams[sid] // lock-free read from ConcurrentHashMap
 
             when (frameType) {
+                FRAME_PING -> { /* keepalive from server — receiving the noise frame is enough */ }
                 FRAME_SYN -> {
                     if (stream == null) {
                         // Server opened a stream — register it (putIfAbsent is atomic)
