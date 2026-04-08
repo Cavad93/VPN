@@ -814,7 +814,7 @@ func buildAnalysisPrompt(reports []TelemetryReport, serverPerf *ServerPerfSummar
 	prompt += "- Obfuscation: TLS 1.3-like record framing (anti-DPI), SNI spoofing with cover domains\n"
 	prompt += "- Transport: UDP+BBR (default) or TCP with N parallel bonds\n"
 	prompt += "- Topology: Client → [optional SPb relay] → Astana VPN server\n"
-	prompt += "- Active-probe protection: non-TLS probes get nginx 400 decoy response\n\n"
+	prompt += "- Active-probe protection: non-TLS probes get full cover website (cooking blog) via http.Handler\n\n"
 
 	prompt += fmt.Sprintf("## Telemetry Window: %d reports from %d devices\n\n", len(reports), len(devices))
 

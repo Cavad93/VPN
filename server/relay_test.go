@@ -151,11 +151,12 @@ func TestRelayServesDecoyForNonVPNProbe(t *testing.T) {
 		}
 	}
 
-	if !bytes.Contains(resp, []byte("HTTP/1.1 400 Bad Request")) {
-		t.Fatalf("expected decoy 400 response, got: %q", resp)
+	// The cover website should serve Pork Kitchen content (not a raw 400).
+	if !bytes.Contains(resp, []byte("Pork Kitchen")) {
+		t.Fatalf("expected cover website 'Pork Kitchen' in response, got: %q", resp)
 	}
 	if !bytes.Contains(resp, []byte("nginx/1.24.0")) {
-		t.Fatalf("expected nginx Server header in decoy, got: %q", resp)
+		t.Fatalf("expected nginx Server header in cover response, got: %q", resp)
 	}
 }
 

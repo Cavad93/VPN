@@ -540,10 +540,13 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	// reducing per-packet TCP/IP overhead (~40 bytes/segment) by ~40%.
 	bufConn := transport.NewBufConn(conn)
 
-	// TLS obfuscation handshake
+	// TLS obfuscation handshake.
+	// Failures are logged at DEBUG to avoid exposing VPN presence during
+	// mass scanning. A real HTTPS server would not log every bad TLS
+	// handshake at WARN level — and neither should we.
 	obfs := transport.NewObfsConn(bufConn)
 	if err := obfs.ServerHandshake(); err != nil {
-		s.logger.Warn("obfs handshake failed", "err", err)
+		s.logger.Debug("obfs handshake failed", "err", err)
 		return
 	}
 
@@ -554,16 +557,21 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 	session, err := s.doNoiseHandshake(obfs)
 	if err != nil {
-		s.logger.Warn("noise handshake failed", "err", err)
+		// DEBUG level: probes replaying partial handshakes trigger this path.
+		// WARN would create log noise during mass scanning, fingerprinting
+		// the server as a VPN to anyone with log access.
+		s.logger.Debug("noise handshake failed", "err", err)
 		return
 	}
 	if s.Perf != nil {
 		s.Perf.TrackLatency(perf.StageHandshake, time.Since(hsStart))
 	}
 
-	// Check if this key is allowed
+	// Check if this key is allowed.
+	// DEBUG level: a probe that somehow completes Noise with a random key
+	// should not produce visible log entries.
 	if !s.isKeyAllowed(session.RemoteStatic) {
-		s.logger.Warn("key not allowed", "key", hex.EncodeToString(session.RemoteStatic[:]))
+		s.logger.Debug("key not allowed", "key", hex.EncodeToString(session.RemoteStatic[:]))
 		return
 	}
 

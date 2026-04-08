@@ -2,20 +2,22 @@
 //
 // When an external scanner or DPI probe connects to the VPN port, it sends
 // data that does NOT start with a TLS Handshake record (0x16). This module
-// intercepts such connections BEFORE the ObfsConn handshake and responds with
-// a convincing HTTP/1.1 400 "plain HTTP sent to HTTPS port" page — exactly
-// what nginx returns in this situation.
+// intercepts such connections BEFORE the ObfsConn handshake and routes them
+// to the cover website (a realistic cooking blog served from cover.go).
 //
 // Decision tree (based on first byte only, zero overhead for real clients):
 //
 //	first byte == 0x16  →  VPN path (TLS ClientHello, ObfsConn takes over)
-//	first byte == other →  serveHTTPDecoy (nginx-like 400) + close
+//	first byte == other →  cover website (full HTTP handler) + close
+//	no data (timeout)   →  close silently
 //
-// The 400 response is chosen deliberately:
-//  1. It is the most common real-world nginx response when plain HTTP is sent
-//     to an HTTPS listener — scanners expect and recognise it.
-//  2. It does NOT expose that this is a VPN server.
-//  3. It closes the connection immediately after — no lingering state.
+// Anti-probing design (based on Trojan-GFW approach):
+//   - Non-TLS connections get a full cover website with multiple pages,
+//     internal links, and realistic content — not just a 400 error.
+//   - All handshake failures (ObfsConn, Noise) are logged at DEBUG level
+//     to avoid exposing VPN presence in logs during mass scanning.
+//   - The cover site uses standard http.Handler, making it indistinguishable
+//     from a real nginx-backed website to automated scanners.
 //
 // peekConn prepends the already-consumed first byte back into the read stream
 // so the rest of the handshake pipeline (BufConn → ObfsConn → Noise) never
@@ -23,7 +25,6 @@
 package main
 
 import (
-	"fmt"
 	"net"
 	"sync/atomic"
 	"time"
@@ -54,41 +55,6 @@ func decoyReadDeadline() time.Duration {
 // Used only in tests; the production default is 5 s (set in init).
 func setDecoyReadDeadline(d time.Duration) {
 	decoyReadDeadlineNs.Store(int64(d))
-}
-
-// decoyHTTPResponse is the response served to non-VPN probes.
-// It mimics nginx's standard "400 The plain HTTP request was sent to HTTPS
-// port" error — the most widely recognised response for HTTPS servers receiving
-// HTTP traffic. The Date header is omitted intentionally: it would require
-// time.Now() formatting and scanners do not verify it for fingerprinting.
-// decoyHTTPBody is the HTML body of the decoy response.
-// Kept as a separate constant so the init check and tests can verify that
-// Content-Length in the headers matches exactly.
-const decoyHTTPBody = "<html>\r\n" +
-	"<head><title>400 Bad Request</title></head>\r\n" +
-	"<body>\r\n" +
-	"<center><h1>400 Bad Request</h1></center>\r\n" +
-	"<center>The plain HTTP request was sent to HTTPS port</center>\r\n" +
-	"<hr><center>nginx/1.24.0</center>\r\n" +
-	"</body>\r\n" +
-	"</html>\r\n"
-
-// decoyBodyLen is len(decoyHTTPBody); used in Content-Length and tests.
-const decoyBodyLen = len(decoyHTTPBody) // 221
-
-var decoyHTTPResponse = []byte("HTTP/1.1 400 Bad Request\r\n" +
-	"Server: nginx/1.24.0\r\n" +
-	"Content-Type: text/html\r\n" +
-	fmt.Sprintf("Content-Length: %d\r\n", decoyBodyLen) +
-	"Connection: close\r\n" +
-	"\r\n" +
-	decoyHTTPBody)
-
-func init() {
-	// Compile-time guard: verify Content-Length header matches actual body.
-	if decoyBodyLen != 221 {
-		panic(fmt.Sprintf("decoy: body length changed: got %d, expected 221 — update Content-Length header", decoyBodyLen))
-	}
 }
 
 // peekConn wraps a net.Conn and prepends a single already-read byte back into
@@ -131,7 +97,7 @@ func (p *peekConn) Read(b []byte) (int, error) {
 //     the normal VPN pipeline. The returned conn transparently replays the
 //     peeked byte so the pipeline never sees a truncated stream.
 //   - (nil, false)             — the byte was something else; peekAndRoute has
-//     already written the HTTP decoy response and closed the connection.
+//     already served the cover website and closed the connection.
 //     Caller must not touch conn.
 func peekAndRoute(conn net.Conn) (net.Conn, bool) {
 	// Give the client a short window to send its first byte.
@@ -140,6 +106,8 @@ func peekAndRoute(conn net.Conn) (net.Conn, bool) {
 	var first [1]byte
 	if _, err := conn.Read(first[:]); err != nil {
 		// No data arrived (timeout, reset, etc.) — close silently.
+		// No logging: SYN-only probes are routine noise and MUST NOT appear
+		// in logs to avoid fingerprinting the server as a VPN.
 		conn.Close()
 		return nil, false
 	}
@@ -152,16 +120,11 @@ func peekAndRoute(conn net.Conn) (net.Conn, bool) {
 		return &peekConn{Conn: conn, peeked: first[0]}, true
 	}
 
-	// Not a VPN client. Serve the HTTP decoy and close.
-	serveHTTPDecoy(conn)
+	// Not a VPN client. Serve the full cover website (cooking blog).
+	// This makes the server indistinguishable from a real HTTP website
+	// to DPI scanners and active probes. The cover site has multiple
+	// pages (/recipe1, /recipe2, /contacts, /about) with internal links,
+	// increasing scanner confidence that this is a legitimate web server.
+	serveCoverSiteFromPeeked(conn, first[0])
 	return nil, false
-}
-
-// serveHTTPDecoy writes the nginx-like 400 response and closes conn.
-// The write deadline is intentionally short (2 s): we do not want to block
-// the goroutine on a slow scanner.
-func serveHTTPDecoy(conn net.Conn) {
-	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	conn.Write(decoyHTTPResponse) //nolint:errcheck
-	conn.Close()
 }

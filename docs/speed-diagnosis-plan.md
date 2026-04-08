@@ -734,3 +734,77 @@ Ha et al. 2008 (ACM SIGOPS): β=0.7 улучшает утилизацию при
 **Тесты:** 24/24 passed (`test_reliable_udp.py`), все Go тесты pass
 
 **Следующий шаг:** Все кодовые гипотезы (#1–#16) проверены и исправлены. Оставшиеся гипотезы (#4 WiFi, #5 Packet loss, #10 Provider throttling) требуют тестирования на реальном оборудовании. Подготовить диагностический скрипт для сбора метрик (iperf3, mtr, sysctl) на MacBook и серверах. Или: проверить relay TCP deadline bug (`relayPipeTimeout` устанавливает абсолютный deadline через `SetDeadline`, а не per-read timeout — TCP relay умирает через 5 минут даже при активной передаче; не влияет на UDP default transport).
+
+---
+
+## Прогресс REALITY
+
+### План реализации anti-probing защиты
+
+**Цель:** Сделать VPN-сервер неотличимым от обычного HTTP-сайта для любого внешнего наблюдателя (DPI/ТСПУ, активные пробы, сканеры).
+
+| # | Задача | Статус | Сеанс |
+|---|--------|--------|-------|
+| R1 | Cover website + HTTP handler + fallback для non-TLS проб + silent logging | ВЫПОЛНЕНО | 9 |
+| R2 | Смена порта с 8443 на высокий (>30000) + гайд миграции | ПЛАН | — |
+| R3 | SNI fix — убрать Google/Microsoft из defaultSNIDomains | ПЛАН | — |
+| R4 | Port knocking — секретный ключ в первом пакете relay | ПЛАН | — |
+| R5 | HTTP listener на порту 80 для cover site | ПЛАН | — |
+| R6 | Интеграция cover site в handleConn (fallback при Noise failure) | ПЛАН | — |
+
+### Сеанс 9 — 2026-04-08 — Cover website + anti-probing fallback (R1)
+
+**Задача:** Реализовать полноценный cover website как HTTP fallback для non-VPN соединений + подавить логи handshake failures.
+
+**Научное обоснование:**
+- **Trojan-GFW** (Li et al., FOCI 2020): при неуспешной аутентификации, сервер проксирует соединение на реальный веб-сервер. Это делает active probing неэффективным — зонд получает валидный HTTP-ответ и не может отличить VPN от обычного сайта.
+- **V2Ray VLESS fallback** (v2fly docs): VLESS поддерживает `fallbacks` — если первый пакет не соответствует VLESS протоколу, соединение перенаправляется на HTTP-сервер.
+- **Alice et al. "Your State is Not Mine" (NDSS 2017):** active probing replays partial handshakes; a convincing fallback defeats replay-based fingerprinting.
+- **Frolov et al. (FOCI 2017):** cover traffic must be indistinguishable from real web traffic at the content level.
+
+**Что сделано:**
+
+1. **`server/cover.go` (НОВЫЙ)** — полноценный cover website "Pork Kitchen" (кулинарный блог):
+   - `coverHandler() http.Handler` — маршрутизатор с 5 страницами + 404
+   - Маршруты: `/` (главная с индексом рецептов), `/recipe1` (жареная свиная лопатка), `/recipe2` (pulled pork), `/about` (о блоге), `/contacts` (контакты)
+   - Каждая страница: валидный HTML5, meta tags, CSS, navigation bar, footer, внутренние ссылки
+   - Реалистичный контент: ингредиенты, шаги приготовления с температурами, таймингами, chef's notes
+   - Все страницы: `Server: nginx/1.24.0`, `Connection: close`, `X-Content-Type-Options: nosniff`
+   - 404 страница с ссылками на существующие рецепты (увеличивает scanner confidence)
+   - `coverResponseWriter` — буферизующий ResponseWriter для синхронной записи HTTP-ответа на raw `net.Conn` (без goroutine leaks)
+   - `serveCoverSite(conn)` — парсит HTTP запрос через `http.ReadRequest()`, маршрутизирует через `coverHandler`, пишет полный HTTP/1.1 response с Content-Length
+   - `serveCoverSiteFromPeeked(conn, firstByte)` — обёртка с replay первого байта (интеграция с `peekAndRoute`)
+   - `serveCoverHTTP(addr, onReady)` — standalone HTTP listener для порта 80
+   - Таймаут 10с на весь HTTP exchange (защита от slowloris)
+
+2. **`server/decoy.go` (ПЕРЕПИСАН)** — вместо простого HTTP 400 "nginx", non-TLS пробы получают полный cover website:
+   - `peekAndRoute(conn)` — первый байт == 0x16 → VPN path; иначе → `serveCoverSiteFromPeeked()` → полный HTTP-сайт
+   - Удалены: `decoyHTTPResponse`, `decoyHTTPBody`, `decoyBodyLen`, `serveHTTPDecoy()` — заменены cover website handler
+   - Сохранены: `peekConn`, `tlsHandshakeRecordType`, `decoyReadDeadlineNs` (с atomic для thread safety)
+
+3. **`server/main.go` (ИЗМЕНЁН)** — подавление логов handshake failures:
+   - `obfs.ServerHandshake()` error: `Warn` → `Debug` (строка 546)
+   - `doNoiseHandshake()` error: `Warn` → `Debug` (строка 558)
+   - `isKeyAllowed()` rejection: `Warn` → `Debug` (строка 567)
+   - Обоснование: WARN логи при массовом сканировании = fingerprint VPN-сервера для anyone с log access
+
+4. **`server/api/telemetry.go` (ИЗМЕНЁН)** — обновлено описание decoy в AI prompt
+
+**Результат:** ВЫПОЛНЕНО
+
+**Тесты:**
+- `server/cover_test.go` (НОВЫЙ): 14 тестов — index page, recipe1, recipe2, contacts, about, 404, nginx header на всех страницах, Connection:close, navigation links, coverResponseWriter, serveCoverSite HTTP GET/recipe/404, serveCoverHTTP listener
+- `server/decoy_test.go` (ОБНОВЛЁН): 12 тестов — peekConn (5), peekAndRoute VPN passthrough, HTTP scanner → cover site, raw TCP scanner, timeout silent close, non-VPN bytes, serveCoverSiteFromPeeked byte replay
+- `server/relay_test.go` (ОБНОВЛЁН): проверяет "Pork Kitchen" вместо "400 Bad Request"
+- **Все Go тесты: PASS** (`go test ./... -p 1` — 8 пакетов OK)
+
+**Изменённые файлы:**
+- `server/cover.go` — НОВЫЙ: cover website HTTP handler + HTML content
+- `server/cover_test.go` — НОВЫЙ: 14 unit + integration тестов
+- `server/decoy.go` — ПЕРЕПИСАН: cover site fallback вместо 400 nginx
+- `server/decoy_test.go` — ОБНОВЛЁН: проверка cover site content вместо 400
+- `server/main.go` — ИЗМЕНЁН: Warn → Debug для handshake failures (3 места)
+- `server/relay_test.go` — ОБНОВЛЁН: проверка "Pork Kitchen" вместо "400 Bad Request"
+- `server/api/telemetry.go` — ОБНОВЛЁН: описание decoy
+
+**Следующий шаг (R2):** Сменить порт сервера с 8443 на случайный выше 30000. Написать гайд по миграции: закрытие старого порта (iptables, ufw), открытие нового, обновление relay конфигурации (MacBook → СПБ:443 → Астана:новый_порт). Учесть что MacBook передаёт трафик на 443 в СПБ, тот на 8443 в Астану.
