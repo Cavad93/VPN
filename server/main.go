@@ -52,19 +52,21 @@ type TunDevice interface {
 
 // Config holds the server configuration.
 type Config struct {
-	ListenAddr  string
-	TunCIDR     string
-	PrivKeyFile string
-	Transport   string // "tcp" (default) or "udp" (user-space BBR)
+	ListenAddr      string
+	TunCIDR         string
+	PrivKeyFile     string
+	Transport       string // "tcp" (default) or "udp" (user-space BBR)
+	AllowedKeysFile string // path to persist the allowed-keys list across restarts
 }
 
 // DefaultConfig returns a Config populated with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		ListenAddr:  "0.0.0.0:443",
-		TunCIDR:     "10.8.0.1/24",
-		PrivKeyFile: "server_privkey.hex",
-		Transport:   "udp",
+		ListenAddr:      "0.0.0.0:443",
+		TunCIDR:         "10.8.0.1/24",
+		PrivKeyFile:     "server_privkey.hex",
+		Transport:       "udp",
+		AllowedKeysFile: "allowed_keys.txt",
 	}
 }
 
@@ -349,20 +351,97 @@ func (s *Server) Sessions() []api.SessionInfo {
 
 // AddAllowedKey adds key to the allowlist. If no allowlist existed, one is
 // created (switching the server from open-access to allowlist mode).
+// When transitioning to allowlist mode, all currently connected sessions are
+// grandfathered in so they are not locked out on their next reconnect.
 func (s *Server) AddAllowedKey(key [32]byte) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.allowedKeys == nil {
-		s.allowedKeys = make(map[[32]byte]struct{})
+		// Transitioning from open-access to allowlist mode: grandfather all
+		// currently connected sessions so they aren't locked out immediately.
+		s.allowedKeys = make(map[[32]byte]struct{}, len(s.sessions)+1)
+		for _, cs := range s.sessions {
+			s.allowedKeys[cs.remoteKey] = struct{}{}
+		}
 	}
 	s.allowedKeys[key] = struct{}{}
+	s.mu.Unlock()
+	s.saveAllowedKeys()
 }
 
 // RemoveAllowedKey removes key from the allowlist.
 func (s *Server) RemoveAllowedKey(key [32]byte) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.allowedKeys, key)
+	s.mu.Unlock()
+	s.saveAllowedKeys()
+}
+
+// saveAllowedKeys writes the current allowlist to AllowedKeysFile atomically.
+// A nil or empty allowlist (open-access mode) removes the file.
+func (s *Server) saveAllowedKeys() {
+	if s.cfg.AllowedKeysFile == "" {
+		return
+	}
+	s.mu.RLock()
+	keys := make([][32]byte, 0, len(s.allowedKeys))
+	for k := range s.allowedKeys {
+		keys = append(keys, k)
+	}
+	s.mu.RUnlock()
+
+	if len(keys) == 0 {
+		// Empty allowlist means open-access — remove the file so the next
+		// restart stays in open-access mode.
+		_ = os.Remove(s.cfg.AllowedKeysFile)
+		return
+	}
+
+	var sb strings.Builder
+	for _, k := range keys {
+		sb.WriteString(hex.EncodeToString(k[:]))
+		sb.WriteByte('\n')
+	}
+
+	// Atomic write: write to a temp file then rename.
+	tmp := s.cfg.AllowedKeysFile + ".tmp"
+	if err := os.WriteFile(tmp, []byte(sb.String()), 0600); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("failed to save allowed_keys", "err", err)
+		}
+		return
+	}
+	if err := os.Rename(tmp, s.cfg.AllowedKeysFile); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("failed to rename allowed_keys file", "err", err)
+		}
+	}
+}
+
+// loadAllowedKeysFile reads an allowed_keys file (one hex key per line).
+// Returns nil if the file does not exist (open-access mode).
+func loadAllowedKeysFile(path string) ([][32]byte, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read allowed_keys file: %w", err)
+	}
+	var keys [][32]byte
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		b, err := hex.DecodeString(line)
+		if err != nil || len(b) != 32 {
+			return nil, fmt.Errorf("invalid key in allowed_keys file: %q", line)
+		}
+		var k [32]byte
+		copy(k[:], b)
+		keys = append(keys, k)
+	}
+	return keys, nil
 }
 
 // AllowedKeys returns a copy of the current allowlist, or nil if open access.
@@ -1407,6 +1486,7 @@ func main() {
 	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
 	flag.StringVar(&cfg.PrivKeyFile, "privkey", cfg.PrivKeyFile, "path to hex-encoded private key file")
 	flag.StringVar(&cfg.Transport, "transport", cfg.Transport, "transport protocol: tcp (kernel CC) or udp (user-space BBR)")
+	flag.StringVar(&cfg.AllowedKeysFile, "allowed-keys-file", cfg.AllowedKeysFile, "path to file with allowed client public keys (one hex key per line); persists across restarts")
 	flag.StringVar(&apiCfg.ListenAddr, "api-addr", apiCfg.ListenAddr, "REST API listen address (empty to disable)")
 	flag.StringVar(&apiCfg.APIToken, "api-token", "", "Bearer token for the REST API (empty = auto-generate a secure random token on startup)")
 	flag.StringVar(&vlessAddr, "vless-addr", "", "VLESS+WS+TLS listen address (e.g. 0.0.0.0:443)")
@@ -1478,7 +1558,16 @@ func main() {
 		logger.Warn("TUN configuration failed — interface may need manual setup", "err", err)
 	}
 
-	srv, err := NewServer(cfg, kp, tun, nil, logger)
+	// Load the persisted allowed-keys list (if any).
+	persistedKeys, err := loadAllowedKeysFile(cfg.AllowedKeysFile)
+	if err != nil {
+		logger.Warn("failed to load allowed_keys file — starting in open-access mode", "err", err)
+		persistedKeys = nil
+	} else if len(persistedKeys) > 0 {
+		logger.Info("loaded allowed_keys", "path", cfg.AllowedKeysFile, "count", len(persistedKeys))
+	}
+
+	srv, err := NewServer(cfg, kp, tun, persistedKeys, logger)
 	if err != nil {
 		logger.Error("failed to create server", "err", err)
 		os.Exit(1)

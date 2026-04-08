@@ -1636,6 +1636,120 @@ func TestRemoveAllowedKey_Nonexistent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TestAllowedKeys_FilePersistence — saveAllowedKeys / loadAllowedKeysFile
+// ---------------------------------------------------------------------------
+
+func TestAllowedKeys_FilePersistence(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	keyFile := dir + "/allowed_keys.txt"
+
+	cfg := DefaultConfig()
+	cfg.AllowedKeysFile = keyFile
+
+	kp, _ := crypto.GenerateKeyPair()
+	tun := newMockTun()
+	defer tun.Close()
+	srv, _ := NewServer(cfg, kp, tun, nil, newTestLogger())
+
+	var k1, k2 [32]byte
+	k1[0] = 0xAA
+	k2[0] = 0xBB
+
+	// After AddAllowedKey the file must exist and be loadable.
+	srv.AddAllowedKey(k1)
+	srv.AddAllowedKey(k2)
+
+	loaded, err := loadAllowedKeysFile(keyFile)
+	if err != nil {
+		t.Fatalf("loadAllowedKeysFile: %v", err)
+	}
+	if len(loaded) != 2 {
+		t.Fatalf("expected 2 keys, got %d", len(loaded))
+	}
+	found := make(map[[32]byte]bool)
+	for _, k := range loaded {
+		found[k] = true
+	}
+	if !found[k1] || !found[k2] {
+		t.Error("loaded keys do not match saved keys")
+	}
+
+	// After RemoveAllowedKey(k1) the file contains only k2.
+	srv.RemoveAllowedKey(k1)
+	loaded, err = loadAllowedKeysFile(keyFile)
+	if err != nil {
+		t.Fatalf("loadAllowedKeysFile after remove: %v", err)
+	}
+	if len(loaded) != 1 || loaded[0] != k2 {
+		t.Errorf("expected only k2 after remove, got %v", loaded)
+	}
+
+	// After removing all keys the file is deleted — loadAllowedKeysFile returns nil.
+	srv.RemoveAllowedKey(k2)
+	loaded, err = loadAllowedKeysFile(keyFile)
+	if err != nil {
+		t.Fatalf("loadAllowedKeysFile after all removed: %v", err)
+	}
+	if loaded != nil {
+		t.Errorf("expected nil (open-access) after removing all keys, got %v", loaded)
+	}
+}
+
+func TestAllowedKeys_LoadNonexistent(t *testing.T) {
+	t.Parallel()
+	keys, err := loadAllowedKeysFile("/nonexistent/path/allowed_keys.txt")
+	if err != nil {
+		t.Fatalf("expected nil error for non-existent file, got %v", err)
+	}
+	if keys != nil {
+		t.Errorf("expected nil for non-existent file, got %v", keys)
+	}
+}
+
+func TestAllowedKeys_GrandfatherExistingSessions(t *testing.T) {
+	t.Parallel()
+	// Simulate the scenario: server is in open-access mode (nil allowedKeys).
+	// A client has already established a session (its key is in srv.sessions).
+	// When a NEW key is added via AddAllowedKey (e.g. QR generation), the
+	// existing session key must be grandfathered into the allowlist so that
+	// the existing client can reconnect.
+	cfg := DefaultConfig()
+	cfg.AllowedKeysFile = "" // disable file I/O for this test
+
+	kp, _ := crypto.GenerateKeyPair()
+	tun := newMockTun()
+	defer tun.Close()
+	srv, _ := NewServer(cfg, kp, tun, nil, newTestLogger())
+
+	// Inject a fake session to simulate a connected client.
+	var existingClientKey [32]byte
+	existingClientKey[0] = 0x55
+	srv.mu.Lock()
+	srv.sessions[99] = &clientSession{id: 99, remoteKey: existingClientKey}
+	srv.mu.Unlock()
+
+	// Now generate a QR for a NEW device (adds a different key).
+	var newDeviceKey [32]byte
+	newDeviceKey[0] = 0xFF
+	srv.AddAllowedKey(newDeviceKey)
+
+	// The existing client's key must have been grandfathered.
+	if !srv.isKeyAllowed(existingClientKey) {
+		t.Error("existing session key should have been grandfathered into the allowlist")
+	}
+	if !srv.isKeyAllowed(newDeviceKey) {
+		t.Error("newly added key should be allowed")
+	}
+	// A random unknown key must still be rejected.
+	var unknownKey [32]byte
+	unknownKey[0] = 0x11
+	if srv.isKeyAllowed(unknownKey) {
+		t.Error("unknown key should not be allowed")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TestStartAPIServer
 // ---------------------------------------------------------------------------
 
