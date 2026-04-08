@@ -569,3 +569,49 @@ Wire check: IP(20) + UDP(8) + ReliableHdr(11) + Payload(1460) = 1499 ≤ 1500 �
 **Тесты:** 22/22 passed (`test_reliable_udp.py`)
 
 **Следующий шаг:** Проверить гипотезу #4 (WiFi bottleneck) — нельзя проверить из кода. Подготовить скрипт диагностики для сравнения скорости WiFi vs Ethernet на MacBook, и параллельно проверить гипотезу #10 (Provider throttling) — подготовить скрипт сравнения скоростей на разных портах. Или выдвинуть новую гипотезу на основе оставшихся данных — проверить нет ли в коде проблемы с начальным congestion window (IW=4 vs рекомендованный RFC 6928 IW=10).
+
+### Сеанс 6 — 2026-04-08 — IW=10 + initial ssthresh=∞ (гипотеза #13)
+
+**Гипотеза:** #13 — Начальный congestion window IW=4 и ssthresh=32 ниже рекомендаций RFC
+
+**Что сделано:**
+
+Проведён анализ кода `reliable_udp.py:111-112` и RFC 6928 / RFC 5681:
+
+**Найденные проблемы:**
+
+1. **`_cwnd = 4` (строка 111)** — ниже рекомендации RFC 6928
+   - RFC 6928 §1: "We propose increasing the initial window to 10*SMSS" (SMSS=1460 → IW=10)
+   - Linux kernel использует IW=10 с версии 2.6.39 (2011)
+   - Google (Dukkipati et al. 2010): IW=10 даёт ~10% снижение задержки для высокоRTT соединений
+   - При RTT=72ms, BDP≈47 сегментов:
+     - Старый IW=4: 4→8→16→32 (медленный старт, 4 RTT) + CA 32→47 (~15 RTT) ≈ **1.4 секунды** до полной скорости
+     - Новый IW=10: 10→20→40→47 (медленный старт, 3 RTT) ≈ **216 мс** до полной скорости
+   - Разница: **1.2 секунды быстрее** при каждом переподключении (reconnect storm = критично)
+
+2. **`_ssthresh = 32` (строка 112)** — противоречит RFC 5681 §3.1
+   - RFC 5681 §3.1: "The initial value of ssthresh SHOULD be set arbitrarily high (e.g., to the size of the largest possible advertised window)"
+   - ssthresh=32 < BDP≈47: медленный старт искусственно прерывается до достижения BDP
+   - Это вынуждает переход в congestion avoidance (рост +1 сегмент за RTT) вместо медленного старта (удвоение за RTT) — значительно замедляет рост cwnd от 32 до 47
+   - Правильно: ssthresh=MAX_WINDOW_SIZE=512 — сеть сама определит BDP через первую потерю пакета
+
+**Научное обоснование:**
+- RFC 6928 (2013): Experimental standard, реализован в Linux/Android/iOS
+- RFC 5681 §3.1 (2009): явно требует "arbitrarily high" для начального ssthresh
+- Dukkipati et al. 2010 (Google): median 10% improvement с IW=10
+
+**Результат:** ИСПРАВЛЕНО
+
+**Влияние на VPN:**
+- Основное: ускорение выхода на полную скорость после переподключения (1.4с → 0.2с)
+- Вторично: устранение sub-optimal CA фазы 32→47 при первом подключении
+- Для постоянного соединения: незначительное (cwnd уже устоявшийся)
+- Для нестабильной сети CIS с частыми reconnect: ~10% выигрыш
+
+**Изменённые файлы:**
+- `client/reliable_udp.py` — `_cwnd`: 4 → 10; `_ssthresh`: 32 → MAX_WINDOW_SIZE; добавлены подробные комментарии со ссылками на RFC 6928 и RFC 5681 §3.1
+- `client/test_reliable_udp.py` — добавлен тест `test_initial_congestion_window_rfc6928`: проверяет cwnd==10 и ssthresh==MAX_WINDOW_SIZE при инициализации
+
+**Тесты:** 23/23 passed (`test_reliable_udp.py`)
+
+**Следующий шаг:** Выдвинуть новую гипотезу #14 — проверить, есть ли в коде `_retransmit_loop` достаточная гранулярность проверки. Текущий sleep = max(50ms, rto/4) при rto=216ms → 54ms. Проверить, не создаёт ли это 54мс задержку fast retransmit в edge-cases. Или исследовать server-side BBR (transport/bbr_state.go): проверить параметры STARTUP_GAIN (2.885), выход из Startup, ProbeRTT настройки — нет ли sub-optimal параметров ограничивающих download до 3.38 Мбит/с.

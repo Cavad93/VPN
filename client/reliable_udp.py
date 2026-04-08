@@ -108,8 +108,23 @@ class ReliableUDP:
         self._send_lock = threading.Lock()
         self._send_seq = 0
         self._pending: dict[int, _PendingPacket] = {}
-        self._cwnd = 4
-        self._ssthresh = 32
+        # RFC 6928 §1: initial congestion window = 10 segments (IW10).
+        # Google measured ~10% median latency reduction vs IW4 on high-RTT paths
+        # (Dukkipati et al. 2010).  Linux default since kernel 2.6.39 (2011).
+        # At RTT=72ms with BDP≈47 segments:
+        #   IW=4:  4→8→16→32 (slow start, 4 RTTs) + CA 32→47 (~15 RTTs) = ~1.4 s
+        #   IW=10: 10→20→40→47 (slow start, 3 RTTs)                      = ~0.2 s
+        # The 1.2-second difference matters for reconnect storms and cold-start.
+        self._cwnd = 10
+        # RFC 5681 §3.1: "The initial value of ssthresh SHOULD be set arbitrarily
+        # high (e.g., to the size of the largest possible advertised window),
+        # allowing the network conditions to determine the appropriate value."
+        # Setting ssthresh=32 artificially stops slow start at 32 segments and
+        # forces congestion avoidance even before probing the actual network BDP.
+        # With ssthresh=MAX_WINDOW_SIZE the connection stays in slow start (doubling
+        # each RTT) until it naturally hits congestion, then sets ssthresh to half
+        # the in-flight count — the standard Reno behaviour.
+        self._ssthresh = MAX_WINDOW_SIZE
         self._cwnd_remainder: float = 0.0   # fractional accumulator for CA phase
         self._window_open = threading.Event()
         self._window_open.set()

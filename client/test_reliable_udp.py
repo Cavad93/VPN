@@ -10,6 +10,7 @@ import pytest
 from reliable_udp import (
     HEADER_SIZE,
     MAX_PAYLOAD_SIZE,
+    MAX_WINDOW_SIZE,
     PACKET_TYPE_ACK,
     PACKET_TYPE_DATA,
     ReliableUDP,
@@ -332,6 +333,30 @@ class TestReliableUDP:
 
             assert not client._in_fast_recovery
             assert client._dup_ack_count == 0
+        finally:
+            client.close()
+            server.close()
+
+    def test_initial_congestion_window_rfc6928(self):
+        """Initial cwnd MUST be 10 (RFC 6928) and ssthresh MUST be MAX_WINDOW_SIZE (RFC 5681 §3.1).
+
+        RFC 6928 §1: IW = min(10*SMSS, max(2*SMSS, 14600)).  For SMSS=1460 this
+        equals 10 segments.  Linux uses this as default since kernel 2.6.39 (2011).
+
+        RFC 5681 §3.1: initial ssthresh SHOULD be arbitrarily high so slow start
+        continues until the network signals congestion — not until an artificial
+        host-side limit.  Setting ssthresh=32 would prematurely cap slow start well
+        below the BDP (≈47 segments at 7.64 Mbps, RTT=72ms), adding ~1.2 seconds
+        of sub-optimal throughput at connection start and after each reconnect.
+        """
+        client, server = _make_pair()
+        try:
+            assert client._cwnd == 10, (
+                f"Initial cwnd={client._cwnd}, want 10 (RFC 6928)"
+            )
+            assert client._ssthresh == MAX_WINDOW_SIZE, (
+                f"Initial ssthresh={client._ssthresh}, want MAX_WINDOW_SIZE={MAX_WINDOW_SIZE} (RFC 5681 §3.1)"
+            )
         finally:
             client.close()
             server.close()
