@@ -289,9 +289,19 @@ class ReliableUDP:
             self._do_retransmit()
 
     def _do_retransmit(self) -> None:
-        """Retransmit expired packets, apply multiplicative decrease."""
+        """Retransmit expired packets, apply multiplicative decrease.
+
+        RFC 6298 §5.4 / Reno: multiplicative decrease and RTO doubling must be
+        applied AT MOST ONCE per retransmit event (i.e. per call), not once per
+        retransmitted packet.  Applying it per-packet causes cwnd to collapse
+        from N to N/2^k for k simultaneous timeouts — even a single burst of 4
+        timed-out packets drives cwnd from 32 → 2, stalling the connection for
+        seconds.  The fix: track whether MD has already been applied this round
+        and skip it for subsequent packets in the same call.
+        """
         now = time.monotonic()
         dropped = 0
+        did_reduce = False   # MD/RTO-backoff applied at most once per event
         with self._send_lock:
             for seq in list(self._pending.keys()):
                 pp = self._pending[seq]
@@ -307,12 +317,14 @@ class ReliableUDP:
                     pass
                 pp.sent_at = now
                 pp.retransmits += 1
-                # Multiplicative decrease (Reno).
-                self._ssthresh = max(self._cwnd // 2, 2)
-                self._cwnd = self._ssthresh
-                self._cwnd_remainder = 0.0
-                # Exponential backoff on RTO (cap at 60s).
-                self._rto = min(self._rto * 2, 60.0)
+                if not did_reduce:
+                    # Multiplicative decrease (Reno) — once per retransmit event.
+                    self._ssthresh = max(self._cwnd // 2, 2)
+                    self._cwnd = self._ssthresh
+                    self._cwnd_remainder = 0.0
+                    # Exponential backoff on RTO (cap at 60s).
+                    self._rto = min(self._rto * 2, 60.0)
+                    did_reduce = True
         if dropped > 0:
             self._window_open.set()
 

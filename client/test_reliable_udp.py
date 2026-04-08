@@ -216,3 +216,40 @@ class TestReliableUDP:
         finally:
             client.close()
             server.close()
+
+    def test_retransmit_md_once_per_event(self):
+        """Multiplicative decrease must apply at most once per _do_retransmit() call.
+
+        RFC 6298 §5.4: MD is applied per retransmit EVENT, not per packet.
+        Calling _do_retransmit() with N timed-out packets should halve cwnd
+        exactly once, not N times.
+        """
+        client, server = _make_pair()
+        try:
+            initial_cwnd = 32
+            client._cwnd = initial_cwnd
+            client._ssthresh = 64
+            client._rto = 0.001  # very short so packets are "timed out"
+
+            # Inject 4 fake pending packets all past their RTO.
+            from reliable_udp import _PendingPacket
+            fake_raw = encode_packet(PACKET_TYPE_DATA, 0, 0, b"x")
+            for seq in range(4):
+                pp = _PendingPacket(fake_raw)
+                pp.sent_at = 0.0  # epoch — always < rto
+                client._pending[seq] = pp
+
+            initial_rto = client._rto
+            client._do_retransmit()
+
+            # cwnd should be halved ONCE (32→16), not 4 times (32→2).
+            assert client._cwnd == max(initial_cwnd // 2, 2), (
+                f"cwnd={client._cwnd}, expected {initial_cwnd // 2} — MD applied multiple times"
+            )
+            # RTO should be doubled ONCE, not 4 times.
+            assert client._rto == pytest.approx(initial_rto * 2, rel=0.01), (
+                f"rto={client._rto}, expected {initial_rto * 2} — RTO backoff applied multiple times"
+            )
+        finally:
+            client.close()
+            server.close()

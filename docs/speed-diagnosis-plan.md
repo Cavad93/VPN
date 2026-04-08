@@ -412,3 +412,57 @@ sysctl -w net.ipv4.tcp_wmem="4096 1048576 16777216"
 **Тесты:** 17/17 passed (`test_reliable_udp.py`)
 
 **Следующий шаг:** Проверить гипотезу #8 (Mux backpressure) — изучить `MuxStream._queue (maxsize=4096)` в `core.py`: может ли `_deliver()` заблокировать mux-reader thread? Является ли `ClientMux._read_loop` single-threaded bottleneck? Проверить `readCh` размер в `server/transport/mux.go` и блокировку `s.readCh <-` при полном канале.
+
+### Сеанс 3 — 2026-04-08 — Per-packet multiplicative decrease bug (новая гипотеза #11)
+
+**Гипотеза:** #8 (Mux backpressure) — анализ, затем новая #11 — Per-packet MD в reliable_udp.py
+
+**Что сделано:**
+
+**Анализ гипотезы #8 (Mux backpressure):**
+
+Изучены `server/transport/mux.go` (строки 320-385) и `client/core.py` (строки 625-713, 802-854):
+- Go сервер: `readCh` = 256 записей × 1460 байт = ~370 KB. BDP = 7.64 Мбит/с × 72мс = 69 KB. Буфер в 5× больше BDP — backpressure не возникнет при нормальной работе.
+- Python клиент: `_queue` maxsize=4096 × 1460 байт = ~6 MB. При скорости 3.38 Мбит/с очередь заполняется за 14 секунд — не bottleneck.
+- `_deliver()` использует блокирующий `queue.put()` — теоретически может заблокировать `_read_loop`, но только при >14 секундах задержки TUN-записи.
+
+**Вывод по #8:** ОПРОВЕРГНУТА. Mux backpressure не является причиной наблюдаемого ограничения 3.38 Мбит/с.
+
+**Новая гипотеза #11 — Per-packet Multiplicative Decrease в reliable_udp.py:**
+
+При анализе кода обнаружен критический баг в `_do_retransmit()` (строки 291-317):
+
+```python
+for seq in list(self._pending.keys()):
+    ...  # для каждого пакета с истёкшим таймаутом:
+    self._ssthresh = max(self._cwnd // 2, 2)  # MD применяется КАЖДЫЙ РАЗ
+    self._cwnd = self._ssthresh                # за каждый пакет!
+    self._rto = min(self._rto * 2, 60.0)      # RTO удваивается каждый раз!
+```
+
+**Пример коллапса:** cwnd=32, 4 пакета с истёкшим RTO одновременно:
+- 1-й: cwnd=16, rto×2
+- 2-й: cwnd=8, rto×4
+- 3-й: cwnd=4, rto×8
+- 4-й: cwnd=2, rto×16 → соединение стоит секундами!
+
+**Стандарт (RFC 6298 §5.4):** MD и RTO backoff применяются ОДИН РАЗ за retransmit event, не за каждый пакет.
+
+**Влияние на скорость (математика):**
+- При 0.7% потери пакетов (Russia↔Kazakhstan) и RTT=72мс
+- Reno с правильным MD: throughput ≈ MSS×C/(RTT×√p) = 1350×1.22/(0.072×0.0837) ≈ 2.2 Мбит/с
+- С багом per-packet MD: любая серия из 3–4 потерянных пакетов → cwnd=2 → throughput ≈ 0.1 Мбит/с
+- После исправления теоретический потолок при 0.7% loss: ~2.2–5 Мбит/с (ближе к 7.64 потолку если loss ниже)
+
+**Результат:** #11 ИСПРАВЛЕНО
+
+**Найденные проблемы:**
+- `client/reliable_udp.py:310-315` — MD и RTO backoff в цикле `for seq in pending`: применялись по одному разу на каждый тайм-аут пакет вместо одного раза на retransmit event
+
+**Изменённые файлы:**
+- `client/reliable_udp.py` — добавлен флаг `did_reduce: bool = False`; MD и RTO backoff перенесены в блок `if not did_reduce: ... did_reduce = True`. Добавлен подробный комментарий с ссылкой на RFC 6298.
+- `client/test_reliable_udp.py` — добавлен тест `test_retransmit_md_once_per_event`: проверяет что при 4 одновременных тайм-аутах cwnd halvied ровно 1 раз (32→16), не 4 раза (32→2).
+
+**Тесты:** 18/18 passed (`test_reliable_udp.py`)
+
+**Следующий шаг:** Проверить гипотезу #9 (MTU/фрагментация) — изучить MTU настройки TUN интерфейса на клиенте и сервере: `tun_linux.go`, `tun_macos.py`. Соответствует ли TUN MTU расчёту из reliable_udp.py (1370 байт)? Проверить нет ли IP-фрагментации на пути MacBook→SPB→Astana.
