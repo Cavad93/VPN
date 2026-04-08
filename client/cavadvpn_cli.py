@@ -151,6 +151,7 @@ def cmd_connect(args: argparse.Namespace) -> int:
         print(f"Server key pinned: {server_key_hex[:16]}…")
 
     try:
+        import time as _time
         from core import VPNConfig, VPNClient  # type: ignore
 
         # server is already in "host:port" format — pass directly.
@@ -159,7 +160,9 @@ def cmd_connect(args: argparse.Namespace) -> int:
             private_key_file=key_file,
         )
         client = VPNClient(vpn_cfg)
+        _hs_start = _time.monotonic()
         route = client.connect()
+        _handshake_ms = (_time.monotonic() - _hs_start) * 1000
         print(f"Connected. Assigned IP: {route.assigned_ip}/{route.prefix_len}  Gateway: {route.gateway}")
 
         # Activate smart routing after VPN is up (routes now go through the tunnel).
@@ -187,11 +190,13 @@ def cmd_connect(args: argparse.Namespace) -> int:
             def _get_vpn_state():
                 return {"server_addr": server, "state": "connected"}
 
+            _MAX_BOND_COUNT = 8   # sanity cap — 64 bonds is excessive for any ISP
+
             def _on_config_update(cfg: dict) -> None:
                 """Автоматически применяет рекомендации AI агента."""
                 # Обновляем транспортную информацию в следующем отчёте.
                 transport = cfg.get("transport_mode", "")
-                bonds = cfg.get("bond_count", 0)
+                bonds = min(cfg.get("bond_count", 0) or 0, _MAX_BOND_COUNT)
                 padding = cfg.get("padding_mode", "")
                 sni_list = cfg.get("sni_hosts") or []
                 sni = sni_list[0] if sni_list else ""
@@ -203,7 +208,7 @@ def cmd_connect(args: argparse.Namespace) -> int:
                         padding_mode=padding,
                     )
                 print(f"[AI] Новый конфиг от сервера: transport={transport or '—'}, "
-                      f"padding={padding or '—'}, sni={sni or '—'}")
+                      f"bonds={bonds or '—'}, padding={padding or '—'}, sni={sni or '—'}")
 
             from telemetry import TelemetryConfig, TelemetryCollector  # type: ignore
             from telemetry import _generate_device_id, _detect_platform  # type: ignore
@@ -215,7 +220,11 @@ def cmd_connect(args: argparse.Namespace) -> int:
             )
             telemetry = TelemetryCollector(tel_cfg, get_vpn_state=_get_vpn_state)
             # Сообщаем текущий транспортный режим (UDP по умолчанию).
-            telemetry.set_transport_info(transport_mode="udp", bond_count=0)
+            telemetry.set_transport_info(
+                transport_mode=vpn_cfg.transport,
+                bond_count=vpn_cfg.bond_count,
+            )
+            telemetry.record_handshake(_handshake_ms)
             telemetry.record_connect()
             telemetry.start()
             print(f"Telemetry active → {telemetry_url}")

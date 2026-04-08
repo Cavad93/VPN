@@ -218,7 +218,9 @@ func NewTelemetryStore(capacity int) *TelemetryStore {
 func (ts *TelemetryStore) Add(r TelemetryReport) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	r.ReceivedAt = time.Now()
+	if r.ReceivedAt.IsZero() {
+		r.ReceivedAt = time.Now()
+	}
 	ts.reports[ts.pos] = r
 	ts.pos++
 	if ts.pos >= ts.capacity {
@@ -1073,6 +1075,9 @@ func (a *APIServer) handleSubmitTelemetry(w http.ResponseWriter, r *http.Request
 
 	// Set public IP from request.
 	report.PublicIP = remoteIP(r)
+	// Set received_at here so both the in-memory store and the JSONL file see the same value.
+	// Previously Add() set it on a local copy, so appendDiagnostics got the zero-time report.
+	report.ReceivedAt = time.Now()
 
 	a.telemetryStore.Add(report)
 	a.logger.Debug("telemetry received", "device", report.DeviceID, "platform", report.Platform)

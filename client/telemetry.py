@@ -114,9 +114,50 @@ def _detect_platform() -> str:
 
 
 def _detect_network_type() -> str:
-    """Best-effort network type detection."""
-    # On macOS we could parse scutil/networksetup, but for simplicity:
-    return "wifi"  # default assumption; overridden by mobile clients
+    """Best-effort network type detection. Uses scutil on macOS."""
+    import subprocess
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        try:
+            result = subprocess.run(
+                ["scutil", "--nwi"],
+                capture_output=True, text=True, timeout=2,
+            )
+            out = result.stdout
+            # Active interface is listed first after "Network interfaces:"
+            # utun/ipsec → vpn, en0 (usually WiFi) → wifi, en1/en2 → ethernet,
+            # pdp_ip / rmnet → cellular.
+            if "pdp_ip" in out or "rmnet" in out or "wwan" in out.lower():
+                return "cellular"
+            if "utun" in out or "ipsec" in out:
+                return "vpn"
+            if "en0" in out or "Wi-Fi" in out:
+                return "wifi"
+            if "en1" in out or "en2" in out or "Ethernet" in out:
+                return "ethernet"
+        except Exception:
+            pass
+        return "wifi"   # fallback on macOS
+    if sys_name == "Linux":
+        try:
+            result = subprocess.run(
+                ["ip", "route", "get", "8.8.8.8"],
+                capture_output=True, text=True, timeout=2,
+            )
+            iface = ""
+            for token in result.stdout.split():
+                if token == "dev":
+                    iface_idx = result.stdout.split().index(token)
+                    iface = result.stdout.split()[iface_idx + 1]
+                    break
+            if iface.startswith("wl"):
+                return "wifi"
+            if iface.startswith("eth") or iface.startswith("en"):
+                return "ethernet"
+        except Exception:
+            pass
+        return "unknown"
+    return "unknown"
 
 
 def _get_local_ip() -> str:
