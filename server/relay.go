@@ -35,10 +35,43 @@ import (
 // If Astana is unreachable within this window the client connection is closed.
 var relayDialTimeout = 10 * time.Second
 
-// relayPipeTimeout is the read/write deadline applied to idle relay pipes.
-// A connection that transfers no bytes for this duration is considered dead.
+// relayPipeTimeout is the idle timeout for relay pipes.  A connection that
+// transfers no bytes for this duration in either direction is considered dead.
 // Set to 0 to disable (no timeout).
+//
+// IMPORTANT: this is an IDLE timeout, not an absolute deadline.  The deadline
+// is reset before every Read and Write via idleTimeoutConn, so active
+// connections stay alive indefinitely.  Previously this was implemented as a
+// one-shot SetDeadline which killed active connections after exactly 5 minutes
+// regardless of traffic (see Cloudflare blog "The complete guide to Go
+// net/http timeouts" — deadlines are absolute, you must reset them per-op).
 var relayPipeTimeout = 5 * time.Minute
+
+// idleTimeoutConn wraps a net.Conn and resets the read/write deadline before
+// every I/O operation, turning a Go absolute deadline into an idle timeout.
+//
+// Each direction gets its own deadline: Read resets ReadDeadline, Write resets
+// WriteDeadline.  This allows bidirectional io.Copy goroutines to independently
+// detect idle: if the *reading* side of a pipe goes silent for relayPipeTimeout
+// the Read returns a timeout error, while the Write side (driven by the other
+// pipe) may still be active.
+//
+// This pattern is standard in Go relay/proxy code — see Trojan-Go, Caddy,
+// and Cloudflare's recommendation to call SetDeadline before every op.
+type idleTimeoutConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *idleTimeoutConn) Read(b []byte) (int, error) {
+	c.Conn.SetReadDeadline(time.Now().Add(c.timeout)) //nolint:errcheck
+	return c.Conn.Read(b)
+}
+
+func (c *idleTimeoutConn) Write(b []byte) (int, error) {
+	c.Conn.SetWriteDeadline(time.Now().Add(c.timeout)) //nolint:errcheck
+	return c.Conn.Write(b)
+}
 
 // runRelay listens on listenAddr for incoming connections, applies
 // peek-and-route (active-probe protection), and transparently forwards
@@ -125,14 +158,14 @@ func relayOne(client net.Conn, target string, knockKey *transport.KnockPSK, logg
 		"upstream", target,
 	)
 
-	// Apply idle timeout if configured.
-	applyRelayDeadline := func(c net.Conn) {
-		if relayPipeTimeout > 0 {
-			c.SetDeadline(time.Now().Add(relayPipeTimeout)) //nolint:errcheck
-		}
+	// Wrap connections with idle timeout if configured.
+	// Each Read/Write resets its own deadline — active connections survive
+	// indefinitely, but connections idle for relayPipeTimeout are killed.
+	var routedIO, upstreamIO net.Conn = routed, upstream
+	if relayPipeTimeout > 0 {
+		routedIO = &idleTimeoutConn{Conn: routed, timeout: relayPipeTimeout}
+		upstreamIO = &idleTimeoutConn{Conn: upstream, timeout: relayPipeTimeout}
 	}
-	applyRelayDeadline(routed)
-	applyRelayDeadline(upstream)
 
 	// Bidirectional pipe: client ↔ upstream.
 	done := make(chan struct{}, 2)
@@ -144,8 +177,8 @@ func relayOne(client net.Conn, target string, knockKey *transport.KnockPSK, logg
 		done <- struct{}{}
 	}
 
-	go pipe(upstream, routed)
-	go pipe(routed, upstream)
+	go pipe(upstreamIO, routedIO)
+	go pipe(routedIO, upstreamIO)
 
 	// Wait for both directions to finish.
 	<-done

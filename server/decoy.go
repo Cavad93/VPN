@@ -73,9 +73,17 @@ type peekConn struct {
 	used   bool // true once the peeked byte has been consumed
 }
 
-// Read satisfies io.Reader. The first call (or the first call after the peeked
-// byte has been injected) prepends the peeked byte before delegating to the
-// underlying connection.
+// Read satisfies io.Reader. The first call returns ONLY the peeked byte
+// without touching the underlying connection.  Subsequent calls delegate
+// directly.
+//
+// We intentionally do NOT attempt to combine the peeked byte with a second
+// read from the wire in the same call.  While that would save one Read call,
+// it interacts badly with deadline-aware wrappers like idleTimeoutConn:
+// the wrapper sets a ReadDeadline before calling Read, and the deadline would
+// apply to the wire read, potentially delaying delivery of the already-known
+// peeked byte by the full idle timeout.  One extra Read call per connection
+// lifetime is negligible.
 func (p *peekConn) Read(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
@@ -83,13 +91,7 @@ func (p *peekConn) Read(b []byte) (int, error) {
 	if !p.used {
 		p.used = true
 		b[0] = p.peeked
-		if len(b) == 1 {
-			// Caller asked for exactly 1 byte — return it without a syscall.
-			return 1, nil
-		}
-		// Caller wants more; read the rest from the wire.
-		n, err := p.Conn.Read(b[1:])
-		return 1 + n, err
+		return 1, nil
 	}
 	return p.Conn.Read(b)
 }

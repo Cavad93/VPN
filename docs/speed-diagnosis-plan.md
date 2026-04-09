@@ -1273,3 +1273,73 @@ Kotlin syntax: **OK** (ObfsConn.kt)
 | R6 | CCS + TLS 1.3 fallback в handleConn при Noise failure | ВЫПОЛНЕНО | 12 |
 
 **Все задачи REALITY плана выполнены.**
+
+### Сеанс 13 — 2026-04-09 — TCP relay idle timeout bug fix (гипотеза #17)
+
+**Гипотеза:** #17 — TCP relay absolute deadline kills active connections after 5 minutes
+
+**Что сделано:**
+
+Проведён анализ `server/relay.go:128-135`. Обнаружен баг: `relayPipeTimeout` реализован через один вызов `SetDeadline(time.Now().Add(5*time.Minute))` перед `io.Copy` — это абсолютный deadline (point-in-time), НЕ idle timeout. Соединение умирает через ровно 5 минут независимо от активности трафика.
+
+**Научное обоснование:**
+
+- **Cloudflare blog "The complete guide to Go net/http timeouts":** "Deadlines are absolute, you must reset them before every Read/Write operation to implement idle timeout semantics."
+- **Go documentation (net package):** "A deadline is an absolute time after which I/O operations fail... it is not reset by activity on the connection."
+- **Trojan-Go, Caddy, и другие Go relay/proxy реализации:** все используют per-operation deadline reset для idle timeout.
+
+**Баг (relay.go:128-135):**
+
+```go
+// BUG: absolute deadline — kills active connections after exactly 5 minutes
+applyRelayDeadline := func(c net.Conn) {
+    c.SetDeadline(time.Now().Add(relayPipeTimeout))
+}
+applyRelayDeadline(routed)
+applyRelayDeadline(upstream)
+// io.Copy runs... deadline never resets... boom after 5 min
+```
+
+**Влияние:**
+- TCP relay (СПБ→Астана): соединение разрывается через 5 минут даже при активной VPN-сессии
+- При пиковой загрузке (streaming, downloads >5 мин): полное прерывание с reconnect
+- UDP relay НЕ затронут (использует activity-based cleanup с `lastSeen` timestamp)
+
+**Исправление:**
+
+1. **`server/relay.go` — `idleTimeoutConn` wrapper (НОВЫЙ тип):**
+   - Обёртка над `net.Conn`, сбрасывает deadline перед каждым `Read`/`Write`
+   - `Read(b)` → `SetReadDeadline(now+timeout)` → `Conn.Read(b)` — каждый Read получает свежий deadline
+   - `Write(b)` → `SetWriteDeadline(now+timeout)` → `Conn.Write(b)` — аналогично для Write
+   - Раздельные deadline для направлений: ReadDeadline для чтения, WriteDeadline для записи
+   - Две bidirectional `io.Copy` горутины независимо отслеживают idle в своём направлении
+   - Активное соединение живёт бесконечно; idle >5 мин → timeout error → pipe закрывается
+
+2. **`server/relay.go` — `relayOne` обновлён:**
+   - Было: `c.SetDeadline(time.Now().Add(relayPipeTimeout))` — одноразовый абсолютный deadline
+   - Стало: `idleTimeoutConn{Conn: c, timeout: relayPipeTimeout}` — per-op reset
+   - Обе стороны (routed и upstream) обёрнуты в `idleTimeoutConn`
+
+3. **`server/decoy.go` — `peekConn.Read` упрощён:**
+   - Было: при `len(b) > 1` peekConn возвращал peeked byte + читал ещё данные из wire в том же вызове Read
+   - Проблема: `idleTimeoutConn.Read` устанавливает deadline перед `peekConn.Read`, и deadline применяется к wire-read, задерживая доставку уже-известного peeked byte на весь idle timeout
+   - Стало: peekConn ВСЕГДА возвращает только peeked byte на первом Read (1 лишний syscall per connection lifetime — negligible)
+
+**Результат:** #17 ИСПРАВЛЕНО
+
+**Тесты:**
+
+Новые тесты в `server/relay_test.go`:
+- `TestIdleTimeoutConnResetsDeadlinePerOp` — 8 writes по 50ms интервалу через 100ms idle timeout wrapper; все writes проходят (400ms суммарного трафика > 100ms timeout)
+- `TestIdleTimeoutConnKillsIdleConnection` — write 1 byte, go idle, Read → timeout error через ~200ms
+- `TestRelayActiveConnectionSurvivesPastTimeout` — end-to-end relay с 500ms idle timeout: 20 write/read циклов по 100ms = 2 секунды активного трафика (4× timeout) — все проходят
+
+Все Go тесты: **8 пакетов ALL PASS** (`go test ./... -count=1 -p 1`)
+Python тесты: **24/24 PASS** (`test_reliable_udp.py`)
+
+**Изменённые файлы:**
+- `server/relay.go` — `idleTimeoutConn` тип + `Read`/`Write` с per-op deadline reset; `relayOne` обёртывает connections
+- `server/relay_test.go` — 3 новых теста для idle timeout
+- `server/decoy.go` — `peekConn.Read` упрощён: всегда возвращает только peeked byte (совместимость с deadline wrappers)
+
+**Следующий шаг:** Подготовить диагностический скрипт для сбора метрик (iperf3, mtr, sysctl) на MacBook и серверах. Или: добавить benchmark тесты (шифрование throughput, mux throughput, ObfsConn throughput, end-to-end loopback).
