@@ -127,9 +127,9 @@ func TestRelayForwardsVPNConnection(t *testing.T) {
 	}
 }
 
-// TestRelayServesFallbackForNonVPNProbe verifies that a connection NOT starting
-// with 0x16 receives the fallback cooking blog response.
-func TestRelayServesFallbackForNonVPNProbe(t *testing.T) {
+// TestRelayServesDecoyForNonVPNProbe verifies that a connection NOT starting
+// with 0x16 receives the HTTP decoy response.
+func TestRelayServesDecoyForNonVPNProbe(t *testing.T) {
 	echo := startEchoServer(t)
 	relay := startRelayWithUpstream(t, echo)
 
@@ -151,15 +151,12 @@ func TestRelayServesFallbackForNonVPNProbe(t *testing.T) {
 		}
 	}
 
-	// Fallback now serves a full cooking blog instead of a simple 400 decoy.
-	if !bytes.Contains(resp, []byte("HTTP/1.1 200")) {
-		t.Fatalf("expected fallback 200 response, got: %q", resp)
+	// The cover website should serve Pork Kitchen content (not a raw 400).
+	if !bytes.Contains(resp, []byte("Pork Kitchen")) {
+		t.Fatalf("expected cover website 'Pork Kitchen' in response, got: %q", resp)
 	}
 	if !bytes.Contains(resp, []byte("nginx/1.24.0")) {
-		t.Fatalf("expected nginx Server header, got: %q", resp)
-	}
-	if !bytes.Contains(resp, []byte("Домашняя кухня")) {
-		t.Fatalf("expected cooking blog content, got: %q", resp)
+		t.Fatalf("expected nginx Server header in cover response, got: %q", resp)
 	}
 }
 

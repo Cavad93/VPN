@@ -1,20 +1,23 @@
 // Package main — decoy.go implements active-probe protection for the VPN server.
 //
-// When an external scanner or DPI probe connects to the VPN port, this module
-// intercepts the connection BEFORE the ObfsConn handshake and decides how to
-// handle it based on the first byte of data.
+// When an external scanner or DPI probe connects to the VPN port, it sends
+// data that does NOT start with a TLS Handshake record (0x16). This module
+// intercepts such connections BEFORE the ObfsConn handshake and routes them
+// to the cover website (a realistic cooking blog served from cover.go).
 //
 // Decision tree (based on first byte only, zero overhead for real clients):
 //
 //	first byte == 0x16  →  VPN path (TLS ClientHello, ObfsConn takes over)
-//	first byte == other →  serveFallback: HTTP → cooking blog; non-HTTP → nginx 400
+//	first byte == other →  cover website (full HTTP handler) + close
+//	no data (timeout)   →  close silently
 //
-// Anti-probing strategy (per gfw.report, Trojan protocol, and XRAY research):
-//  1. HTTP probes receive a full, convincing cooking blog website — the server
-//     looks like a normal web server to any scanner that visits it.
-//  2. Non-HTTP binary probes get a standard nginx 400 response — consistent
-//     with nginx receiving plain HTTP on an HTTPS port.
-//  3. TLS probes that fail ObfsConn handshake are silently drained (DEBUG log).
+// Anti-probing design (based on Trojan-GFW approach):
+//   - Non-TLS connections get a full cover website with multiple pages,
+//     internal links, and realistic content — not just a 400 error.
+//   - All handshake failures (ObfsConn, Noise) are logged at DEBUG level
+//     to avoid exposing VPN presence in logs during mass scanning.
+//   - The cover site uses standard http.Handler, making it indistinguishable
+//     from a real nginx-backed website to automated scanners.
 //
 // peekConn prepends the already-consumed first byte back into the read stream
 // so the rest of the handshake pipeline (BufConn → ObfsConn → Noise) never
@@ -94,7 +97,7 @@ func (p *peekConn) Read(b []byte) (int, error) {
 //     the normal VPN pipeline. The returned conn transparently replays the
 //     peeked byte so the pipeline never sees a truncated stream.
 //   - (nil, false)             — the byte was something else; peekAndRoute has
-//     already written the HTTP decoy response and closed the connection.
+//     already served the cover website and closed the connection.
 //     Caller must not touch conn.
 func peekAndRoute(conn net.Conn) (net.Conn, bool) {
 	// Give the client a short window to send its first byte.
@@ -103,6 +106,8 @@ func peekAndRoute(conn net.Conn) (net.Conn, bool) {
 	var first [1]byte
 	if _, err := conn.Read(first[:]); err != nil {
 		// No data arrived (timeout, reset, etc.) — close silently.
+		// No logging: SYN-only probes are routine noise and MUST NOT appear
+		// in logs to avoid fingerprinting the server as a VPN.
 		conn.Close()
 		return nil, false
 	}
@@ -115,8 +120,11 @@ func peekAndRoute(conn net.Conn) (net.Conn, bool) {
 		return &peekConn{Conn: conn, peeked: first[0]}, true
 	}
 
-	// Not a VPN client. Serve fallback website (cooking blog for HTTP,
-	// nginx 400 for non-HTTP binary probes). serveFallback closes conn.
-	serveFallback(&peekConn{Conn: conn, peeked: first[0]})
+	// Not a VPN client. Serve the full cover website (cooking blog).
+	// This makes the server indistinguishable from a real HTTP website
+	// to DPI scanners and active probes. The cover site has multiple
+	// pages (/recipe1, /recipe2, /contacts, /about) with internal links,
+	// increasing scanner confidence that this is a legitimate web server.
+	serveCoverSiteFromPeeked(conn, first[0])
 	return nil, false
 }

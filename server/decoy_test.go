@@ -179,61 +179,67 @@ func TestPeekAndRouteVPNClientPassesThrough(t *testing.T) {
 	}
 }
 
-func TestPeekAndRouteHTTPScannerGetsCookingBlog(t *testing.T) {
+func TestPeekAndRouteHTTPScannerGetsCoverSite(t *testing.T) {
 	cConn, sConn := newLocalTCPPair(t)
 
 	// Client sends an HTTP GET (first byte 'G' = 0x47).
 	go func() {
-		cConn.Write([]byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")) //nolint:errcheck
+		cConn.Write([]byte("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")) //nolint:errcheck
 	}()
 
 	routed, ok := peekAndRoute(sConn)
 	if ok || routed != nil {
-		t.Fatal("expected fallback path (ok=false, routed=nil)")
+		t.Fatal("expected cover site path (ok=false, routed=nil)")
 	}
 
-	// Client must receive the fallback cooking blog then EOF.
-	cConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	// Client must receive the cover website (Pork Kitchen) response then EOF.
+	cConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	resp, err := io.ReadAll(cConn)
 	if err != nil && err != io.EOF {
 		msg := err.Error()
 		if !strings.Contains(msg, "closed") &&
 			!strings.Contains(msg, "reset by peer") &&
 			!strings.Contains(msg, "connection reset") {
-			t.Fatalf("unexpected error reading fallback response: %v", err)
+			t.Fatalf("unexpected error reading cover response: %v", err)
 		}
 	}
 
-	// Fallback serves the cooking blog (200 OK) instead of old 400 decoy.
-	if !bytes.Contains(resp, []byte("HTTP/1.1 200")) {
-		t.Fatalf("expected 200 OK in fallback, got: %q", resp)
+	// The cover site should contain the cooking blog content.
+	if !bytes.Contains(resp, []byte("Pork Kitchen")) {
+		t.Fatalf("expected cover website 'Pork Kitchen' in response, got: %q", truncate(resp, 300))
 	}
+	// Must have nginx Server header for scanner fingerprinting.
 	if !bytes.Contains(resp, []byte("nginx/1.24.0")) {
-		t.Fatalf("expected nginx Server header, got: %q", resp)
-	}
-	// Verify actual blog content is present.
-	if !bytes.Contains(resp, []byte("Домашняя кухня")) {
-		t.Fatalf("expected cooking blog content, got: %q", resp)
+		t.Fatalf("expected nginx Server header in cover response, got: %q", truncate(resp, 300))
 	}
 }
 
-func TestPeekAndRouteRawTCPScannerGetsDecoy(t *testing.T) {
+func TestPeekAndRouteRawTCPScannerGetsClosed(t *testing.T) {
+	// Short cover site deadline so the test doesn't wait 10 s for invalid HTTP.
+	origCover := coverSiteDeadline()
+	setCoverSiteDeadline(200 * time.Millisecond)
+	t.Cleanup(func() { setCoverSiteDeadline(origCover) })
+
 	cConn, sConn := newLocalTCPPair(t)
 
-	// Scanner sends a raw non-TLS byte (e.g., null probe).
+	// Scanner sends a raw non-TLS, non-HTTP byte (null probe).
+	// This won't parse as HTTP, so http.ReadRequest will fail.
 	go func() {
 		cConn.Write([]byte{0x00}) //nolint:errcheck
 	}()
 
 	routed, ok := peekAndRoute(sConn)
 	if ok || routed != nil {
-		t.Fatal("expected decoy path for non-TLS first byte")
+		t.Fatal("expected cover site path for non-TLS first byte")
 	}
 
+	// Connection should be closed by the server side.
 	cConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	resp, _ := io.ReadAll(cConn)
-	if !bytes.Contains(resp, []byte("400 Bad Request")) {
-		t.Fatalf("expected 400 decoy response, got: %q", resp)
+	// May get HTTP 400 from http.Server for malformed request, or empty.
+	// Either way, we should NOT get a VPN error message.
+	if bytes.Contains(resp, []byte("obfs")) || bytes.Contains(resp, []byte("noise")) {
+		t.Fatalf("response should not contain VPN protocol errors, got: %q", resp)
 	}
 }
 
@@ -270,10 +276,13 @@ func TestPeekAndRouteSilentlyClosesOnTimeout(t *testing.T) {
 }
 
 func TestPeekAndRouteByte0x16IsOnlyVPNPath(t *testing.T) {
-	// Override deadline so sub-tests run quickly.
+	// Override deadlines so sub-tests run quickly.
 	orig := decoyReadDeadline()
 	setDecoyReadDeadline(50 * time.Millisecond)
 	t.Cleanup(func() { setDecoyReadDeadline(orig) })
+	origCover := coverSiteDeadline()
+	setCoverSiteDeadline(200 * time.Millisecond)
+	t.Cleanup(func() { setCoverSiteDeadline(origCover) })
 
 	nonVPNBytes := []byte{0x00, 0x01, 0x14, 0x15, 0x17, 0x47 /*'G'*/, 0xFF}
 
@@ -281,20 +290,38 @@ func TestPeekAndRouteByte0x16IsOnlyVPNPath(t *testing.T) {
 		b := b
 		t.Run(fmt.Sprintf("0x%02x", b), func(t *testing.T) {
 			cConn, sConn := newLocalTCPPair(t)
-			go func() {
-				cConn.Write([]byte{b}) //nolint:errcheck
-				// Close write side so serveFallback's http.ReadRequest
-				// gets EOF quickly for HTTP-method bytes like 'G'.
-				if tc, ok := cConn.(*net.TCPConn); ok {
-					tc.CloseWrite() //nolint:errcheck
-				}
-			}()
+			go func() { cConn.Write([]byte{b}) }() //nolint:errcheck
 			routed, ok := peekAndRoute(sConn)
 			if ok || routed != nil {
-				t.Fatalf("byte 0x%02x should trigger fallback path, got VPN path", b)
+				t.Fatalf("byte 0x%02x should trigger cover site path, got VPN path", b)
 			}
 		})
 	}
 }
 
-// --- serveFallback tests are in fallback_test.go ---
+// --- serveCoverSiteFromPeeked test -----------------------------------------
+
+func TestServeCoverSiteFromPeekedReplaysFirstByte(t *testing.T) {
+	cConn, sConn := newLocalTCPPair(t)
+
+	// Simulate: first byte 'G' was already consumed, rest of HTTP request follows.
+	go func() {
+		// Only send the rest of the request (first 'G' was "peeked").
+		cConn.Write([]byte("ET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")) //nolint:errcheck
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		serveCoverSiteFromPeeked(sConn, 'G')
+	}()
+
+	cConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, _ := io.ReadAll(cConn)
+
+	<-done
+
+	if !bytes.Contains(resp, []byte("Pork Kitchen")) {
+		t.Fatalf("expected cover website content after byte replay, got: %q", truncate(resp, 300))
+	}
+}

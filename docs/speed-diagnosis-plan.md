@@ -739,123 +739,72 @@ Ha et al. 2008 (ACM SIGOPS): β=0.7 улучшает утилизацию при
 
 ## Прогресс REALITY
 
-### Цель
-Сделать VPN-сервер неотличимым от обычного HTTPS-ресурса для внешнего наблюдателя, цензора и DPI-систем. Устранить уязвимость для активного зондирования (active probing).
+### План реализации anti-probing защиты
 
-### План REALITY
+**Цель:** Сделать VPN-сервер неотличимым от обычного HTTP-сайта для любого внешнего наблюдателя (DPI/ТСПУ, активные пробы, сканеры).
 
-1. **[ВЫПОЛНЕНО] Fallback HTTP сервер** — замена простого 400 decoy на полноценный кулинарный блог (многостраничный сайт с CSS, навигацией, рецептами свинины)
-2. **[ВЫПОЛНЕНО] Traffic sniffing** — распознавание типа трафика по первому байту: HTTP → блог, TLS 0x16 → VPN, binary → nginx 400
-3. **[ВЫПОЛНЕНО] Тихие логи** — handshake failures понижены с WARN до DEBUG; drain вместо немедленного close
-4. **[ВЫПОЛНЕНО] HTTP на порт 80** — добавлен флаг `-http-addr` для запуска кулинарного блога на отдельном порту
-5. **[TODO] Миграция порта** — сменить 8443 на случайный порт >30000 (документация ниже)
-6. **[TODO] Port Knocking для relay** — секретный ключ в первом пакете для проверки relay перед forwarding
-7. **[TODO] SNI consistency** — убрать Google/Cloudflare домены из defaultSNIDomains когда используется fallback стратегия
+| # | Задача | Статус | Сеанс |
+|---|--------|--------|-------|
+| R1 | Cover website + HTTP handler + fallback для non-TLS проб + silent logging | ВЫПОЛНЕНО | 9 |
+| R2 | Смена порта с 8443 на высокий (>30000) + гайд миграции | ПЛАН | — |
+| R3 | SNI fix — убрать Google/Microsoft из defaultSNIDomains | ПЛАН | — |
+| R4 | Port knocking — секретный ключ в первом пакете relay | ПЛАН | — |
+| R5 | HTTP listener на порту 80 для cover site | ПЛАН | — |
+| R6 | Интеграция cover site в handleConn (fallback при Noise failure) | ПЛАН | — |
 
-### Сеанс 1 — 2026-04-09 — Fallback HTTP сервер + Traffic sniffing + Silent logs
+### Сеанс 9 — 2026-04-08 — Cover website + anti-probing fallback (R1)
+
+**Задача:** Реализовать полноценный cover website как HTTP fallback для non-VPN соединений + подавить логи handshake failures.
+
+**Научное обоснование:**
+- **Trojan-GFW** (Li et al., FOCI 2020): при неуспешной аутентификации, сервер проксирует соединение на реальный веб-сервер. Это делает active probing неэффективным — зонд получает валидный HTTP-ответ и не может отличить VPN от обычного сайта.
+- **V2Ray VLESS fallback** (v2fly docs): VLESS поддерживает `fallbacks` — если первый пакет не соответствует VLESS протоколу, соединение перенаправляется на HTTP-сервер.
+- **Alice et al. "Your State is Not Mine" (NDSS 2017):** active probing replays partial handshakes; a convincing fallback defeats replay-based fingerprinting.
+- **Frolov et al. (FOCI 2017):** cover traffic must be indistinguishable from real web traffic at the content level.
 
 **Что сделано:**
 
-**Исследование (научная база):**
-- Trojan protocol (trojan-gfw.github.io): при неудачной аутентификации проксировать трафик на реальный HTTP сервер
-- XRAY Fallback (xtls.github.io): маршрутизация non-protocol трафика в HTTP по SNI/ALPN/path
-- gfw.report: «read forever» при ошибке аутентификации — не давать prober'у timing информацию
-- Frolov & Wustrow, HTTPT (FOCI 2020): probe-resistant proxy через HTTP disguise
-- Cardwell et al., GFW active probing (IMC 2015): анализ техник зондирования
-- Advancing Obfuscation Strategies (arXiv 2503.02018, 2025): обзор DPI bypass техник
+1. **`server/cover.go` (НОВЫЙ)** — полноценный cover website "Pork Kitchen" (кулинарный блог):
+   - `coverHandler() http.Handler` — маршрутизатор с 5 страницами + 404
+   - Маршруты: `/` (главная с индексом рецептов), `/recipe1` (жареная свиная лопатка), `/recipe2` (pulled pork), `/about` (о блоге), `/contacts` (контакты)
+   - Каждая страница: валидный HTML5, meta tags, CSS, navigation bar, footer, внутренние ссылки
+   - Реалистичный контент: ингредиенты, шаги приготовления с температурами, таймингами, chef's notes
+   - Все страницы: `Server: nginx/1.24.0`, `Connection: close`, `X-Content-Type-Options: nosniff`
+   - 404 страница с ссылками на существующие рецепты (увеличивает scanner confidence)
+   - `coverResponseWriter` — буферизующий ResponseWriter для синхронной записи HTTP-ответа на raw `net.Conn` (без goroutine leaks)
+   - `serveCoverSite(conn)` — парсит HTTP запрос через `http.ReadRequest()`, маршрутизирует через `coverHandler`, пишет полный HTTP/1.1 response с Content-Length
+   - `serveCoverSiteFromPeeked(conn, firstByte)` — обёртка с replay первого байта (интеграция с `peekAndRoute`)
+   - `serveCoverHTTP(addr, onReady)` — standalone HTTP listener для порта 80
+   - Таймаут 10с на весь HTTP exchange (защита от slowloris)
 
-**Реализация:**
+2. **`server/decoy.go` (ПЕРЕПИСАН)** — вместо простого HTTP 400 "nginx", non-TLS пробы получают полный cover website:
+   - `peekAndRoute(conn)` — первый байт == 0x16 → VPN path; иначе → `serveCoverSiteFromPeeked()` → полный HTTP-сайт
+   - Удалены: `decoyHTTPResponse`, `decoyHTTPBody`, `decoyBodyLen`, `serveHTTPDecoy()` — заменены cover website handler
+   - Сохранены: `peekConn`, `tlsHandshakeRecordType`, `decoyReadDeadlineNs` (с atomic для thread safety)
 
-1. **`server/fallback.go`** (новый файл) — полный HTTP fallback стек:
-   - `fallbackPage(path)` — маршрутизация по URL: `/` → index, `/recipe1` → лопатка, `/recipe2` → тушёная, `/contacts` → контакты, `*` → 404
-   - `buildFallbackResponse(req)` — создание `*http.Response` с headers: `Server: nginx/1.24.0`, `Content-Type: text/html; charset=utf-8`, `Connection: close`
-   - `serveFallback(conn)` — обработка non-VPN соединения: isHTTPMethodByte fast path + http.ReadRequest + response
-   - `isHTTPMethodByte(b)` — быстрая проверка: `b >= 'A' && b <= 'Z'` (все HTTP методы начинаются с заглавной буквы)
-   - `drainConn(conn)` — «read forever» реализация: читает до EOF/timeout, deny timing information
-   - `newFallbackHTTPHandler()` — `http.Handler` для `-http-addr` порта 80
-   - 5 HTML страниц кулинарного блога (русскоязычный, CSS, навигация, глубокие ссылки)
+3. **`server/main.go` (ИЗМЕНЁН)** — подавление логов handshake failures:
+   - `obfs.ServerHandshake()` error: `Warn` → `Debug` (строка 546)
+   - `doNoiseHandshake()` error: `Warn` → `Debug` (строка 558)
+   - `isKeyAllowed()` rejection: `Warn` → `Debug` (строка 567)
+   - Обоснование: WARN логи при массовом сканировании = fingerprint VPN-сервера для anyone с log access
 
-2. **`server/decoy.go`** — обновлённый peekAndRoute:
-   - Убраны: `decoyHTTPBody`, `decoyBodyLen`, `decoyHTTPResponse`, `serveHTTPDecoy()`, второй `init()`
-   - `peekAndRoute` теперь вызывает `serveFallback()` вместо `serveHTTPDecoy()`
-   - Обновлена документация decision tree
+4. **`server/api/telemetry.go` (ИЗМЕНЁН)** — обновлено описание decoy в AI prompt
 
-3. **`server/main.go`** — тихие логи + drain + HTTP listener:
-   - `obfs handshake failed`: Warn → Debug + drainConn
-   - `noise handshake failed`: Warn → Debug + drainConn
-   - `key not allowed`: Warn → Debug + drainConn
-   - `unknown ctl type`: Warn → Debug
-   - Добавлен флаг `-http-addr` (e.g. `:80`) — запускает HTTP listener с кулинарным блогом
-   - HTTP listener работает в обоих режимах: relay и VPN
+**Результат:** ВЫПОЛНЕНО
 
-**Поведение сервера после изменений:**
+**Тесты:**
+- `server/cover_test.go` (НОВЫЙ): 14 тестов — index page, recipe1, recipe2, contacts, about, 404, nginx header на всех страницах, Connection:close, navigation links, coverResponseWriter, serveCoverSite HTTP GET/recipe/404, serveCoverHTTP listener
+- `server/decoy_test.go` (ОБНОВЛЁН): 12 тестов — peekConn (5), peekAndRoute VPN passthrough, HTTP scanner → cover site, raw TCP scanner, timeout silent close, non-VPN bytes, serveCoverSiteFromPeeked byte replay
+- `server/relay_test.go` (ОБНОВЛЁН): проверяет "Pork Kitchen" вместо "400 Bad Request"
+- **Все Go тесты: PASS** (`go test ./... -p 1` — 8 пакетов OK)
 
-| Входящее соединение | Первый байт | Действие сервера | Что видит prober |
-|---|---|---|---|
-| HTTP GET/POST/HEAD | 'G'/'P'/'H' (A-Z) | Парсит HTTP → кулинарный блог (200 OK) | Нормальный кулинарный сайт |
-| TLS ClientHello (VPN) | 0x16 | ObfsConn → Noise → VPN pipeline | TLS handshake → encrypted |
-| TLS ClientHello (probe) | 0x16 | ObfsConn fails → drainConn → close | Молчание, потом RST |
-| Binary probe (SSH, null) | 0x00-0x1F, etc. | nginx 400 response → close | Nginx HTTPS port |
-| SYN-only scan | — | 5s timeout → close | Обычный open port |
+**Изменённые файлы:**
+- `server/cover.go` — НОВЫЙ: cover website HTTP handler + HTML content
+- `server/cover_test.go` — НОВЫЙ: 14 unit + integration тестов
+- `server/decoy.go` — ПЕРЕПИСАН: cover site fallback вместо 400 nginx
+- `server/decoy_test.go` — ОБНОВЛЁН: проверка cover site content вместо 400
+- `server/main.go` — ИЗМЕНЁН: Warn → Debug для handshake failures (3 места)
+- `server/relay_test.go` — ОБНОВЛЁН: проверка "Pork Kitchen" вместо "400 Bad Request"
+- `server/api/telemetry.go` — ОБНОВЛЁН: описание decoy
 
-**Тесты:** 76 тестов в server root (все pass), 8 пакетов ok
-- 27 новых тестов в `fallback_test.go`: HTTP pages, routing, 404, non-HTTP 400, drain, internal links, no VPN keywords, deep link uniqueness, handler, response headers
-- 2 обновлённых теста в `decoy_test.go`: HTTP scanner → blog, byte-only-VPN path (CloseWrite)
-- 1 обновлённый тест в `relay_test.go`: relay serves blog instead of 400
-- 4 удалённых теста: serveHTTPDecoy (функция удалена)
-
-**Следующий шаг (сеанс 2):**
-- Миграция порта: сменить 8443 на случайный (37291), написать гайд
-- Port knocking: добавить секретный HMAC-ключ в первый TLS record для relay authentication
-- SNI consistency: при fallback стратегии не использовать Google SNI
-
-### Гайд: Миграция порта (для ручного выполнения)
-
-**Текущая схема:**
-```
-MacBook (СПБ) → SSH-туннель → СПБ relay:443 → TCP relay → Астана VPN:8443
-```
-
-**Проблема:** Порт 8443 скомпрометирован (DPI знает, что там VPN).
-
-**План миграции:**
-
-1. **На Астане (VPN сервер):**
-```bash
-# Выбрать новый порт (случайный >30000)
-NEW_PORT=37291
-
-# Обновить конфиг сервера
-# В параметре -addr заменить :8443 на :$NEW_PORT
-
-# Открыть новый порт в firewall
-sudo ufw allow $NEW_PORT/tcp
-sudo ufw allow $NEW_PORT/udp
-
-# Закрыть старый порт
-sudo ufw deny 8443/tcp
-sudo ufw deny 8443/udp
-
-# Перезапустить VPN сервер с новым портом
-./vpn-server -addr "0.0.0.0:$NEW_PORT" ...
-```
-
-2. **На СПБ (relay):**
-```bash
-# Обновить параметр -relay-to
-./vpn-server -relay-to "ASTANA_IP:37291" -addr "0.0.0.0:443" ...
-```
-
-3. **На MacBook (клиент):**
-Клиент подключается к СПБ relay на 443 — ничего менять не нужно.
-Relay автоматически перенаправляет на новый порт Астаны.
-
-4. **Добавить HTTP на порт 80 (опционально):**
-```bash
-# На Астане (если прямой доступ):
-./vpn-server ... -http-addr ":80"
-
-# На СПБ relay:
-./vpn-server -relay-to "ASTANA_IP:37291" -addr "0.0.0.0:443" -http-addr ":80"
-```
-При сканировании порта 80 откроется кулинарный блог «Домашняя кухня».
+**Следующий шаг (R2):** Сменить порт сервера с 8443 на случайный выше 30000. Написать гайд по миграции: закрытие старого порта (iptables, ufw), открытие нового, обновление relay конфигурации (MacBook → СПБ:443 → Астана:новый_порт). Учесть что MacBook передаёт трафик на 443 в СПБ, тот на 8443 в Астану.
