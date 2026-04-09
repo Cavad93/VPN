@@ -748,7 +748,7 @@ Ha et al. 2008 (ACM SIGOPS): β=0.7 улучшает утилизацию при
 | R1 | Cover website + HTTP handler + fallback для non-TLS проб + silent logging | ВЫПОЛНЕНО | 9 |
 | R2 | Смена порта с 8443 на высокий (>30000) + гайд миграции | ВЫПОЛНЕНО | 10 |
 | R3 | SNI fix — убрать Google/Microsoft из defaultSNIDomains | ВЫПОЛНЕНО | 10 |
-| R4 | Port knocking — секретный ключ в первом пакете relay | ПЛАН | — |
+| R4 | Port knocking — секретный ключ в первом пакете relay (Reality-style HMAC) | ВЫПОЛНЕНО | 11 |
 | R5 | HTTP listener на порту 80 для cover site | ПЛАН | — |
 | R6 | Интеграция cover site в handleConn (fallback при Noise failure) | ПЛАН | — |
 
@@ -997,3 +997,144 @@ curl -s http://СПБ_IP            # должен вернуть "Pork Kitchen"
 2. **MacBook клиент НЕ МЕНЯТЬ** — он подключается к relay (СПБ:443), не напрямую к Астане
 3. **Ограничить доступ к 38947** — через iptables разрешить только IP СПБ сервера (см. выше)
 4. **SNI обновлён** — теперь используются CDN-домены (jsdelivr, cloudflare CDN) вместо Google/Microsoft; мismatch SNI↔cover site стал нормальным (CDN обслуживает любой контент)
+
+### Сеанс 11 — 2026-04-09 — Port Knocking: Reality-style HMAC в session_id (R4)
+
+**Задача:** Реализовать port knocking на relay — relay в СПб не должен устанавливать соединение с Астаной, если в первом пакете клиента нет валидного секретного ключа. Основано на подходе Xray Reality.
+
+**Научное обоснование:**
+
+- **Xray Reality (v2fly/Xray-core):** Использует поле `session_id` в TLS 1.3 ClientHello для аутентификации. session_id = HMAC-SHA256(PSK, random), где random — 32-байтное поле Random из того же ClientHello. Relay парсит первые 76 байт TCP потока, извлекает random и session_id, вычисляет HMAC и сравнивает. Не совпало → cover site / close.
+- **Frolov & Wustrow (NDSS 2019) "The use of TLS in Censorship Circumvention":** session_id в TLS 1.3 — legacy compatibility field, заполняемый случайными байтами во всех major browser implementations. Ни одна известная DPI-система не проверяет энтропию session_id. Выход HMAC-SHA256 computationally indistinguishable от uniform random.
+- **RFC 8446 §4.1.2:** legacy_session_id — opaque random bytes for middlebox compatibility. 32-байтный session_id — стандартное значение для Chrome/Firefox/Safari.
+- **TrojanProbe (ScienceDirect 2024):** Active probing fingerprints серверы по поведению: если relay ВСЕГДА соединяется с backend при TLS ClientHello — это detectable. Port knocking устраняет этот вектор: без PSK relay не трогает backend.
+
+**Алгоритм:**
+
+```
+Client:
+  random = crypto/rand(32)
+  session_id = HMAC-SHA256(PSK, random)
+  → embed both in ClientHello
+
+Relay:
+  read 76 bytes (TLS record header + handshake header + random + session_id)
+  verify: session_id == HMAC-SHA256(PSK, random)
+  YES → prefixConn (replay 76 bytes) → forward to Astana
+  NO + first byte == 0x16 → close silently (DPI probe)
+  NO + first byte != 0x16 → serve cover website (HTTP scanner)
+```
+
+**Byte offsets (from TCP stream start):**
+- `[0]` TLS content_type = 0x16
+- `[5]` handshake msg_type = 0x01
+- `[11-42]` Random (32 bytes)
+- `[43]` session_id_length = 0x20
+- `[44-75]` session_id (32 bytes) = knock tag
+- Minimum: **76 bytes** to verify
+
+**Что сделано:**
+
+1. **`server/transport/knock.go` (НОВЫЙ)** — HMAC-SHA256 port knocking:
+   - `KnockPSK` — тип 32-байтного pre-shared key
+   - `KnockMinBytes = 76` — минимум байт для верификации
+   - `ComputeKnockTag(psk, random) [32]byte` — HMAC-SHA256(psk, random)
+   - `VerifyKnock(psk, data) bool` — парсит raw TCP stream, извлекает random[11:43] и session_id[44:76], проверяет HMAC
+   - Structural validation: content_type=0x16, msg_type=0x01, session_id_len=0x20
+
+2. **`server/transport/obfs.go` (ИЗМЕНЁН)** — knock embedding в ClientHello:
+   - Новое поле `knockKey *KnockPSK` в `ObfsConn`
+   - `WithKnock(key KnockPSK) *ObfsConn` — builder method (chaining)
+   - `buildClientHelloCore(sni *string, knockKey *KnockPSK) []byte` — unified builder; если knockKey != nil → session_id = HMAC(knockKey, random); иначе → random
+   - `buildClientHello()` и `buildClientHelloWithSNI(sni)` — делегируют в `buildClientHelloCore`
+   - `ClientHandshake()` — передаёт knockKey в builder
+
+3. **`server/transport/sni.go` (ИЗМЕНЁН)** — `buildClientHelloWithSNI` упрощён до вызова `buildClientHelloCore`
+
+4. **`server/decoy.go` (ИЗМЕНЁН)** — knock verification на уровне relay:
+   - `prefixConn` — generic multi-byte prefix replay (заменяет single-byte `peekConn` для knock path)
+   - `peekAndRouteKnock(conn, knockKey)` — новая функция:
+     - knockKey == nil → делегирует peekAndRoute (backward compatible)
+     - knockKey != nil → читает 76 байт, VerifyKnock:
+       - Valid → prefixConn (replay all 76 bytes) → forward
+       - Invalid + TLS → close silently (DPI probe — zero information leakage)
+       - Invalid + non-TLS → serveCoverSiteFromPrefix (HTTP scanner gets cooking blog)
+   - `serveCoverSiteFromPrefix(conn, prefix)` — replay multi-byte prefix before serving cover site
+
+5. **`server/relay.go` (ИЗМЕНЁН)** — передача knock key:
+   - `runRelay(ctx, addr, target, knockKey, logger)` — новый параметр knockKey
+   - `relayOne(client, target, knockKey, logger)` — вызывает `peekAndRouteKnock` вместо `peekAndRoute`
+
+6. **`server/main.go` (ИЗМЕНЁН)** — CLI flag:
+   - Новый flag: `-knock-key` (64 hex chars = 32 bytes)
+   - Парсинг и валидация в relay mode section
+   - Логирование: `"port knocking enabled (Reality-style session_id HMAC)"`
+
+7. **`server/cmd/vpnclient/main.go` (ИЗМЕНЁН)** — Go клиент:
+   - Новый flag: `-knock-key` (64 hex chars)
+   - `vpnSession.knockKey *transport.KnockPSK`
+   - TCP connect, UDP connect, secondary connect — все применяют `obfs.WithKnock()` если knockKey != nil
+
+8. **`client/core.py` (ИЗМЕНЁН)** — Python клиент:
+   - `_compute_knock_tag(psk, random) -> bytes` — HMAC-SHA256
+   - `_build_client_hello(knock_key=None)` — если knock_key задан, session_id = HMAC(knock_key, random)
+   - `ObfsConn.__init__(sock, knock_key=None)` — хранит knock_key
+   - `ObfsConn.client_handshake()` — передаёт knock_key в builder
+   - `VPNConfig.knock_key: Optional[bytes]` — конфигурация
+   - Все точки создания ObfsConn (connect, bond connect) передают knock_key
+
+**Результат:** ВЫПОЛНЕНО
+
+**Тесты:**
+
+- `server/transport/knock_test.go` (НОВЫЙ): 14 тестов — ComputeKnockTag (deterministic, different PSK, different random), VerifyKnock (valid, invalid PSK, random session_id, too short, not TLS, not ClientHello, wrong SID length), BuildClientHelloWithKnock, BuildClientHelloWithKnockAndSNI, BuildClientHelloWithoutKnock, benchmarks
+- `server/decoy_test.go` (ОБНОВЛЁН): +9 новых тестов — prefixConn (replay multiple bytes, small reads), peekAndRouteKnock (nil key delegates, valid knock, invalid knock closes silently, HTTP gets cover site, timeout silent close)
+- `server/relay_test.go` (ОБНОВЛЁН): вызов runRelay обновлён для нового параметра knockKey
+- **Все Go тесты: 8 пакетов ALL PASS** (`go test ./... -count=1 -p 1`)
+- Python syntax check: PASS (тесты core.py не запускаются из-за системной несовместимости cryptography backend — pre-existing issue, не связано с knock)
+
+**Изменённые файлы:**
+- `server/transport/knock.go` — НОВЫЙ: HMAC knock tag computation + verification
+- `server/transport/knock_test.go` — НОВЫЙ: 14 тестов + benchmarks
+- `server/transport/obfs.go` — WithKnock, buildClientHelloCore, unified builder
+- `server/transport/sni.go` — buildClientHelloWithSNI упрощён (делегирует в core)
+- `server/decoy.go` — prefixConn, peekAndRouteKnock, serveCoverSiteFromPrefix
+- `server/decoy_test.go` — 9 новых тестов для knock + prefixConn
+- `server/relay.go` — knockKey parameter в runRelay/relayOne
+- `server/relay_test.go` — обновлён вызов runRelay
+- `server/main.go` — `-knock-key` flag, парсинг в relay mode
+- `server/cmd/vpnclient/main.go` — `-knock-key` flag, vpnSession.knockKey, все ObfsConn paths
+- `client/core.py` — _compute_knock_tag, knock в ObfsConn/VPNConfig
+
+**Использование:**
+
+```bash
+# Генерация knock key (одноразовая операция)
+openssl rand -hex 32
+# Пример: a1b2c3d4e5f6...64 hex chars
+
+# Relay (СПб)
+./cavad-relay -addr 0.0.0.0:443 -relay-to АСТАНА:38947 \
+  -knock-key a1b2c3d4e5f6...
+
+# Go клиент (MacBook)
+sudo ./vpnclient -server СПБ_IP:443 \
+  -knock-key a1b2c3d4e5f6...
+
+# Python клиент
+from core import VPNConfig, VPNClient
+cfg = VPNConfig(
+    server_addr='СПБ_IP:443',
+    knock_key=bytes.fromhex('a1b2c3d4e5f6...')
+)
+```
+
+**Безопасность knock:**
+- HMAC-SHA256 output indistinguishable from random (PRF assumption)
+- session_id в TLS 1.3 — opaque random bytes (RFC 8446), DPI не проверяет
+- Без knock key relay НИКОГДА не подключается к Астане
+- TLS ClientHello без knock → close silently (zero information leakage)
+- HTTP/другие пробы → cover website (Pork Kitchen)
+- Replay: каждый ClientHello содержит уникальный random → уникальный knock tag
+
+**Следующий шаг (R5):** HTTP listener на порту 80 для cover site.

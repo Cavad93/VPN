@@ -142,29 +142,7 @@ func buildSupportedVersionsExtension() []byte {
 // The random and session_id fields are filled with fresh cryptographic randomness
 // so every call produces a unique on-wire record.
 func buildClientHelloWithSNI(sni string) []byte {
-	var random [32]byte
-	var sessionID [32]byte
-	rand.Read(random[:])    //nolint:errcheck — rand.Read never errors on Linux
-	rand.Read(sessionID[:]) //nolint:errcheck
-
-	sniExt := buildSNIExtension(sni)
-	verExt := buildSupportedVersionsExtension()
-	extensions := append(sniExt, verExt...)
-
-	body := make([]byte, 0, 128+len(extensions))
-	body = append(body, 0x03, 0x03)      // legacy_version = TLS 1.2
-	body = append(body, random[:]...)    // random (32 bytes)
-	body = append(body, 0x20)            // legacy_session_id length = 32
-	body = append(body, sessionID[:]...) // legacy_session_id (32 bytes)
-	// cipher_suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256
-	body = append(body, 0x00, 0x06, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03)
-	// compression_methods: length=1, null(0x00)
-	body = append(body, 0x01, 0x00)
-	// extensions
-	body = binary.BigEndian.AppendUint16(body, uint16(len(extensions)))
-	body = append(body, extensions...)
-
-	return wrapHandshakeRecord(tlsHelloClient, body)
+	return buildClientHelloCore(&sni, nil)
 }
 
 // ExtractSNI parses the SNI hostname from the body of a ClientHello handshake

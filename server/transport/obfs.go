@@ -70,6 +70,7 @@ type ObfsConn struct {
 	bufr             *bufio.Reader // buffered reader reduces read syscalls
 	readBufRemaining int           // bytes remaining in the current TLS record not yet returned to caller
 	sniSelector      SNISelector   // optional; if set, ClientHandshake embeds an SNI extension
+	knockKey         *KnockPSK    // optional; if set, session_id = HMAC(knockKey, random) for relay auth
 	// hdr is a reusable 5-byte scratch buffer for TLS record headers.
 	// Avoids one heap allocation per read in the hot data path.
 	hdr [ObfsHeaderSize]byte
@@ -92,17 +93,30 @@ func (c *ObfsConn) WithSNI(selector SNISelector) *ObfsConn {
 	return c
 }
 
+// WithKnock attaches a port-knock PSK to the connection. When set,
+// ClientHandshake computes session_id = HMAC-SHA256(knockKey, random) instead
+// of filling it with random bytes. The relay verifies this tag before
+// forwarding the connection to the backend. Returns c for method chaining:
+//
+//	conn := transport.NewObfsConn(raw).WithKnock(psk)
+func (c *ObfsConn) WithKnock(key KnockPSK) *ObfsConn {
+	c.knockKey = &key
+	return c
+}
+
 // ClientHandshake sends a synthetic ClientHello and reads the ServerHello.
 // If an SNISelector was attached via WithSNI, the ClientHello includes a
 // server_name extension for the domain returned by the selector.
+// If a KnockPSK was attached via WithKnock, the session_id field contains
+// HMAC-SHA256(knockKey, random) for relay port-knock authentication.
 // Must be called exactly once before the first Write/Read on the initiator.
 func (c *ObfsConn) ClientHandshake() error {
-	var hello []byte
+	var sni *string
 	if c.sniSelector != nil {
-		hello = buildClientHelloWithSNI(c.sniSelector.Select())
-	} else {
-		hello = buildClientHello()
+		s := c.sniSelector.Select()
+		sni = &s
 	}
+	hello := buildClientHelloCore(sni, c.knockKey)
 	if _, err := c.conn.Write(hello); err != nil {
 		return err
 	}
@@ -263,13 +277,26 @@ func buildAppDataRecord(payload []byte) []byte {
 // so that every connection produces a unique on-wire byte sequence.
 // Use NewObfsConn(conn).WithSNI(selector) to add an SNI extension.
 func buildClientHello() []byte {
+	return buildClientHelloCore(nil, nil)
+}
+
+// buildClientHelloCore is the unified builder for ClientHello records.
+// If sni is non-nil, SNI and supported_versions extensions are included.
+// If knockKey is non-nil, session_id = HMAC-SHA256(knockKey, random) for
+// relay port-knock authentication (Reality-style, see knock.go).
+func buildClientHelloCore(sni *string, knockKey *KnockPSK) []byte {
 	var random [32]byte
 	var sessionID [32]byte
-	rand.Read(random[:])    //nolint:errcheck — rand.Read never errors on Linux
-	rand.Read(sessionID[:]) //nolint:errcheck
+	rand.Read(random[:]) //nolint:errcheck — rand.Read never errors on Linux
+
+	if knockKey != nil {
+		sessionID = ComputeKnockTag(*knockKey, random)
+	} else {
+		rand.Read(sessionID[:]) //nolint:errcheck
+	}
 
 	// Construct the ClientHello body following RFC 8446 §4.1.2 (simplified).
-	body := make([]byte, 0, 100)
+	body := make([]byte, 0, 128)
 	body = append(body, 0x03, 0x03)      // legacy_version = TLS 1.2
 	body = append(body, random[:]...)    // random (32 bytes)
 	body = append(body, 0x20)            // legacy_session_id length = 32
@@ -278,6 +305,14 @@ func buildClientHello() []byte {
 	//               TLS_CHACHA20_POLY1305_SHA256(0x1303)
 	body = append(body, 0x00, 0x06, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03)
 	body = append(body, 0x01, 0x00) // compression_methods: length=1, null
+
+	if sni != nil {
+		sniExt := buildSNIExtension(*sni)
+		verExt := buildSupportedVersionsExtension()
+		extensions := append(sniExt, verExt...)
+		body = binary.BigEndian.AppendUint16(body, uint16(len(extensions)))
+		body = append(body, extensions...)
+	}
 
 	return wrapHandshakeRecord(tlsHelloClient, body)
 }

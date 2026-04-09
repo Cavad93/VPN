@@ -1540,6 +1540,7 @@ func main() {
 	var vlessAddr, vlessCert, vlessKey, vlessPath string
 	var anthropicKey string
 	var relayTo string
+	var knockKeyHex string
 	var relayMetricsAddr string
 	var diagnosticsFile string
 	var openAccess bool
@@ -1557,6 +1558,7 @@ func main() {
 	flag.StringVar(&vlessPath, "vless-path", "/tunnel", "WebSocket path for VLESS")
 	flag.StringVar(&anthropicKey, "anthropic-key", "", "Anthropic API key for telemetry analysis (or ANTHROPIC_API_KEY env)")
 	flag.StringVar(&relayTo, "relay-to", "", "relay VPN traffic to this upstream address (e.g. 193.124.93.240:38947); disables local VPN termination")
+	flag.StringVar(&knockKeyHex, "knock-key", "", "hex-encoded 32-byte PSK for relay port knocking (Reality-style HMAC in session_id); client must use the same key")
 	flag.StringVar(&relayMetricsAddr, "relay-metrics-addr", ":9092", "relay metrics HTTP server address (per-segment throughput for AI diagnostics; empty to disable)")
 	flag.StringVar(&diagnosticsFile, "diagnostics-file", "", "path to append telemetry reports as JSONL (e.g. /var/log/cavadvpn/diagnostics.jsonl)")
 	flag.Parse()
@@ -1592,6 +1594,21 @@ func main() {
 	if relayTo != "" {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
+
+		// Parse knock key if provided.
+		var knockKey *transport.KnockPSK
+		if knockKeyHex != "" {
+			kb, err := hex.DecodeString(knockKeyHex)
+			if err != nil || len(kb) != 32 {
+				logger.Error("invalid -knock-key: must be 64 hex characters (32 bytes)")
+				os.Exit(1)
+			}
+			var k transport.KnockPSK
+			copy(k[:], kb)
+			knockKey = &k
+			logger.Info("port knocking enabled (Reality-style session_id HMAC)")
+		}
+
 		logger.Info("starting in relay mode", "listen", cfg.ListenAddr, "upstream", relayTo)
 		// Start per-segment metrics server (used by AI diagnostics to identify bottleneck).
 		if relayMetricsAddr != "" {
@@ -1599,7 +1616,7 @@ func main() {
 		}
 		// TCP relay: handles CavadVPN TCP transport + decoy for scanners.
 		go func() {
-			if err := runRelay(ctx, cfg.ListenAddr, relayTo, logger); err != nil {
+			if err := runRelay(ctx, cfg.ListenAddr, relayTo, knockKey, logger); err != nil {
 				logger.Error("TCP relay error", "err", err)
 			}
 		}()

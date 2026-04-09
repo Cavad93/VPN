@@ -359,10 +359,22 @@ class NoiseHandshake:
 # TLS obfuscation layer
 # ---------------------------------------------------------------------------
 
-def _build_client_hello() -> bytes:
-    """Build a synthetic TLS 1.3 ClientHello record."""
+def _compute_knock_tag(psk: bytes, random_bytes: bytes) -> bytes:
+    """Compute HMAC-SHA256(psk, random) for Reality-style port knocking."""
+    return hmac.new(psk, random_bytes, hashlib.sha256).digest()
+
+
+def _build_client_hello(knock_key: Optional[bytes] = None) -> bytes:
+    """Build a synthetic TLS 1.3 ClientHello record.
+
+    If knock_key is provided (32 bytes), session_id is set to
+    HMAC-SHA256(knock_key, random) for relay port-knock authentication.
+    """
     random_bytes = os.urandom(32)
-    session_id = os.urandom(32)
+    if knock_key is not None:
+        session_id = _compute_knock_tag(knock_key, random_bytes)
+    else:
+        session_id = os.urandom(32)
 
     body = (
         bytes([0x03, 0x03])          # legacy_version = TLS 1.2
@@ -430,8 +442,9 @@ class ObfsConn:
     # so most _recv_exactly() calls return instantly from memory with zero syscalls.
     _SOCK_RECV_SIZE = 262144
 
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: socket.socket, knock_key: Optional[bytes] = None) -> None:
         self._sock = sock
+        self._knock_key = knock_key  # 32-byte PSK for relay port knocking, or None
         # Both buffers are bytearray: += is an in-place extend O(chunk), not O(total).
         self._read_buf = bytearray()
         self._sock_buf = bytearray()  # bytearray avoids O(n) copy on each += unlike bytes
@@ -447,7 +460,7 @@ class ObfsConn:
 
     def client_handshake(self) -> None:
         """Send ClientHello, read ServerHello."""
-        self._sock.sendall(_build_client_hello())
+        self._sock.sendall(_build_client_hello(self._knock_key))
         self._read_handshake_record(TLS_HELLO_SERVER)
         logger.debug("obfs_client_handshake_done")
 
@@ -897,6 +910,9 @@ class VPNConfig:
     # The server round-robins download packets across all bonded streams
     # (streamBond in main.go). Recommended: 4-8 for CIS routes; 1 for LAN.
     bond_count: int = 1
+    # knock_key: 32-byte PSK for relay port knocking (Reality-style HMAC in
+    # session_id). Must match the relay's -knock-key. None = no knock.
+    knock_key: Optional[bytes] = None
 
 
 # ---------------------------------------------------------------------------
@@ -963,8 +979,8 @@ class VPNClient:
         else:
             self._sock = self._connect_tcp(host, int(port))
 
-        # 2. TLS obfuscation
-        self._obfs = ObfsConn(self._sock)
+        # 2. TLS obfuscation (with optional port-knock)
+        self._obfs = ObfsConn(self._sock, knock_key=self._config.knock_key)
         self._obfs.client_handshake()
         self._log.debug("obfs_handshake_done")
 
@@ -1339,7 +1355,7 @@ class VPNClient:
         """
         sock = self._connect_tcp(host, port)
 
-        obfs = ObfsConn(sock)
+        obfs = ObfsConn(sock, knock_key=self._config.knock_key)
         obfs.client_handshake()
 
         session = self._do_noise_handshake_on(obfs, kp)

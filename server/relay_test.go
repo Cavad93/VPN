@@ -50,7 +50,7 @@ func startRelayWithUpstream(t *testing.T, upstream string) string {
 	t.Cleanup(cancel)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	go runRelay(ctx, addr, upstream, logger) //nolint:errcheck
+	go runRelay(ctx, addr, upstream, nil, logger) //nolint:errcheck
 
 	// Give the relay goroutine a moment to bind.
 	time.Sleep(20 * time.Millisecond)

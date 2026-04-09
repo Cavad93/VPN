@@ -190,7 +190,8 @@ type vpnSession struct {
 	serverAddr   string
 	kp           *crypto.KeyPair
 	serverKeyHex string
-	origGW       string // original default gateway, computed once
+	knockKey     *transport.KnockPSK // optional port-knock PSK for relay auth
+	origGW       string              // original default gateway, computed once
 	tun          *tunDevice
 	transport    string // "tcp" or "udp"
 }
@@ -237,8 +238,11 @@ func (vs *vpnSession) connect() (
 	bufConn := transport.NewBufConn(rawConn)
 	cleanupConn := func() { bufConn.Close() }
 
-	// 2. TLS obfuscation handshake.
+	// 2. TLS obfuscation handshake (with optional port-knock).
 	obfs := transport.NewObfsConn(bufConn)
+	if vs.knockKey != nil {
+		obfs.WithKnock(*vs.knockKey)
+	}
 	if err := obfs.ClientHandshake(); err != nil {
 		cleanupConn()
 		return nil, nil, "", "", nil, fmt.Errorf("obfs handshake: %w", err)
@@ -360,9 +364,12 @@ func (vs *vpnSession) connectUDP() (
 	// Seed BBR with 15 Mbps @ estimated 65ms RTT — skip slow Startup phase.
 	udpConn.SetInitialBandwidth(15_000_000/8, 65*time.Millisecond)
 
-	// 2. TLS obfuscation handshake over UDP.
+	// 2. TLS obfuscation handshake over UDP (with optional port-knock).
 	log.Info("starting obfs handshake (UDP)")
 	obfs := transport.NewObfsConn(udpConn)
+	if vs.knockKey != nil {
+		obfs.WithKnock(*vs.knockKey)
+	}
 	if err := obfs.ClientHandshake(); err != nil {
 		cleanupConn()
 		return nil, nil, "", "", nil, fmt.Errorf("obfs handshake: %w", err)
@@ -493,8 +500,11 @@ func (vs *vpnSession) connectSecondary(assignedIP string) (*secondaryConn, error
 	bufConn2 := transport.NewBufConn(rawConn)
 	cleanupConn := func() { bufConn2.Close() }
 
-	// 2. TLS obfuscation.
+	// 2. TLS obfuscation (with optional port-knock).
 	obfs := transport.NewObfsConn(bufConn2)
+	if sc.sess.knockKey != nil {
+		obfs.WithKnock(*sc.sess.knockKey)
+	}
 	if err := obfs.ClientHandshake(); err != nil {
 		cleanupConn()
 		return nil, fmt.Errorf("secondary obfs: %w", err)
@@ -651,6 +661,7 @@ func run() error {
 	serverAddr := flag.String("server", "", "VPN server host:port (required)")
 	keyFile    := flag.String("key", "client_privkey.hex", "path to hex-encoded private key file")
 	serverKeyHex := flag.String("server-key", "", "expected server public key hex (optional, for verification)")
+	knockKeyHex := flag.String("knock-key", "", "hex-encoded 32-byte PSK for relay port knocking (must match relay's -knock-key)")
 	bonds := flag.Int("bonds", numBondConns, "number of parallel TCP connections (more = faster on lossy high-RTT paths)")
 	transportFlag := flag.String("transport", "udp", "transport protocol: tcp or udp (udp uses BBR congestion control)")
 	flag.Parse()
@@ -662,6 +673,19 @@ func run() error {
 	if *serverAddr == "" {
 		flag.Usage()
 		return fmt.Errorf("flag -server is required")
+	}
+
+	// Parse knock key if provided.
+	var knockKey *transport.KnockPSK
+	if *knockKeyHex != "" {
+		kb, err := hex.DecodeString(*knockKeyHex)
+		if err != nil || len(kb) != 32 {
+			return fmt.Errorf("invalid -knock-key: must be 64 hex characters (32 bytes)")
+		}
+		var k transport.KnockPSK
+		copy(k[:], kb)
+		knockKey = &k
+		log.Info("port knocking enabled")
 	}
 
 	// Apply macOS TCP kernel tuning before opening any sockets.
@@ -693,6 +717,7 @@ func run() error {
 		serverAddr:   *serverAddr,
 		kp:           kp,
 		serverKeyHex: *serverKeyHex,
+		knockKey:     knockKey,
 		origGW:       origGW,
 		tun:          tun,
 		transport:    *transportFlag,

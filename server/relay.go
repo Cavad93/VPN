@@ -27,6 +27,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/cavad93/vpn/server/transport"
 )
 
 // relayDialTimeout is how long the relay waits for the upstream connection.
@@ -40,10 +42,13 @@ var relayPipeTimeout = 5 * time.Minute
 
 // runRelay listens on listenAddr for incoming connections, applies
 // peek-and-route (active-probe protection), and transparently forwards
-// VPN connections to relayTarget.
+// VPN connections to relayTarget. If knockKey is non-nil, the relay
+// additionally verifies a Reality-style HMAC tag in the ClientHello's
+// session_id field — connections without a valid knock are served the
+// cover website or closed silently (see peekAndRouteKnock).
 //
 // It never returns while ctx is alive.
-func runRelay(ctx context.Context, listenAddr, relayTarget string, logger *slog.Logger) error {
+func runRelay(ctx context.Context, listenAddr, relayTarget string, knockKey *transport.KnockPSK, logger *slog.Logger) error {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return err
@@ -82,19 +87,19 @@ func runRelay(ctx context.Context, listenAddr, relayTarget string, logger *slog.
 			tc.SetKeepAlive(true)
 			tc.SetKeepAlivePeriod(15 * time.Second)
 		}
-		go relayOne(conn, relayTarget, logger)
+		go relayOne(conn, relayTarget, knockKey, logger)
 	}
 }
 
 // relayOne handles a single incoming connection:
-//  1. Peek the first byte (active-probe protection via peekAndRoute).
+//  1. Peek and verify knock (active-probe protection via peekAndRouteKnock).
 //  2. Dial the upstream server.
 //  3. Pipe bytes in both directions until either side closes.
-func relayOne(client net.Conn, target string, logger *slog.Logger) {
-	// Active-probe protection: non-VPN → decoy response, VPN → proceed.
-	routed, ok := peekAndRoute(client)
+func relayOne(client net.Conn, target string, knockKey *transport.KnockPSK, logger *slog.Logger) {
+	// Active-probe protection: non-VPN / bad knock → decoy response, VPN → proceed.
+	routed, ok := peekAndRouteKnock(client, knockKey)
 	if !ok {
-		return // decoy served and conn closed inside peekAndRoute
+		return // decoy served and conn closed inside peekAndRouteKnock
 	}
 
 	// Connect to upstream (Astana VPN server).

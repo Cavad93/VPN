@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cavad93/vpn/server/transport"
 )
 
 // --- test helpers -----------------------------------------------------------
@@ -323,5 +326,250 @@ func TestServeCoverSiteFromPeekedReplaysFirstByte(t *testing.T) {
 
 	if !bytes.Contains(resp, []byte("Pork Kitchen")) {
 		t.Fatalf("expected cover website content after byte replay, got: %q", truncate(resp, 300))
+	}
+}
+
+// --- prefixConn tests -------------------------------------------------------
+
+func TestPrefixConnReplaysMultipleBytes(t *testing.T) {
+	cConn, sConn := newLocalTCPPair(t)
+
+	prefix := []byte{0x16, 0x03, 0x01, 0x00, 0x4D}
+	pc := &prefixConn{Conn: sConn, prefix: prefix}
+
+	// Client sends additional data after what was "peeked".
+	go func() {
+		cConn.Write([]byte{0x01, 0x02, 0x03}) //nolint:errcheck
+		cConn.Close()
+	}()
+
+	// Read enough to cover prefix + wire data.
+	buf := make([]byte, 8)
+	sConn.SetReadDeadline(time.Now().Add(time.Second))
+	total := 0
+	for total < 8 {
+		n, err := pc.Read(buf[total:])
+		total += n
+		if err != nil {
+			break
+		}
+	}
+
+	if total != 8 {
+		t.Fatalf("expected 8 bytes, got %d", total)
+	}
+	// First 5 bytes should be the prefix.
+	if !bytes.Equal(buf[:5], prefix) {
+		t.Fatalf("prefix mismatch: got %x, want %x", buf[:5], prefix)
+	}
+	// Next 3 bytes should be from the wire.
+	if !bytes.Equal(buf[5:8], []byte{0x01, 0x02, 0x03}) {
+		t.Fatalf("wire data mismatch: got %x", buf[5:8])
+	}
+}
+
+func TestPrefixConnSmallReads(t *testing.T) {
+	_, sConn := pipeConn(t)
+	prefix := []byte{0xAA, 0xBB, 0xCC}
+	pc := &prefixConn{Conn: sConn, prefix: prefix}
+
+	// Read 1 byte at a time from the prefix.
+	for i, expected := range prefix {
+		buf := make([]byte, 1)
+		n, err := pc.Read(buf)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if n != 1 || buf[0] != expected {
+			t.Fatalf("read %d: got 0x%02x, want 0x%02x", i, buf[0], expected)
+		}
+	}
+}
+
+// --- peekAndRouteKnock tests ------------------------------------------------
+
+func TestPeekAndRouteKnockNilKeyDelegatesToPeekAndRoute(t *testing.T) {
+	cConn, sConn := newLocalTCPPair(t)
+
+	// Send TLS first byte.
+	go func() {
+		cConn.Write([]byte{0x16, 0x03, 0x03}) //nolint:errcheck
+	}()
+
+	// nil knockKey → behaves like peekAndRoute.
+	routed, ok := peekAndRouteKnock(sConn, nil)
+	if !ok {
+		t.Fatal("expected VPN path with nil knock key")
+	}
+	if routed == nil {
+		t.Fatal("expected non-nil routed conn")
+	}
+	// Verify first byte is replayed.
+	buf := make([]byte, 1)
+	routed.SetReadDeadline(time.Now().Add(time.Second))
+	n, _ := routed.Read(buf)
+	if n != 1 || buf[0] != 0x16 {
+		t.Fatalf("expected replayed 0x16, got 0x%02x", buf[0])
+	}
+}
+
+// buildWireClientHello builds a complete TLS ClientHello with knock for testing.
+func buildWireClientHello(psk transport.KnockPSK) []byte {
+	var random [32]byte
+	rand.Read(random[:])
+	sessionID := transport.ComputeKnockTag(psk, random)
+
+	body := make([]byte, 0, 77)
+	body = append(body, 0x03, 0x03)
+	body = append(body, random[:]...)
+	body = append(body, 0x20)
+	body = append(body, sessionID[:]...)
+	body = append(body, 0x00, 0x06, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03)
+	body = append(body, 0x01, 0x00)
+
+	hsLen := len(body)
+	hs := make([]byte, 4+hsLen)
+	hs[0] = 0x01
+	hs[1] = byte(hsLen >> 16)
+	hs[2] = byte(hsLen >> 8)
+	hs[3] = byte(hsLen)
+	copy(hs[4:], body)
+
+	rec := make([]byte, 5+len(hs))
+	rec[0] = 0x16
+	rec[1] = 0x03
+	rec[2] = 0x01
+	rec[3] = byte(len(hs) >> 8)
+	rec[4] = byte(len(hs))
+	copy(rec[5:], hs)
+
+	return rec
+}
+
+func TestPeekAndRouteKnockValidKnock(t *testing.T) {
+	cConn, sConn := newLocalTCPPair(t)
+
+	var psk transport.KnockPSK
+	rand.Read(psk[:])
+	hello := buildWireClientHello(psk)
+
+	// Also send some trailing data after the hello header.
+	go func() {
+		cConn.Write(hello)       //nolint:errcheck
+		cConn.Write([]byte{0xFF}) //nolint:errcheck
+	}()
+
+	routed, ok := peekAndRouteKnock(sConn, &psk)
+	if !ok {
+		t.Fatal("expected VPN path for valid knock")
+	}
+	if routed == nil {
+		t.Fatal("expected non-nil routed conn")
+	}
+
+	// The routed conn should replay the full header.
+	buf := make([]byte, len(hello)+1)
+	routed.SetReadDeadline(time.Now().Add(time.Second))
+	total := 0
+	for total < len(hello)+1 {
+		n, err := routed.Read(buf[total:])
+		total += n
+		if err != nil {
+			break
+		}
+	}
+	if total < len(hello) {
+		t.Fatalf("expected at least %d bytes (hello), got %d", len(hello), total)
+	}
+	if !bytes.Equal(buf[:len(hello)], hello) {
+		t.Fatal("replayed bytes don't match original hello")
+	}
+}
+
+func TestPeekAndRouteKnockInvalidKnock_TLS(t *testing.T) {
+	cConn, sConn := newLocalTCPPair(t)
+
+	var psk transport.KnockPSK
+	rand.Read(psk[:])
+
+	// Build a hello with a DIFFERENT PSK.
+	var wrongPSK transport.KnockPSK
+	rand.Read(wrongPSK[:])
+	hello := buildWireClientHello(wrongPSK)
+
+	go func() {
+		cConn.Write(hello) //nolint:errcheck
+	}()
+
+	// Verify with the correct PSK — should fail.
+	routed, ok := peekAndRouteKnock(sConn, &psk)
+	if ok || routed != nil {
+		t.Fatal("expected reject for invalid knock (wrong PSK)")
+	}
+
+	// Connection should be closed.
+	cConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, err := cConn.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("expected connection to be closed after invalid knock")
+	}
+}
+
+func TestPeekAndRouteKnockHTTPGetsCoverSite(t *testing.T) {
+	cConn, sConn := newLocalTCPPair(t)
+
+	var psk transport.KnockPSK
+	rand.Read(psk[:])
+
+	// Send a full HTTP request (enough to exceed 76 bytes).
+	httpReq := "GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+	go func() {
+		cConn.Write([]byte(httpReq)) //nolint:errcheck
+	}()
+
+	routed, ok := peekAndRouteKnock(sConn, &psk)
+	if ok || routed != nil {
+		t.Fatal("expected cover site path for HTTP request")
+	}
+
+	// Read cover site response.
+	cConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, _ := io.ReadAll(cConn)
+	if !bytes.Contains(resp, []byte("Pork Kitchen")) {
+		t.Fatalf("expected cover website for HTTP scanner, got: %q", truncate(resp, 300))
+	}
+}
+
+func TestPeekAndRouteKnockTimeoutSilentClose(t *testing.T) {
+	orig := decoyReadDeadline()
+	setDecoyReadDeadline(50 * time.Millisecond)
+	t.Cleanup(func() { setDecoyReadDeadline(orig) })
+
+	cConn, sConn := newLocalTCPPair(t)
+
+	var psk transport.KnockPSK
+	rand.Read(psk[:])
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		routed, ok := peekAndRouteKnock(sConn, &psk)
+		if ok || routed != nil {
+			t.Errorf("expected reject on timeout")
+		}
+	}()
+
+	// Client sends nothing — timeout fires.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("peekAndRouteKnock did not return after timeout")
+	}
+
+	// Connection should be closed.
+	cConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	n, err := cConn.Read(make([]byte, 1))
+	if n != 0 && err == nil {
+		t.Fatal("expected closed connection after timeout")
 	}
 }

@@ -25,9 +25,12 @@
 package main
 
 import (
+	"io"
 	"net"
 	"sync/atomic"
 	"time"
+
+	"github.com/cavad93/vpn/server/transport"
 )
 
 // tlsHandshakeRecordType is the TLS content_type byte for a Handshake record.
@@ -89,6 +92,26 @@ func (p *peekConn) Read(b []byte) (int, error) {
 	return p.Conn.Read(b)
 }
 
+// prefixConn wraps a net.Conn and prepends a multi-byte prefix that was
+// already consumed (e.g. during knock verification) back into the read stream.
+// All net.Conn methods except Read are forwarded unchanged.
+type prefixConn struct {
+	net.Conn
+	prefix []byte
+	offset int
+}
+
+// Read satisfies io.Reader. Returns buffered prefix bytes first, then
+// delegates to the underlying connection.
+func (p *prefixConn) Read(b []byte) (int, error) {
+	if p.offset < len(p.prefix) {
+		n := copy(b, p.prefix[p.offset:])
+		p.offset += n
+		return n, nil
+	}
+	return p.Conn.Read(b)
+}
+
 // peekAndRoute reads the first byte of conn and decides whether the connection
 // carries a VPN handshake or an active probe.
 //
@@ -127,4 +150,76 @@ func peekAndRoute(conn net.Conn) (net.Conn, bool) {
 	// increasing scanner confidence that this is a legitimate web server.
 	serveCoverSiteFromPeeked(conn, first[0])
 	return nil, false
+}
+
+// peekAndRouteKnock is like peekAndRoute but additionally verifies a
+// Reality-style port-knock tag embedded in the TLS ClientHello's session_id.
+//
+// If knockKey is nil, delegates to peekAndRoute (backward compatible).
+//
+// When knockKey is set, the function reads the first 76 bytes of the stream
+// and verifies session_id == HMAC-SHA256(knockKey, random). This prevents
+// the relay from connecting to the backend unless the client knows the PSK.
+//
+// Decision tree:
+//
+//	first byte != 0x16        → serve cover website (HTTP scanner)
+//	first byte == 0x16, HMAC matches → forward to upstream (VPN client)
+//	first byte == 0x16, HMAC fails   → close silently (DPI probe / replay)
+//
+// The "close silently" for failed TLS knock mimics a server that dropped the
+// connection due to handshake failure — a common behavior for misconfigured
+// TLS endpoints, revealing no information about the relay's purpose.
+func peekAndRouteKnock(conn net.Conn, knockKey *transport.KnockPSK) (net.Conn, bool) {
+	if knockKey == nil {
+		return peekAndRoute(conn)
+	}
+
+	// Give the client time to send the ClientHello header.
+	_ = conn.SetReadDeadline(time.Now().Add(decoyReadDeadline()))
+
+	// Read the minimum bytes needed to verify the knock.
+	var buf [transport.KnockMinBytes]byte
+	n, err := io.ReadFull(conn, buf[:])
+	if err != nil {
+		if n > 0 && buf[0] != tlsHandshakeRecordType {
+			// Got some non-TLS bytes — serve cover site with what we have.
+			serveCoverSiteFromPrefix(conn, buf[:n])
+			return nil, false
+		}
+		// Not enough data or read error — close silently.
+		conn.Close()
+		return nil, false
+	}
+
+	// Clear the read deadline.
+	_ = conn.SetReadDeadline(time.Time{})
+
+	// Non-TLS: serve cover website.
+	if buf[0] != tlsHandshakeRecordType {
+		serveCoverSiteFromPrefix(conn, buf[:n])
+		return nil, false
+	}
+
+	// TLS ClientHello — verify knock.
+	if !transport.VerifyKnock(*knockKey, buf[:n]) {
+		// Knock failed: a DPI probe or replayed ClientHello.
+		// Close silently — no information leakage.
+		conn.Close()
+		return nil, false
+	}
+
+	// Knock verified. Wrap in prefixConn so the upstream sees the full stream.
+	peeked := make([]byte, n)
+	copy(peeked, buf[:n])
+	return &prefixConn{Conn: conn, prefix: peeked}, true
+}
+
+// serveCoverSiteFromPrefix serves the cover website on a connection where
+// multiple bytes have already been consumed (e.g. during knock verification).
+// The prefix bytes are replayed before the remaining connection data.
+func serveCoverSiteFromPrefix(conn net.Conn, prefix []byte) {
+	pc := &prefixConn{Conn: conn, prefix: prefix}
+	_ = pc.SetReadDeadline(time.Time{})
+	serveCoverSite(pc)
 }
