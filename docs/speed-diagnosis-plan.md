@@ -746,8 +746,8 @@ Ha et al. 2008 (ACM SIGOPS): β=0.7 улучшает утилизацию при
 | # | Задача | Статус | Сеанс |
 |---|--------|--------|-------|
 | R1 | Cover website + HTTP handler + fallback для non-TLS проб + silent logging | ВЫПОЛНЕНО | 9 |
-| R2 | Смена порта с 8443 на высокий (>30000) + гайд миграции | ПЛАН | — |
-| R3 | SNI fix — убрать Google/Microsoft из defaultSNIDomains | ПЛАН | — |
+| R2 | Смена порта с 8443 на высокий (>30000) + гайд миграции | ВЫПОЛНЕНО | 10 |
+| R3 | SNI fix — убрать Google/Microsoft из defaultSNIDomains | ВЫПОЛНЕНО | 10 |
 | R4 | Port knocking — секретный ключ в первом пакете relay | ПЛАН | — |
 | R5 | HTTP listener на порту 80 для cover site | ПЛАН | — |
 | R6 | Интеграция cover site в handleConn (fallback при Noise failure) | ПЛАН | — |
@@ -807,4 +807,193 @@ Ha et al. 2008 (ACM SIGOPS): β=0.7 улучшает утилизацию при
 - `server/relay_test.go` — ОБНОВЛЁН: проверка "Pork Kitchen" вместо "400 Bad Request"
 - `server/api/telemetry.go` — ОБНОВЛЁН: описание decoy
 
-**Следующий шаг (R2):** Сменить порт сервера с 8443 на случайный выше 30000. Написать гайд по миграции: закрытие старого порта (iptables, ufw), открытие нового, обновление relay конфигурации (MacBook → СПБ:443 → Астана:новый_порт). Учесть что MacBook передаёт трафик на 443 в СПБ, тот на 8443 в Астану.
+**Следующий шаг (R3+R4):** Port knocking — секретный ключ в первом пакете relay. HTTP listener на порту 80 для cover site.
+
+### Сеанс 10 — 2026-04-09 — Смена порта 8443→38947 + SNI fix (R2+R3)
+
+**Задача:** Сменить скомпрометированный порт VPN-сервера (Астана) с 8443 на 38947. Исправить SNI домены — убрать Google/Microsoft, заменить на нейтральные CDN-домены, совместимые с cover website.
+
+**Научное обоснование:**
+
+- **RFC 6335 (IANA Port Procedures):** Порты 49152–65535 — динамические/ephemeral (используются OS для исходящих соединений). Порты 1024–49151 — user ports (зарегистрированные/незарегистрированные сервисы). Порт 38947 — незарегистрированный user port, не ассоциирован с известными сервисами в IANA registry.
+- **Trojan-GFW (Li et al., FOCI 2020):** Порт 443 — gold standard для relay, facing DPI. Порт backend-сервера (за relay) менее критичен, но должен быть нестандартным чтобы не попадать в паттерны сканирования.
+- **TrojanProbe (ScienceDirect 2024):** Active probing fingerprints серверы по несоответствию SNI и HTTP fallback content. ClientHello с SNI=google.com, но HTTP fallback возвращает "Pork Kitchen" blog → мгновенная идентификация VPN.
+- **Frolov et al. (FOCI 2017):** Cover traffic must be indistinguishable from real web traffic at content level. SNI → CDN edge hostnames (jsdelivr, cloudflare CDN) плausibly host *any* third-party content, включая recipe blogs.
+- **VLESS Protocol (habr.com/en/articles/990144, 2025):** В России ТСПУ проверяет соответствие SNI и реального контента. CDN-домены — единственные, где мismatch между SNI и контентом является нормой (CDN обслуживает тысячи сайтов за одним edge hostname).
+
+**Выбор порта 38947:**
+- Выше 30000 (требование ТЗ)
+- Не зарегистрирован в IANA (проверено по registry)
+- Не используется популярными сервисами (проверено Wikipedia List of TCP/UDP port numbers)
+- В диапазоне user ports (1024–49151), не в ephemeral range (49152–65535)
+- Визуально не паттернный (не 30000, 33333, 40000 и т.п.)
+
+**Что сделано:**
+
+1. **Порт 8443 → 38947** — все упоминания обновлены:
+   - `server/relay.go` — комментарии traffic flow: `Астана:8443` → `Астана:38947`
+   - `server/main.go` — флаг `-relay-to` example: `193.124.93.240:8443` → `193.124.93.240:38947`
+   - `server/cmd/vpnclient/main.go` — usage comments (3 строки)
+   - `scripts/install_server.ps1` — example
+   - `tools/auto_update.ps1` — default ServerArgs (2 места)
+   - `tools/watchdog.ps1` — default ServerArgs + Port parameter
+   - `historia.md` — схема relay + гайд (4 места)
+   - `docs/sidestore-setup.md` — инструкция для iOS клиента
+
+2. **SNI домены — убраны Google/Microsoft** (`server/transport/sni.go`):
+   - Удалены: `www.google.com`, `www.cloudflare.com`, `cdn.cloudflare.com`, `www.googleapis.com`, `ajax.googleapis.com`, `fonts.googleapis.com`, `clients1.google.com`, `update.googleapis.com`, `www.gstatic.com`, `www.microsoft.com`
+   - Добавлены CDN edge hostnames: `cdn.jsdelivr.net`, `cdnjs.cloudflare.com`, `cdn.statically.io`, `unpkg.com`, `fastly.jsdelivr.net`, `cdn.bootcdn.net`, `lib.baomitu.com`, `cdn.bootcss.com`, `assets-cdn.github.com`, `raw.githubusercontent.com`
+   - Fallback domain: `www.google.com` → `cdn.jsdelivr.net`
+   - Подробный комментарий с обоснованием (ссылки на Frolov, TrojanProbe)
+
+3. **Python клиент SNI домены** (`client/sni_spoof.py`):
+   - `DOMAIN_POOL` полностью переписан: 20 нейтральных CDN-доменов вместо branded портальных (Google, Microsoft, Apple, Amazon)
+   - Категории: Public CDN edges, GitHub raw content, Generic cloud storage, Misc CDNs
+   - Все домены доступны в России
+
+4. **Тесты обновлены:**
+   - `server/transport/sni_test.go` — `TestWithSNIStaticHandshakeSucceeds`: `www.google.com` → `cdn.jsdelivr.net`; `TestWithSNIClientHelloContainsDomain`: `update.googleapis.com` → `cdn.jsdelivr.net`
+
+**Результат:** ВЫПОЛНЕНО
+
+**Тесты:**
+- Go server: 8 пакетов — ALL PASS (`go test ./... -count=1 -p 1`)
+- Python SNI: 86/86 PASS (`python3 -m pytest test_sni_spoof.py -v`)
+
+**Изменённые файлы:**
+- `server/transport/sni.go` — новый список CDN доменов, обновлён fallback
+- `server/transport/sni_test.go` — обновлены 2 теста с google → cdn.jsdelivr.net
+- `server/relay.go` — комментарии: 8443→38947
+- `server/main.go` — flag example: 8443→38947
+- `server/cmd/vpnclient/main.go` — usage comments: 8443→38947
+- `client/sni_spoof.py` — DOMAIN_POOL: 30 branded → 20 CDN domains
+- `scripts/install_server.ps1` — example: 8443→38947
+- `tools/auto_update.ps1` — defaults: 8443→38947
+- `tools/watchdog.ps1` — defaults: 8443→38947
+- `historia.md` — relay guide: 8443→38947
+- `docs/sidestore-setup.md` — iOS guide: 8443→38947
+
+---
+
+## Гайд: миграция порта 8443 → 38947
+
+### Текущая схема
+
+```
+MacBook (СПБ)                 СПБ relay-сервер             Астана VPN-сервер
+┌──────────┐  TCP:443       ┌──────────────┐  TCP:8443   ┌──────────────┐
+│ VPN клиент├──────────────►│ relay         ├────────────►│ VPN server   │
+│           │  TLS+Noise    │ -relay-to     │  raw TCP    │ -addr 0.0.0.0│
+│           │  +Mux+BBR     │ АСТАНА:8443   │  passthru   │ :8443        │
+└──────────┘               └──────────────┘              └──────────────┘
+```
+
+### Новая схема
+
+```
+MacBook (СПБ)                 СПБ relay-сервер             Астана VPN-сервер
+┌──────────┐  TCP:443       ┌──────────────┐  TCP:38947  ┌──────────────┐
+│ VPN клиент├──────────────►│ relay         ├────────────►│ VPN server   │
+│           │  TLS+Noise    │ -relay-to     │  raw TCP    │ -addr 0.0.0.0│
+│           │  +Mux+BBR     │ АСТАНА:38947  │  passthru   │ :38947       │
+└──────────┘               └──────────────┘              └──────────────┘
+```
+
+### Шаг 1: Астана (VPN-сервер, Windows)
+
+```powershell
+# 1. Остановить VPN-сервер
+Stop-Service CavadVPN
+
+# 2. Открыть новый порт в фаерволе
+New-NetFirewallRule -DisplayName "CavadVPN TCP 38947" `
+    -Direction Inbound -Protocol TCP -LocalPort 38947 -Action Allow
+New-NetFirewallRule -DisplayName "CavadVPN UDP 38947" `
+    -Direction Inbound -Protocol UDP -LocalPort 38947 -Action Allow
+
+# 3. Обновить конфигурацию сервера
+# Отредактировать config.yaml (или параметры командной строки):
+#   listen: "0.0.0.0:38947"   ← было 0.0.0.0:8443
+# Или при запуске:
+#   cavad-vpn.exe -addr 0.0.0.0:38947 -tun-cidr 10.8.0.1/24 ...
+
+# 4. Запустить сервер
+Start-Service CavadVPN
+
+# 5. Проверить что порт слушает
+netstat -an | findstr 38947
+
+# 6. После проверки — закрыть старый порт
+Remove-NetFirewallRule -DisplayName "CavadVPN TCP 443"
+Remove-NetFirewallRule -DisplayName "CavadVPN UDP 443"
+Remove-NetFirewallRule -DisplayName "CavadVPN TCP 8443"   # если был
+Remove-NetFirewallRule -DisplayName "CavadVPN UDP 8443"   # если был
+```
+
+### Шаг 2: СПБ (relay-сервер, Linux)
+
+```bash
+# 1. Обновить relay команду запуска
+# Было:
+#   cavad-relay -addr 0.0.0.0:443 -relay-to АСТАНА_IP:8443
+# Стало:
+cavad-relay -addr 0.0.0.0:443 -relay-to АСТАНА_IP:38947
+
+# 2. Если используется systemd:
+sudo systemctl edit cavadvpn-relay.service
+# В секции [Service]:
+#   ExecStart=/usr/local/bin/cavad-relay -addr 0.0.0.0:443 -relay-to АСТАНА_IP:38947
+sudo systemctl daemon-reload
+sudo systemctl restart cavadvpn-relay
+
+# 3. Проверить что relay работает
+ss -tlnp | grep 443   # relay слушает на 443
+curl -s http://СПБ_IP  # должен вернуть "Pork Kitchen" cover site
+
+# 4. Убедиться что СПБ→Астана:38947 проходит
+# (с СПБ сервера напрямую)
+nc -zv АСТАНА_IP 38947
+
+# 5. Порт 443 на СПБ НЕ менять — он маскируется под HTTPS для ТСПУ
+```
+
+### Шаг 3: MacBook (клиент)
+
+```bash
+# Клиент подключается к СПБ relay на порт 443 — БЕЗ ИЗМЕНЕНИЙ
+# MacBook не знает про порт 38947 — relay транспарентно пробрасывает
+
+# Go клиент:
+sudo ./vpnclient -server СПБ_IP:443 -key client.key
+
+# Python клиент:
+python3 -c "
+from core import VPNConfig, VPNClient
+cfg = VPNConfig(server_addr='СПБ_IP', server_port=443, ...)
+"
+```
+
+### Проверка безопасности
+
+```bash
+# 1. Убедиться что порт 8443 на Астане ЗАКРЫТ (с внешней машины)
+nmap -p 8443 АСТАНА_IP   # должен быть filtered/closed
+
+# 2. Убедиться что порт 38947 на Астане ОТКРЫТ только для СПБ IP
+# (опционально: iptables правило для ограничения доступа)
+sudo iptables -A INPUT -p tcp --dport 38947 -s СПБ_IP -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 38947 -j DROP
+sudo iptables -A INPUT -p udp --dport 38947 -s СПБ_IP -j ACCEPT
+sudo iptables -A INPUT -p udp --dport 38947 -j DROP
+
+# 3. Проверить что cover site работает при прямом обращении
+curl -s http://АСТАНА_IP:38947   # должен вернуть "Pork Kitchen"
+curl -s http://СПБ_IP            # должен вернуть "Pork Kitchen"
+```
+
+### Важные замечания
+
+1. **Порт 443 на СПБ НЕ МЕНЯТЬ** — это стандартный HTTPS порт, маскировка под обычный веб-трафик для ТСПУ
+2. **MacBook клиент НЕ МЕНЯТЬ** — он подключается к relay (СПБ:443), не напрямую к Астане
+3. **Ограничить доступ к 38947** — через iptables разрешить только IP СПБ сервера (см. выше)
+4. **SNI обновлён** — теперь используются CDN-домены (jsdelivr, cloudflare CDN) вместо Google/Microsoft; мismatch SNI↔cover site стал нормальным (CDN обслуживает любой контент)

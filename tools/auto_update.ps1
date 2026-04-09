@@ -32,7 +32,7 @@
 
 .EXAMPLE
     .\auto_update.ps1 -RepoDir C:\CavadVPN\repo -Branch claude/investigate-vpn-performance-IJ0iX
-    .\auto_update.ps1 -RepoDir C:\CavadVPN\repo -ServerArgs "-addr 0.0.0.0:8443 -tun-cidr 10.8.0.1/24 -api-addr 127.0.0.1:8080"
+    .\auto_update.ps1 -RepoDir C:\CavadVPN\repo -ServerArgs "-addr 0.0.0.0:38947 -tun-cidr 10.8.0.1/24 -api-addr 127.0.0.1:8080"
 #>
 
 param(
@@ -49,7 +49,7 @@ param(
 
     [string]$LogFile = "C:\CavadVPN\auto-update.log",
 
-    [string]$ServerArgs = "-addr 0.0.0.0:8443 -tun-cidr 10.8.0.1/24 -api-addr 127.0.0.1:8080",
+    [string]$ServerArgs = "-addr 0.0.0.0:38947 -tun-cidr 10.8.0.1/24 -api-addr 127.0.0.1:8080",
 
     [switch]$Once
 )

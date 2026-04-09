@@ -346,7 +346,7 @@ func newObfsPairWithSNI(t *testing.T, selector SNISelector) (*ObfsConn, *ObfsCon
 
 func TestWithSNIStaticHandshakeSucceeds(t *testing.T) {
 	t.Parallel()
-	client, server := newObfsPairWithSNI(t, &StaticSNI{Domain: "www.google.com"})
+	client, server := newObfsPairWithSNI(t, &StaticSNI{Domain: "cdn.jsdelivr.net"})
 	client.Close()
 	server.Close()
 }
@@ -411,7 +411,7 @@ func TestWithSNIDoesNotBreakNilSelector(t *testing.T) {
 func TestWithSNIClientHelloContainsDomain(t *testing.T) {
 	t.Parallel()
 	// Intercept the raw ClientHello to verify the domain appears on the wire.
-	domain := "update.googleapis.com"
+	domain := "cdn.jsdelivr.net"
 	cRaw, sRaw := net.Pipe()
 
 	var captured []byte

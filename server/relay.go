@@ -10,9 +10,9 @@
 //
 //	MacBook ──[TLS+Noise+Mux]──► SPb relay:443
 //	    peek first byte (0x16?)
-//	    YES → dial Astana:8443, pipe bytes bidirectionally
+//	    YES → dial Astana:38947, pipe bytes bidirectionally
 //	    NO  → serve HTTP decoy, close
-//	                                  SPb relay ──[raw TCP]──► Astana:8443
+//	                                  SPb relay ──[raw TCP]──► Astana:38947
 //	                                                              VPN terminates here
 //
 // The relay is completely protocol-agnostic: it does not decrypt, re-encrypt,

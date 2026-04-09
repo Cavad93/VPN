@@ -1360,9 +1360,9 @@ t.Cleanup(func() { setDecoyReadDeadline(orig) })
 ```
 MacBook ──[TLS+Noise+Mux]──► СПб :443
     peekAndRoute (первый байт)
-    0x16 → dial Астана:8443, bidirectional pipe
+    0x16 → dial Астана:38947, bidirectional pipe
     other → HTTP 400 nginx decoy + close
-                              СПб ──[raw TCP]──► Астана:8443
+                              СПб ──[raw TCP]──► Астана:38947
                                                    VPN терминируется здесь
 ```
 
@@ -1397,7 +1397,7 @@ MacBook ──[TLS+Noise+Mux]──► СПб :443
 
 #### Астана (основной VPN-сервер, без изменений)
 ```powershell
-cavad-vpn.exe -addr 0.0.0.0:8443 -tun-cidr 10.8.0.1/24 -transport tcp -api-addr 127.0.0.1:8080 -api-token "ТОКЕН"
+cavad-vpn.exe -addr 0.0.0.0:38947 -tun-cidr 10.8.0.1/24 -transport tcp -api-addr 127.0.0.1:8080 -api-token "ТОКЕН"
 ```
 
 #### СПб (relay-сервер, Linux)
@@ -1407,7 +1407,7 @@ cd /opt/cavadvpn/repo/server
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o /usr/local/bin/cavad-relay .
 
 # Запуск (relay на порт 443, пробрасывает к Астане)
-cavad-relay -addr 0.0.0.0:443 -relay-to АСТАНА_IP:8443
+cavad-relay -addr 0.0.0.0:443 -relay-to АСТАНА_IP:38947
 ```
 
 Для СПб:

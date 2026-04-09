@@ -1556,7 +1556,7 @@ func main() {
 	flag.StringVar(&vlessKey, "vless-key", "key.pem", "TLS private key file for VLESS")
 	flag.StringVar(&vlessPath, "vless-path", "/tunnel", "WebSocket path for VLESS")
 	flag.StringVar(&anthropicKey, "anthropic-key", "", "Anthropic API key for telemetry analysis (or ANTHROPIC_API_KEY env)")
-	flag.StringVar(&relayTo, "relay-to", "", "relay VPN traffic to this upstream address (e.g. 193.124.93.240:8443); disables local VPN termination")
+	flag.StringVar(&relayTo, "relay-to", "", "relay VPN traffic to this upstream address (e.g. 193.124.93.240:38947); disables local VPN termination")
 	flag.StringVar(&relayMetricsAddr, "relay-metrics-addr", ":9092", "relay metrics HTTP server address (per-segment throughput for AI diagnostics; empty to disable)")
 	flag.StringVar(&diagnosticsFile, "diagnostics-file", "", "path to append telemetry reports as JSONL (e.g. /var/log/cavadvpn/diagnostics.jsonl)")
 	flag.Parse()

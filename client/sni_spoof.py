@@ -92,42 +92,45 @@ CHROME_CIPHER_SUITES: list[int] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Domain pool — popular high-traffic HTTPS sites
+# Domain pool — neutral CDN edge hostnames
 # ---------------------------------------------------------------------------
+#
+# SECURITY (Frolov et al., FOCI 2017; TrojanProbe, ScienceDirect 2024):
+# SNI must be CONSISTENT with the server's fallback content.  If the server
+# returns a cover website (e.g. recipe blog) on active probing, claiming to
+# be google.com or microsoft.com is an instant red flag — the prober sees
+# "pork recipes" at an IP that claims to be Google.
+#
+# CDN edge hostnames plausibly host *any* content behind the same edge, so a
+# mismatch between SNI and HTTP content is expected and normal.
+#
+# All listed domains: accessible in Russia, serve diverse third-party content.
 
 DOMAIN_POOL: list[str] = [
-    # Google (доступен в РФ)
-    "www.google.com",
-    "www.cloudflare.com",
-    "www.googleapis.com",
-    "fonts.googleapis.com",
-    "ssl.gstatic.com",
-    "www.gstatic.com",
-    "accounts.google.com",
-    "ajax.googleapis.com",
-    # Microsoft (доступен в РФ)
-    "www.microsoft.com",
-    "login.microsoftonline.com",
-    "www.office.com",
-    "outlook.live.com",
-    "dl.delivery.mp.microsoft.com",
-    # Apple (доступен в РФ)
-    "www.apple.com",
-    "cdn.apple.com",
-    "swdist.apple.com",
-    "updates.cdn-apple.com",
-    # Cloudflare (доступен в РФ)
-    "cdn.cloudflare.com",
-    "ajax.cloudflare.com",
-    "1.1.1.1",
-    # Amazon AWS (доступен в РФ)
-    "www.amazon.com",
-    "s3.amazonaws.com",
-    "d1.awsstatic.com",
-    # GitHub (доступен в РФ)
-    "www.github.com",
-    "api.github.com",
+    # Public CDN edges (host arbitrary third-party content)
+    "cdn.jsdelivr.net",
+    "cdnjs.cloudflare.com",
+    "cdn.statically.io",
+    "unpkg.com",
+    "fastly.jsdelivr.net",
+    "cdn.bootcdn.net",
+    "lib.baomitu.com",
+    "cdn.bootcss.com",
+    # GitHub raw content (hosts arbitrary user files)
+    "assets-cdn.github.com",
+    "raw.githubusercontent.com",
     "objects.githubusercontent.com",
+    # Generic cloud storage / static assets
+    "storage.googleapis.com",
+    "d1.awsstatic.com",
+    "cdn.shopify.com",
+    "static.parastorage.com",
+    # Misc CDNs accessible in Russia
+    "cdn.ampproject.org",
+    "res.cloudinary.com",
+    "cdn.sanity.io",
+    "images.unsplash.com",
+    "cdn.pixabay.com",
 ]
 
 

@@ -22,24 +22,34 @@ import (
 	"math/big"
 )
 
-// defaultSNIDomains is the built-in list of legitimate-looking domains.
-// These domains serve enormous global traffic volumes, making DPI fingerprinting
-// based on SNI alone ineffective.
-// NOTE: Only domains accessible in Russia are listed here.
-// Using blocked domains (youtube.com, netflix.com, instagram.com) as SNI
-// would make the traffic look suspicious to Russian DPI — those sites are
-// blocked, so any TLS handshake claiming to reach them is an anomaly.
+// defaultSNIDomains is the built-in list of neutral, CDN-like domains.
+//
+// SECURITY DESIGN (Frolov et al., FOCI 2017; TrojanProbe, ScienceDirect 2024):
+// SNI must be CONSISTENT with the server's fallback behaviour. If the server
+// returns a "pork recipe blog" on probe, claiming to be google.com in the
+// ClientHello is an instant red flag for active probing. Use only generic,
+// unbranded CDN subdomains that plausibly host any content — recipe blogs,
+// small SaaS apps, personal pages.
+//
+// All listed domains:
+//   - Are accessible in Russia (not blocked by RKN)
+//   - Host diverse third-party content (CDN edges, not branded portals)
+//   - A mismatch between SNI and HTTP fallback content is expected (CDN serves
+//     many different sites behind the same edge hostname)
+//
+// Operators SHOULD set their own domain via StaticSNI if they have a real
+// domain pointed at the server — that eliminates the mismatch entirely.
 var defaultSNIDomains = []string{
-	"www.google.com",
-	"www.cloudflare.com",
-	"cdn.cloudflare.com",
-	"www.googleapis.com",
-	"ajax.googleapis.com",
-	"fonts.googleapis.com",
-	"clients1.google.com",
-	"update.googleapis.com",
-	"www.gstatic.com",
-	"www.microsoft.com",
+	"cdn.jsdelivr.net",
+	"cdnjs.cloudflare.com",
+	"cdn.statically.io",
+	"unpkg.com",
+	"fastly.jsdelivr.net",
+	"cdn.bootcdn.net",
+	"lib.baomitu.com",
+	"cdn.bootcss.com",
+	"assets-cdn.github.com",
+	"raw.githubusercontent.com",
 }
 
 // SNISelector chooses the hostname to embed in the SNI extension of each
@@ -73,10 +83,10 @@ func NewRandomSNI() *RandomSNI {
 }
 
 // Select implements SNISelector.  Returns a random element from Domains; falls
-// back to "www.google.com" if the list is empty or randomness fails.
+// back to "cdn.jsdelivr.net" if the list is empty or randomness fails.
 func (r *RandomSNI) Select() string {
 	if len(r.Domains) == 0 {
-		return "www.google.com"
+		return "cdn.jsdelivr.net"
 	}
 	n, err := rand.Int(rand.Reader, big.NewInt(int64(len(r.Domains))))
 	if err != nil {

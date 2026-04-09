@@ -46,7 +46,7 @@
 
 .EXAMPLE
     # Установка в нестандартную директорию с кастомными настройками
-    .\install_server.ps1 -InstallDir "D:\VPN" -ListenAddr "0.0.0.0:8443" -APIToken "mysecrettoken"
+    .\install_server.ps1 -InstallDir "D:\VPN" -ListenAddr "0.0.0.0:38947" -APIToken "mysecrettoken"
 
 .EXAMPLE
     # Удаление

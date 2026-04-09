@@ -8,9 +8,9 @@
 //
 // Usage (run as root):
 //
-//	sudo ./vpnclient -server 193.124.93.240:8443
-//	sudo ./vpnclient -server 193.124.93.240:8443 -key /etc/vpn/client.key
-//	sudo ./vpnclient -server 193.124.93.240:8443 -server-key bc05f3a7...
+//	sudo ./vpnclient -server 193.124.93.240:38947
+//	sudo ./vpnclient -server 193.124.93.240:38947 -key /etc/vpn/client.key
+//	sudo ./vpnclient -server 193.124.93.240:38947 -server-key bc05f3a7...
 package main
 
 import (
