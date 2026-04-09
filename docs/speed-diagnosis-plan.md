@@ -749,8 +749,8 @@ Ha et al. 2008 (ACM SIGOPS): β=0.7 улучшает утилизацию при
 | R2 | Смена порта с 8443 на высокий (>30000) + гайд миграции | ВЫПОЛНЕНО | 10 |
 | R3 | SNI fix — убрать Google/Microsoft из defaultSNIDomains | ВЫПОЛНЕНО | 10 |
 | R4 | Port knocking — секретный ключ в первом пакете relay (Reality-style HMAC) | ВЫПОЛНЕНО | 11 |
-| R5 | HTTP listener на порту 80 для cover site | ПЛАН | — |
-| R6 | Интеграция cover site в handleConn (fallback при Noise failure) | ПЛАН | — |
+| R5 | HTTP listener на порту 80 для cover site | ВЫПОЛНЕНО | 12 |
+| R6 | CCS + TLS 1.3 fallback в handleConn при Noise failure | ВЫПОЛНЕНО | 12 |
 
 ### Сеанс 9 — 2026-04-08 — Cover website + anti-probing fallback (R1)
 
@@ -1137,4 +1137,139 @@ cfg = VPNConfig(
 - HTTP/другие пробы → cover website (Pork Kitchen)
 - Replay: каждый ClientHello содержит уникальный random → уникальный knock tag
 
-**Следующий шаг (R5):** HTTP listener на порту 80 для cover site.
+### Сеанс 12 — 2026-04-09 — TLS 1.3 CCS + Fallback Records + HTTP :80 (R5+R6)
+
+**Задача:** Завершить anti-probing защиту: (1) добавить ChangeCipherSpec в ObfsConn для полной совместимости с TLS 1.3 wire format, (2) при отказе Noise handshake — отправлять реалистичную TLS 1.3 error-последовательность, (3) HTTP listener на порту 80 для cover site.
+
+**Научное обоснование:**
+
+- **RFC 8446 §5.1 (TLS 1.3):** Серверы ОБЯЗАНЫ отправлять ChangeCipherSpec (CCS) после ServerHello для middlebox compatibility. Это единственный 6-байтный запись: `14 03 03 00 01 01`. Все major браузеры и серверы (nginx, Apache, IIS) отправляют CCS. Его отсутствие — мгновенный fingerprint non-standard TLS реализации.
+- **Frolov & Wustrow (NDSS 2019) "The use of TLS in Censorship Circumvention":** Active probes fingerprint серверы по отсутствию CCS после ServerHello. GFW использует это для идентификации V2Ray/Shadowsocks серверов.
+- **TrojanProbe (ScienceDirect 2024):** Серверы, которые закрывают соединение без отправки post-ServerHello encrypted records (EncryptedExtensions, Certificate, Finished), fingerprint-ируются как VPN/proxy. Реальный TLS 1.3 сервер ВСЕГДА отправляет 4-5 encrypted records после ServerHello перед ошибкой.
+- **RFC 8446 §6:** В TLS 1.3 все alerts после ServerHello зашифрованы — они заворачиваются в application_data (0x17) records. Пассивный наблюдатель видит только random-looking payload. Наши random-filled records неотличимы от реального AEAD ciphertext.
+
+**Что сделано:**
+
+1. **`server/transport/obfs.go` (ИЗМЕНЁН)** — TLS 1.3 CCS поддержка:
+   - Новая константа `tlsRecordCCS = byte(0x14)`
+   - `buildChangeCipherSpec()` — создаёт CCS record: `14 03 03 00 01 01`
+   - `ServerHandshake()` — теперь отправляет ServerHello + CCS в одном write (TCP coalescing)
+   - `readRecord()` — теперь пропускает CCS records в цикле (для ClientHandshake)
+   - `Read()` (hot path) — также пропускает CCS records (один extra byte-сравнение на header, negligible overhead). Это нужно потому что CCS идёт ПОСЛЕ ServerHello в TCP stream, и может быть ещё не consumed когда hot-path Read начинает работать.
+
+2. **`server/decoy.go` (ИЗМЕНЁН)** — TLS 1.3 fallback response functions:
+   - `sendTLS13FallbackRecords(w io.Writer)` — записывает реалистичную TLS 1.3 error-последовательность:
+     - 5 app_data records (0x17) с random content и realistic sizes:
+       - ~280-429 bytes: mimics EncryptedExtensions
+       - ~1050-1999 bytes: mimics Certificate
+       - ~115-194 bytes: mimics CertificateVerify
+       - ~52-71 bytes: mimics Finished
+       - ~19-30 bytes: mimics encrypted fatal alert
+     - Content = `crypto/rand` — computationally indistinguishable from AEAD ciphertext
+   - `sendPlaintextTLSAlert(w io.Writer, level, desc byte)` — plaintext TLS alert for pre-ServerHello failures: `15 03 03 00 02 {level} {desc}`
+   - `writeFakeAppDataRecord(w io.Writer, size int)` — helper for individual records
+   - `cryptoRandIntn(n int) int` — random int via crypto/rand
+
+3. **`server/main.go` (ИЗМЕНЁН)** — handleConn fallback integration:
+   - ObfsConn failure → `sendPlaintextTLSAlert(conn, 0x02, 50)` (fatal + decode_error) — like nginx does when ClientHello is malformed
+   - Noise handshake failure → `sendTLS13FallbackRecords(bufConn)` + `bufConn.Flush()` — mimics real TLS server that had a handshake error after ServerHello
+   - Key check failure → NO fallback (Noise already completed, probe already saw VPN protocol)
+   - New flag: `-cover-addr` — address for plain HTTP cover website listener (e.g., `:80`)
+   - Cover HTTP launched in both relay mode and VPN server mode
+
+4. **`client/core.py` (ИЗМЕНЁН)** — Python клиент CCS support:
+   - Новая константа `TLS_RECORD_CCS = 0x14`
+   - `_read_record()` — пропускает CCS records (while True loop)
+
+5. **`client/sni_spoof.py` (ИЗМЕНЁН)** — SNISpoofConn CCS support:
+   - Новая константа `TLS_RECORD_CCS = 0x14`
+   - `_read_record()` — пропускает CCS records (while True loop)
+
+6. **`android/.../transport/ObfsConn.kt` (ИЗМЕНЁН)** — Android клиент CCS support:
+   - Новая константа `TLS_CCS: Byte = 0x14`
+   - `readRecord()` — пропускает CCS records (while true loop)
+
+**Wire format до и после:**
+
+До:
+```
+S→C: 16 03 03 XX XX [ServerHello]          ← единственная запись
+     [silence until Noise message]
+     [sudden close on failure]              ← fingerprint: no CCS, no encrypted records
+```
+
+После:
+```
+S→C: 16 03 03 XX XX [ServerHello]          ← handshake record
+S→C: 14 03 03 00 01 01 [CCS]              ← middlebox compat (RFC 8446 §5.1)
+     [Noise handshake proceeds...]
+     [On Noise failure:]
+S→C: 17 03 03 XX XX [~300 bytes random]    ← "encrypted" EncryptedExtensions
+S→C: 17 03 03 XX XX [~1500 bytes random]   ← "encrypted" Certificate
+S→C: 17 03 03 XX XX [~150 bytes random]    ← "encrypted" CertificateVerify
+S→C: 17 03 03 XX XX [~60 bytes random]     ← "encrypted" Finished
+S→C: 17 03 03 XX XX [~25 bytes random]     ← "encrypted" fatal alert
+     [TCP close]                            ← identical to real TLS 1.3 error
+```
+
+**Результат:** ВЫПОЛНЕНО
+
+**Тесты:**
+
+Новые тесты в `server/transport/obfs_test.go`:
+- `TestObfsBuildChangeCipherSpec` — проверяет формат CCS record
+- `TestObfsServerHandshakeSendsCCS` — верификация что ServerHello + CCS отправляются вместе
+- `TestObfsClientHandshakeSkipsCCS` — end-to-end handshake с CCS + передача данных
+- `TestObfsReadRecordSkipsCCSMidStream` — CCS record перед ServerHello пропускается
+
+Новые тесты в `server/decoy_test.go`:
+- `TestSendTLS13FallbackRecordsWritesValidTLSRecords` — 5 app_data records, valid format
+- `TestSendTLS13FallbackRecordsSizeDistribution` — проверка диапазонов размеров (5 итераций)
+- `TestSendPlaintextTLSAlertFormat` — exact byte match for alert record
+- `TestSendPlaintextTLSAlertDifferentCodes` — 4 разных alert кода
+- `TestCryptoRandIntn` — range validation для helper функции
+
+Все Go тесты: **ALL PASS** (8 пакетов)
+Python syntax: **OK** (core.py, sni_spoof.py)
+Kotlin syntax: **OK** (ObfsConn.kt)
+
+**Изменённые файлы:**
+- `server/transport/obfs.go` — CCS constant, buildChangeCipherSpec, ServerHandshake sends CCS, readRecord/Read skip CCS
+- `server/transport/obfs_test.go` — 4 новых теста для CCS
+- `server/decoy.go` — sendTLS13FallbackRecords, sendPlaintextTLSAlert, helpers
+- `server/decoy_test.go` — 5 новых тестов для fallback records
+- `server/main.go` — fallback integration в handleConn, -cover-addr flag, cover HTTP launcher
+- `client/core.py` — TLS_RECORD_CCS, _read_record CCS skip
+- `client/sni_spoof.py` — TLS_RECORD_CCS, _read_record CCS skip
+- `android/.../transport/ObfsConn.kt` — TLS_CCS, readRecord CCS skip
+
+**Использование:**
+
+```bash
+# VPN-сервер с HTTP cover site на :80
+./server -addr 0.0.0.0:38947 -cover-addr :80 ...
+
+# Relay с HTTP cover site на :80
+./server -addr 0.0.0.0:443 -relay-to АСТАНА:38947 -cover-addr :80 -knock-key ...
+```
+
+**Что видит сканер теперь:**
+
+1. **HTTP probe → :80** → полный cooking blog (Pork Kitchen)
+2. **HTTP probe → :38947** → полный cooking blog (через peekAndRoute)
+3. **TLS probe → :443 (relay)** → без knock key → close silently (DPI probe)
+4. **TLS probe → :38947 (server)** → ObfsConn reads ClientHello → sends ServerHello + CCS → Noise fails → sends encrypted-looking records + alert → close (идентично nginx с self-signed cert)
+5. **nmap scan → :80 + :38947** → port 80 = HTTP blog, port 38947 = TLS service → нормальный веб-сервер
+
+**Статус таблицы:**
+
+| # | Задача | Статус | Сеанс |
+|---|--------|--------|-------|
+| R1 | Cover website + HTTP handler + fallback для non-TLS проб + silent logging | ВЫПОЛНЕНО | 9 |
+| R2 | Смена порта с 8443 на высокий (>30000) + гайд миграции | ВЫПОЛНЕНО | 10 |
+| R3 | SNI fix — убрать Google/Microsoft из defaultSNIDomains | ВЫПОЛНЕНО | 10 |
+| R4 | Port knocking — секретный ключ в первом пакете relay (Reality-style HMAC) | ВЫПОЛНЕНО | 11 |
+| R5 | HTTP listener на порту 80 для cover site | ВЫПОЛНЕНО | 12 |
+| R6 | CCS + TLS 1.3 fallback в handleConn при Noise failure | ВЫПОЛНЕНО | 12 |
+
+**Все задачи REALITY плана выполнены.**

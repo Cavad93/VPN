@@ -6,6 +6,7 @@ import java.io.OutputStream
 import java.security.SecureRandom
 
 // TLS record content type bytes
+private const val TLS_CCS       : Byte = 0x14  // ChangeCipherSpec (middlebox compat, RFC 8446 §5.1)
 private const val TLS_HANDSHAKE : Byte = 0x16
 private const val TLS_APP_DATA  : Byte = 0x17
 
@@ -113,16 +114,27 @@ class ObfsConn(
     // -----------------------------------------------------------------------
 
     private fun readRecord(wantType: Int): ByteArray {
-        val hdr = readFully(OBFS_HEADER_SIZE)
-        val gotType = hdr[0].toInt() and 0xFF
-        if (gotType != wantType) {
-            throw IllegalStateException("obfs: unexpected record type 0x%02x (want 0x%02x)".format(gotType, wantType))
+        while (true) {
+            val hdr = readFully(OBFS_HEADER_SIZE)
+            val gotType = hdr[0].toInt() and 0xFF
+            // Skip ChangeCipherSpec records (TLS 1.3 middlebox compat, RFC 8446 §5.1).
+            // The server sends CCS after ServerHello.
+            if (gotType == (TLS_CCS.toInt() and 0xFF)) {
+                val length = ((hdr[3].toInt() and 0xFF) shl 8) or (hdr[4].toInt() and 0xFF)
+                if (length in 1..MAX_OBFS_PAYLOAD) {
+                    readFully(length) // discard CCS payload
+                }
+                continue
+            }
+            if (gotType != wantType) {
+                throw IllegalStateException("obfs: unexpected record type 0x%02x (want 0x%02x)".format(gotType, wantType))
+            }
+            val length = ((hdr[3].toInt() and 0xFF) shl 8) or (hdr[4].toInt() and 0xFF)
+            if (length == 0 || length > MAX_OBFS_PAYLOAD) {
+                throw IllegalStateException("obfs: invalid record length $length")
+            }
+            return readFully(length)
         }
-        val length = ((hdr[3].toInt() and 0xFF) shl 8) or (hdr[4].toInt() and 0xFF)
-        if (length == 0 || length > MAX_OBFS_PAYLOAD) {
-            throw IllegalStateException("obfs: invalid record length $length")
-        }
-        return readFully(length)
     }
 
     private fun readHandshakeRecord(wantMsgType: Int) {

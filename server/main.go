@@ -546,6 +546,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	// handshake at WARN level — and neither should we.
 	obfs := transport.NewObfsConn(bufConn)
 	if err := obfs.ServerHandshake(); err != nil {
+		// Mimic real TLS server: send plaintext Alert(fatal, decode_error=50)
+		// when the ClientHello cannot be parsed. This is what nginx/Apache do.
+		sendPlaintextTLSAlert(conn, 0x02, 50)
 		s.logger.Debug("obfs handshake failed", "err", err)
 		return
 	}
@@ -557,9 +560,15 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 	session, err := s.doNoiseHandshake(obfs)
 	if err != nil {
-		// DEBUG level: probes replaying partial handshakes trigger this path.
-		// WARN would create log noise during mass scanning, fingerprinting
-		// the server as a VPN to anyone with log access.
+		// Mimic real TLS 1.3 server error: send "encrypted" post-handshake
+		// records (EncryptedExtensions + Certificate + Finished) + fatal alert.
+		// Since ServerHello + CCS were already sent, a real TLS server would
+		// send encrypted records next. Our random-filled app_data records are
+		// indistinguishable from real AEAD ciphertext on the wire.
+		// (TrojanProbe, ScienceDirect 2024: servers that close without post-SH
+		// records are fingerprinted as proxy/VPN.)
+		sendTLS13FallbackRecords(bufConn)
+		bufConn.Flush()
 		s.logger.Debug("noise handshake failed", "err", err)
 		return
 	}
@@ -568,8 +577,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 
 	// Check if this key is allowed.
-	// DEBUG level: a probe that somehow completes Noise with a random key
-	// should not produce visible log entries.
+	// No TLS fallback here: if Noise completed, the client already proved
+	// it can speak the VPN protocol (has a valid keypair). TLS fallback is
+	// only useful when Noise FAILS, making the server look like a broken TLS
+	// endpoint to probes that never get past the TLS handshake phase.
 	if !s.isKeyAllowed(session.RemoteStatic) {
 		s.logger.Debug("key not allowed", "key", hex.EncodeToString(session.RemoteStatic[:]))
 		return
@@ -1543,6 +1554,7 @@ func main() {
 	var knockKeyHex string
 	var relayMetricsAddr string
 	var diagnosticsFile string
+	var coverAddr string
 	var openAccess bool
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
 	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
@@ -1561,6 +1573,7 @@ func main() {
 	flag.StringVar(&knockKeyHex, "knock-key", "", "hex-encoded 32-byte PSK for relay port knocking (Reality-style HMAC in session_id); client must use the same key")
 	flag.StringVar(&relayMetricsAddr, "relay-metrics-addr", ":9092", "relay metrics HTTP server address (per-segment throughput for AI diagnostics; empty to disable)")
 	flag.StringVar(&diagnosticsFile, "diagnostics-file", "", "path to append telemetry reports as JSONL (e.g. /var/log/cavadvpn/diagnostics.jsonl)")
+	flag.StringVar(&coverAddr, "cover-addr", "", "listen address for plain HTTP cover website (e.g. :80); serves the cooking blog to censorship scanners checking port 80")
 	flag.Parse()
 
 	// Anthropic API key: flag takes precedence, then environment variable.
@@ -1610,6 +1623,18 @@ func main() {
 		}
 
 		logger.Info("starting in relay mode", "listen", cfg.ListenAddr, "upstream", relayTo)
+		// HTTP cover site on port 80 (optional).
+		// Censorship systems (ТСПУ/GFW) routinely check port 80 to classify
+		// IP addresses. A cooking blog on :80 makes the relay look like a
+		// normal web server to any scanner.
+		if coverAddr != "" {
+			go func() {
+				logger.Info("cover HTTP listener starting", "addr", coverAddr)
+				if err := serveCoverHTTP(coverAddr, nil); err != nil {
+					logger.Warn("cover HTTP listener failed", "addr", coverAddr, "err", err)
+				}
+			}()
+		}
 		// Start per-segment metrics server (used by AI diagnostics to identify bottleneck).
 		if relayMetricsAddr != "" {
 			go startRelayMetricsServer(relayMetricsAddr, logger)
@@ -1670,6 +1695,18 @@ func main() {
 	defer stop()
 
 	apiSrv := startAPIServer(ctx, apiCfg, srv, logger, anthropicKey, diagnosticsFile)
+
+	// HTTP cover site on port 80 (optional).
+	// Same as in relay mode: a cooking blog on :80 makes the server appear
+	// as a normal web host to censorship scanners.
+	if coverAddr != "" {
+		go func() {
+			logger.Info("cover HTTP listener starting", "addr", coverAddr)
+			if err := serveCoverHTTP(coverAddr, nil); err != nil {
+				logger.Warn("cover HTTP listener failed", "addr", coverAddr, "err", err)
+			}
+		}()
+	}
 
 	// Start VLESS+WS+TLS listener if configured.
 	if vlessAddr != "" {

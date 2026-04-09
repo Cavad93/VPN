@@ -56,6 +56,7 @@ logger = structlog.get_logger(__name__)
 # TLS wire-format constants (shared with core.py / obfs.go)
 # ---------------------------------------------------------------------------
 
+TLS_RECORD_CCS = 0x14  # ChangeCipherSpec (middlebox compat, RFC 8446 §5.1)
 TLS_RECORD_HANDSHAKE = 0x16
 TLS_RECORD_APPDATA = 0x17
 TLS_VERSION_MAJOR = 0x03
@@ -545,15 +546,23 @@ class SNISpoofConn:
         return buf
 
     def _read_record(self, want_type: int) -> bytes:
-        hdr = self._recv_exactly(5)
-        if hdr[0] != want_type:
-            raise ValueError(
-                f"unexpected TLS record type 0x{hdr[0]:02x}, want 0x{want_type:02x}"
-            )
-        length = struct.unpack(">H", hdr[3:5])[0]
-        if length == 0 or length > MAX_OBFS_PAYLOAD:
-            raise ValueError(f"invalid TLS record length {length}")
-        return self._recv_exactly(length)
+        while True:
+            hdr = self._recv_exactly(5)
+            # Skip ChangeCipherSpec records (TLS 1.3 middlebox compat,
+            # RFC 8446 §5.1). The server sends CCS after ServerHello.
+            if hdr[0] == TLS_RECORD_CCS:
+                length = struct.unpack(">H", hdr[3:5])[0]
+                if 0 < length <= MAX_OBFS_PAYLOAD:
+                    self._recv_exactly(length)  # discard CCS payload
+                continue
+            if hdr[0] != want_type:
+                raise ValueError(
+                    f"unexpected TLS record type 0x{hdr[0]:02x}, want 0x{want_type:02x}"
+                )
+            length = struct.unpack(">H", hdr[3:5])[0]
+            if length == 0 or length > MAX_OBFS_PAYLOAD:
+                raise ValueError(f"invalid TLS record length {length}")
+            return self._recv_exactly(length)
 
     def _read_handshake_record(self, want_msg_type: int) -> None:
         payload = self._read_record(TLS_RECORD_HANDSHAKE)

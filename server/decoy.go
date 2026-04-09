@@ -25,6 +25,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"net"
 	"sync/atomic"
@@ -222,4 +224,99 @@ func serveCoverSiteFromPrefix(conn net.Conn, prefix []byte) {
 	pc := &prefixConn{Conn: conn, prefix: prefix}
 	_ = pc.SetReadDeadline(time.Time{})
 	serveCoverSite(pc)
+}
+
+// ---------------------------------------------------------------------------
+// TLS 1.3 fallback records for anti-probing
+// ---------------------------------------------------------------------------
+//
+// When a connection passes the TLS handshake (ObfsConn) but fails Noise
+// authentication, the server must behave like a real TLS 1.3 server that
+// encountered a fatal error during the post-ServerHello handshake phase.
+//
+// In real TLS 1.3, all records after ServerHello are encrypted (wrapped in
+// application_data records with content type 0x17). A passive observer sees
+// only random-looking payloads — our random-filled records are byte-identical
+// in distribution.
+//
+// Scientific basis:
+//   - RFC 8446 §5.1: CCS for middlebox compatibility
+//   - RFC 8446 §6: alerts after ServerHello encrypted as application_data
+//   - TrojanProbe (ScienceDirect 2024): servers that close without sending
+//     post-ServerHello records are fingerprinted as proxy/VPN software
+//   - Frolov & Wustrow (NDSS 2019): TLS fingerprinting detects missing CCS
+// ---------------------------------------------------------------------------
+
+// sendTLS13FallbackRecords writes a realistic TLS 1.3 post-handshake error
+// sequence to w. Called when ObfsConn succeeded (ServerHello + CCS were sent)
+// but Noise authentication failed.
+//
+// Wire sequence matches real TLS 1.3 server behavior on handshake error:
+//
+//	17 03 03 XX XX [random ~280-430 bytes]  — "encrypted" EncryptedExtensions
+//	17 03 03 XX XX [random ~1050-2000 bytes] — "encrypted" Certificate
+//	17 03 03 XX XX [random ~115-195 bytes]  — "encrypted" CertificateVerify
+//	17 03 03 XX XX [random ~52-72 bytes]    — "encrypted" Finished
+//	17 03 03 XX XX [random ~19-31 bytes]    — "encrypted" fatal alert
+//	[TCP close]
+//
+// All payloads are crypto/rand — computationally indistinguishable from
+// real AEAD ciphertext.
+func sendTLS13FallbackRecords(w io.Writer) {
+	// "Encrypted" post-handshake records with realistic size distribution.
+	// Sizes match nginx/Apache TLS 1.3 traffic patterns.
+	sizes := [5]int{
+		280 + cryptoRandIntn(150),  // EncryptedExtensions (~280-429)
+		1050 + cryptoRandIntn(950), // Certificate (~1050-1999)
+		115 + cryptoRandIntn(80),   // CertificateVerify (~115-194)
+		52 + cryptoRandIntn(20),    // Finished (~52-71)
+		19 + cryptoRandIntn(12),    // Fatal alert (~19-30)
+	}
+	for _, size := range sizes {
+		writeFakeAppDataRecord(w, size)
+	}
+}
+
+// sendPlaintextTLSAlert writes a plaintext TLS alert record to w.
+// Used when the ObfsConn handshake fails BEFORE ServerHello is sent —
+// at this point the connection is still in plaintext TLS mode.
+//
+// A real TLS server that cannot parse the ClientHello sends:
+//
+//	15 03 03 00 02 02 XX
+//	^  ^---^  ^---^  ^  ^-- alert description
+//	|  |      |      +--- alert level: fatal (0x02)
+//	|  |      +---------- length: 2
+//	|  +----------------- version: TLS 1.2 (legacy)
+//	+-------------------- content_type: Alert (0x15)
+//
+// Common descriptions: decode_error(50), handshake_failure(40),
+// protocol_version(70), internal_error(80).
+func sendPlaintextTLSAlert(w io.Writer, level, desc byte) {
+	alert := [7]byte{0x15, 0x03, 0x03, 0x00, 0x02, level, desc}
+	w.Write(alert[:]) //nolint:errcheck
+}
+
+// writeFakeAppDataRecord writes one TLS application_data record with
+// random content. The content is crypto/rand so it's indistinguishable
+// from real AEAD-encrypted TLS data.
+func writeFakeAppDataRecord(w io.Writer, size int) {
+	rec := make([]byte, 5+size)
+	rec[0] = 0x17 // application_data
+	rec[1] = 0x03
+	rec[2] = 0x03
+	binary.BigEndian.PutUint16(rec[3:5], uint16(size))
+	rand.Read(rec[5:]) //nolint:errcheck
+	w.Write(rec)       //nolint:errcheck
+}
+
+// cryptoRandIntn returns a random int in [0, n) using crypto/rand.
+// Used for size randomization of fake TLS records.
+func cryptoRandIntn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	var b [2]byte
+	rand.Read(b[:]) //nolint:errcheck
+	return int(binary.BigEndian.Uint16(b[:])) % n
 }

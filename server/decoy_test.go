@@ -573,3 +573,144 @@ func TestPeekAndRouteKnockTimeoutSilentClose(t *testing.T) {
 		t.Fatal("expected closed connection after timeout")
 	}
 }
+
+// --- sendTLS13FallbackRecords tests -----------------------------------------
+
+func TestSendTLS13FallbackRecordsWritesValidTLSRecords(t *testing.T) {
+	var buf bytes.Buffer
+	sendTLS13FallbackRecords(&buf)
+
+	data := buf.Bytes()
+	if len(data) < 100 {
+		t.Fatalf("expected substantial TLS fallback data, got %d bytes", len(data))
+	}
+
+	// Parse the output: should be exactly 5 TLS application_data records.
+	offset := 0
+	recordCount := 0
+	for offset < len(data) {
+		if offset+5 > len(data) {
+			t.Fatalf("truncated record header at offset %d", offset)
+		}
+		contentType := data[offset]
+		if contentType != 0x17 {
+			t.Fatalf("record %d: expected app_data (0x17), got 0x%02x at offset %d",
+				recordCount, contentType, offset)
+		}
+		// Version should be TLS 1.2 (0x03 0x03)
+		if data[offset+1] != 0x03 || data[offset+2] != 0x03 {
+			t.Fatalf("record %d: unexpected version %02x%02x",
+				recordCount, data[offset+1], data[offset+2])
+		}
+		length := int(data[offset+3])<<8 | int(data[offset+4])
+		if length == 0 || length > 16383 {
+			t.Fatalf("record %d: invalid length %d", recordCount, length)
+		}
+		offset += 5 + length
+		recordCount++
+	}
+
+	if recordCount != 5 {
+		t.Fatalf("expected 5 TLS records, got %d", recordCount)
+	}
+}
+
+func TestSendTLS13FallbackRecordsSizeDistribution(t *testing.T) {
+	// Run multiple times to check randomness in sizes.
+	for i := 0; i < 5; i++ {
+		var buf bytes.Buffer
+		sendTLS13FallbackRecords(&buf)
+
+		data := buf.Bytes()
+		offset := 0
+		var sizes []int
+		for offset < len(data) {
+			length := int(data[offset+3])<<8 | int(data[offset+4])
+			sizes = append(sizes, length)
+			offset += 5 + length
+		}
+
+		if len(sizes) != 5 {
+			t.Fatalf("iter %d: expected 5 records, got %d", i, len(sizes))
+		}
+		// EncryptedExtensions: 280-429
+		if sizes[0] < 280 || sizes[0] > 429 {
+			t.Errorf("iter %d: EncryptedExtensions size %d out of range [280, 429]", i, sizes[0])
+		}
+		// Certificate: 1050-1999
+		if sizes[1] < 1050 || sizes[1] > 1999 {
+			t.Errorf("iter %d: Certificate size %d out of range [1050, 1999]", i, sizes[1])
+		}
+		// CertificateVerify: 115-194
+		if sizes[2] < 115 || sizes[2] > 194 {
+			t.Errorf("iter %d: CertificateVerify size %d out of range [115, 194]", i, sizes[2])
+		}
+		// Finished: 52-71
+		if sizes[3] < 52 || sizes[3] > 71 {
+			t.Errorf("iter %d: Finished size %d out of range [52, 71]", i, sizes[3])
+		}
+		// Alert: 19-30
+		if sizes[4] < 19 || sizes[4] > 30 {
+			t.Errorf("iter %d: Alert size %d out of range [19, 30]", i, sizes[4])
+		}
+	}
+}
+
+func TestSendPlaintextTLSAlertFormat(t *testing.T) {
+	var buf bytes.Buffer
+	sendPlaintextTLSAlert(&buf, 0x02, 50) // fatal + decode_error
+
+	data := buf.Bytes()
+	expected := []byte{0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 50}
+	if !bytes.Equal(data, expected) {
+		t.Fatalf("TLS alert format mismatch:\n  got:  %x\n  want: %x", data, expected)
+	}
+}
+
+func TestSendPlaintextTLSAlertDifferentCodes(t *testing.T) {
+	tests := []struct {
+		name  string
+		level byte
+		desc  byte
+	}{
+		{"fatal_handshake_failure", 0x02, 40},
+		{"fatal_decode_error", 0x02, 50},
+		{"fatal_internal_error", 0x02, 80},
+		{"warning_close_notify", 0x01, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			sendPlaintextTLSAlert(&buf, tt.level, tt.desc)
+			data := buf.Bytes()
+			if len(data) != 7 {
+				t.Fatalf("expected 7 bytes, got %d", len(data))
+			}
+			if data[0] != 0x15 {
+				t.Fatalf("content_type: got 0x%02x, want 0x15", data[0])
+			}
+			if data[5] != tt.level {
+				t.Fatalf("level: got 0x%02x, want 0x%02x", data[5], tt.level)
+			}
+			if data[6] != tt.desc {
+				t.Fatalf("desc: got 0x%02x, want 0x%02x", data[6], tt.desc)
+			}
+		})
+	}
+}
+
+func TestCryptoRandIntn(t *testing.T) {
+	// Verify range [0, n) for various n values.
+	for _, n := range []int{1, 10, 100, 256, 1000} {
+		for i := 0; i < 100; i++ {
+			v := cryptoRandIntn(n)
+			if v < 0 || v >= n {
+				t.Fatalf("cryptoRandIntn(%d) = %d, out of range", n, v)
+			}
+		}
+	}
+	// Edge case: n=0.
+	if v := cryptoRandIntn(0); v != 0 {
+		t.Fatalf("cryptoRandIntn(0) = %d, want 0", v)
+	}
+}

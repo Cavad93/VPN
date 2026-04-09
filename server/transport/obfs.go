@@ -28,6 +28,7 @@ import (
 
 // TLS record content types.
 const (
+	tlsRecordCCS       = byte(0x14) // ChangeCipherSpec (middlebox compat, RFC 8446 §5.1)
 	tlsRecordHandshake = byte(0x16)
 	tlsRecordAppData   = byte(0x17)
 )
@@ -123,13 +124,26 @@ func (c *ObfsConn) ClientHandshake() error {
 	return c.readHandshakeRecord(tlsHelloServer)
 }
 
-// ServerHandshake reads the ClientHello and sends a synthetic ServerHello.
+// ServerHandshake reads the ClientHello and sends a synthetic ServerHello
+// followed by a ChangeCipherSpec record (RFC 8446 §5.1 middlebox compat).
+//
+// Real TLS 1.3 servers send CCS immediately after ServerHello. Without this,
+// active probes can fingerprint the server by observing that no CCS follows
+// the ServerHello — a pattern unique to non-standard TLS implementations.
+// (Frolov & Wustrow, NDSS 2019: "The use of TLS in Censorship Circumvention")
+//
 // Must be called exactly once before the first Write/Read on the responder.
 func (c *ObfsConn) ServerHandshake() error {
 	if err := c.readHandshakeRecord(tlsHelloClient); err != nil {
 		return err
 	}
-	_, err := c.conn.Write(buildServerHello())
+	// Send ServerHello + CCS in one write for TCP coalescing.
+	sh := buildServerHello()
+	ccs := buildChangeCipherSpec()
+	combined := make([]byte, len(sh)+len(ccs))
+	copy(combined, sh)
+	copy(combined[len(sh):], ccs)
+	_, err := c.conn.Write(combined)
 	return err
 }
 
@@ -170,15 +184,32 @@ func (c *ObfsConn) Write(p []byte) (int, error) {
 // payload, subsequent calls continue draining the current record before
 // decoding the next header.
 //
+// ChangeCipherSpec records (0x14) are silently skipped — the server sends
+// CCS after ServerHello for TLS 1.3 middlebox compatibility (RFC 8446 §5.1).
+// CCS appears at most once per connection, so the branch adds negligible
+// overhead to the hot path (one byte comparison per record header).
+//
 // Single-buffer design: data flows network → bufio.Reader → p with no
 // intermediate allocations.  readBufRemaining tracks how many payload bytes
 // remain in the current TLS record so that bufio.Reader serves as the sole
 // buffer in the system — eliminating the old separate readBuf allocation.
 func (c *ObfsConn) Read(p []byte) (int, error) {
 	if c.readBufRemaining == 0 {
-		// Decode the next TLS record header.
-		if _, err := io.ReadFull(c.bufr, c.hdr[:]); err != nil {
-			return 0, err
+		// Decode the next TLS record header, skipping CCS records.
+		for {
+			if _, err := io.ReadFull(c.bufr, c.hdr[:]); err != nil {
+				return 0, err
+			}
+			if c.hdr[0] == tlsRecordCCS {
+				// CCS payload is typically 1 byte (0x01). Discard.
+				length := int(binary.BigEndian.Uint16(c.hdr[3:5]))
+				if length > 0 && length <= maxObfsPayload {
+					discard := make([]byte, length)
+					io.ReadFull(c.bufr, discard) //nolint:errcheck
+				}
+				continue
+			}
+			break
 		}
 		if c.hdr[0] != tlsRecordAppData {
 			return 0, errors.New("obfs: unexpected TLS record content type")
@@ -227,22 +258,42 @@ func (c *ObfsConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteD
 // Used only during handshake; the hot-path Read() inlines the header parsing
 // to avoid the intermediate allocation.
 // Reads go through the buffered reader (c.bufr) to reduce syscalls.
+//
+// ChangeCipherSpec records (0x14) are silently skipped — this is required
+// because real TLS 1.3 servers send CCS for middlebox compatibility
+// (RFC 8446 §5.1). Our ServerHandshake sends CCS after ServerHello, so
+// the client must skip it when reading the handshake response.
 func (c *ObfsConn) readRecord(wantType byte) ([]byte, error) {
-	if _, err := io.ReadFull(c.bufr, c.hdr[:]); err != nil {
-		return nil, err
+	for {
+		if _, err := io.ReadFull(c.bufr, c.hdr[:]); err != nil {
+			return nil, err
+		}
+		// Skip ChangeCipherSpec records (TLS 1.3 middlebox compatibility).
+		// CCS payload is always 1 byte (0x01). Read and discard.
+		if c.hdr[0] == tlsRecordCCS {
+			length := binary.BigEndian.Uint16(c.hdr[3:5])
+			if length == 0 || length > maxObfsPayload {
+				return nil, errors.New("obfs: invalid CCS record length")
+			}
+			discard := make([]byte, length)
+			if _, err := io.ReadFull(c.bufr, discard); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if c.hdr[0] != wantType {
+			return nil, errors.New("obfs: unexpected TLS record content type")
+		}
+		length := binary.BigEndian.Uint16(c.hdr[3:5])
+		if length == 0 || length > maxObfsPayload {
+			return nil, errors.New("obfs: invalid TLS record length")
+		}
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(c.bufr, payload); err != nil {
+			return nil, err
+		}
+		return payload, nil
 	}
-	if c.hdr[0] != wantType {
-		return nil, errors.New("obfs: unexpected TLS record content type")
-	}
-	length := binary.BigEndian.Uint16(c.hdr[3:5])
-	if length == 0 || length > maxObfsPayload {
-		return nil, errors.New("obfs: invalid TLS record length")
-	}
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(c.bufr, payload); err != nil {
-		return nil, err
-	}
-	return payload, nil
 }
 
 // readHandshakeRecord reads a TLS handshake record and checks the message type.
@@ -330,6 +381,19 @@ func buildServerHello() []byte {
 	body = append(body, 0x00)         // compression_method: null
 
 	return wrapHandshakeRecord(tlsHelloServer, body)
+}
+
+// buildChangeCipherSpec returns a TLS ChangeCipherSpec record.
+// In TLS 1.3 this is a no-op sent for middlebox compatibility (RFC 8446 §5.1).
+// All major browsers and servers send this after ServerHello. Wire format:
+//
+//	14 03 03 00 01 01
+//	^  ^---^  ^---^  ^-- payload: single byte 0x01
+//	|  |      +---- length: 1
+//	|  +----------- version: TLS 1.2 (legacy)
+//	+-------------- content_type: ChangeCipherSpec
+func buildChangeCipherSpec() []byte {
+	return []byte{tlsRecordCCS, tlsVersionMajor, tlsVersionMinor, 0x00, 0x01, 0x01}
 }
 
 // wrapHandshakeRecord wraps a handshake message body inside a TLS record.

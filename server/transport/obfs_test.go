@@ -449,3 +449,145 @@ func TestObfsReadEOF(t *testing.T) {
 	}
 	cRaw.Close()
 }
+
+// ---------------------------------------------------------------------------
+// ChangeCipherSpec (CCS) — TLS 1.3 middlebox compatibility
+// ---------------------------------------------------------------------------
+
+func TestObfsBuildChangeCipherSpec(t *testing.T) {
+	t.Parallel()
+	ccs := buildChangeCipherSpec()
+	expected := []byte{0x14, 0x03, 0x03, 0x00, 0x01, 0x01}
+	if !bytes.Equal(ccs, expected) {
+		t.Fatalf("CCS record mismatch:\n  got:  %x\n  want: %x", ccs, expected)
+	}
+}
+
+func TestObfsServerHandshakeSendsCCS(t *testing.T) {
+	// Verify that ServerHandshake sends ServerHello + CCS.
+	// We manually read the raw wire output to check for the CCS record.
+	t.Parallel()
+
+	cRaw, sRaw := net.Pipe()
+	defer cRaw.Close()
+	defer sRaw.Close()
+
+	// Server runs handshake in background.
+	var sErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server := NewObfsConn(sRaw)
+		sErr = server.ServerHandshake()
+	}()
+
+	// Client: send a valid ClientHello first.
+	clientHello := buildClientHello()
+	if _, err := cRaw.Write(clientHello); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read raw output from server.
+	rawBuf := make([]byte, 4096)
+	n, err := cRaw.Read(rawBuf)
+	if err != nil {
+		t.Fatalf("read server response: %v", err)
+	}
+
+	<-done
+	if sErr != nil {
+		t.Fatalf("ServerHandshake: %v", sErr)
+	}
+
+	// Parse: first record should be ServerHello (0x16), second should be CCS (0x14).
+	offset := 0
+	// Record 1: ServerHello
+	if rawBuf[offset] != 0x16 {
+		t.Fatalf("first record type: got 0x%02x, want 0x16", rawBuf[offset])
+	}
+	shLen := int(rawBuf[offset+3])<<8 | int(rawBuf[offset+4])
+	offset += 5 + shLen
+
+	// Record 2: CCS
+	if offset >= n {
+		t.Fatal("no CCS record found after ServerHello")
+	}
+	if rawBuf[offset] != 0x14 {
+		t.Fatalf("second record type: got 0x%02x, want 0x14 (CCS)", rawBuf[offset])
+	}
+	ccsLen := int(rawBuf[offset+3])<<8 | int(rawBuf[offset+4])
+	if ccsLen != 1 {
+		t.Fatalf("CCS payload length: got %d, want 1", ccsLen)
+	}
+	if rawBuf[offset+5] != 0x01 {
+		t.Fatalf("CCS payload: got 0x%02x, want 0x01", rawBuf[offset+5])
+	}
+}
+
+func TestObfsClientHandshakeSkipsCCS(t *testing.T) {
+	// Verify that ClientHandshake successfully handles a ServerHello + CCS.
+	// This tests the readRecord CCS-skip logic end-to-end.
+	t.Parallel()
+
+	client, server := newObfsPair(t)
+	defer client.Close()
+	defer server.Close()
+
+	// If we get here without error, CCS was handled correctly.
+	// Send data through to verify the connection still works.
+	testData := []byte("hello after CCS handshake")
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		client.Write(testData)
+	}()
+
+	buf := make([]byte, len(testData))
+	if _, err := io.ReadFull(server, buf); err != nil {
+		t.Fatalf("read after handshake: %v", err)
+	}
+	wg.Wait()
+	if !bytes.Equal(buf, testData) {
+		t.Fatalf("data mismatch: got %q, want %q", buf, testData)
+	}
+}
+
+func TestObfsReadRecordSkipsCCSMidStream(t *testing.T) {
+	// Verify that readRecord skips CCS records even if they appear between
+	// other records (defensive coding — shouldn't happen in practice but the
+	// code should handle it gracefully).
+	t.Parallel()
+
+	cRaw, sRaw := net.Pipe()
+	defer cRaw.Close()
+	defer sRaw.Close()
+
+	conn := NewObfsConn(cRaw)
+
+	// Feed: CCS record + ServerHello record on sRaw.
+	go func() {
+		// CCS
+		sRaw.Write([]byte{0x14, 0x03, 0x03, 0x00, 0x01, 0x01})
+		// ServerHello (minimal valid record)
+		body := make([]byte, 36)
+		body[0] = 0x02 // ServerHello msg type
+		body[1] = 0x00
+		body[2] = 0x00
+		body[3] = 0x20 // 32 bytes body
+		rec := make([]byte, 5+len(body))
+		rec[0] = 0x16
+		rec[1] = 0x03
+		rec[2] = 0x03
+		rec[3] = byte(len(body) >> 8)
+		rec[4] = byte(len(body))
+		copy(rec[5:], body)
+		sRaw.Write(rec)
+	}()
+
+	// readHandshakeRecord should skip the CCS and return ServerHello.
+	err := conn.readHandshakeRecord(tlsHelloServer)
+	if err != nil {
+		t.Fatalf("readHandshakeRecord should skip CCS: %v", err)
+	}
+}
