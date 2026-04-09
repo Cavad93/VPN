@@ -1508,3 +1508,12 @@ appLimited := len(c.pending) == 0
 - `server/cmd/vpnclient/main.go` — `sc.sess.knockKey` → `vs.knockKey`
 
 **Следующий шаг:** Пересобрать VPN сервер на Астане и vpnclient на MacBook. Замерить download speed — ожидается рост до 7-9 Mbps.
+
+**Замер после деплоя (2026-04-10):**
+
+| Метрика | До fix (#18) | После fix (#18) | Изменение |
+|---------|-------------|-----------------|-----------|
+| Download | 3.50 Mbps | **6.0 Mbps** | **+71%** |
+| Upload | 9.52 Mbps | ~9.5 Mbps | без изменений |
+
+Download 6.0 Mbps = 83% от теоретического потолка (upload SPB = 7.64 Mbps → max download ≈ 7.2 Mbps с overhead). Оставшийся зазор (~1.2 Mbps) объясняется packet loss на маршруте SPB↔Астана и BBR ProbeRTT duty cycle (200ms/10s = 2%).
