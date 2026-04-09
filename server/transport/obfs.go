@@ -201,11 +201,11 @@ func (c *ObfsConn) Read(p []byte) (int, error) {
 				return 0, err
 			}
 			if c.hdr[0] == tlsRecordCCS {
-				// CCS payload is typically 1 byte (0x01). Discard.
-				length := int(binary.BigEndian.Uint16(c.hdr[3:5]))
-				if length > 0 && length <= maxObfsPayload {
-					discard := make([]byte, length)
-					io.ReadFull(c.bufr, discard) //nolint:errcheck
+				// CCS payload is typically 1 byte (0x01). Discard without
+				// allocation — io.Discard uses an internal pooled buffer.
+				length := int64(binary.BigEndian.Uint16(c.hdr[3:5]))
+				if length > 0 && length <= int64(maxObfsPayload) {
+					io.CopyN(io.Discard, c.bufr, length) //nolint:errcheck
 				}
 				continue
 			}
@@ -271,12 +271,12 @@ func (c *ObfsConn) readRecord(wantType byte) ([]byte, error) {
 		// Skip ChangeCipherSpec records (TLS 1.3 middlebox compatibility).
 		// CCS payload is always 1 byte (0x01). Read and discard.
 		if c.hdr[0] == tlsRecordCCS {
-			length := binary.BigEndian.Uint16(c.hdr[3:5])
-			if length == 0 || length > maxObfsPayload {
+			length := int64(binary.BigEndian.Uint16(c.hdr[3:5]))
+			if length == 0 || length > int64(maxObfsPayload) {
 				return nil, errors.New("obfs: invalid CCS record length")
 			}
-			discard := make([]byte, length)
-			if _, err := io.ReadFull(c.bufr, discard); err != nil {
+			// Discard CCS payload without heap allocation.
+			if _, err := io.CopyN(io.Discard, c.bufr, length); err != nil {
 				return nil, err
 			}
 			continue

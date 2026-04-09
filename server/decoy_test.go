@@ -38,8 +38,11 @@ func newLocalTCPPair(t *testing.T) (client, server net.Conn) {
 		ln.Close()
 		t.Fatalf("dial: %v", err)
 	}
-	ln.Close()
+	// Wait for Accept to complete before closing listener —
+	// closing before Accept returns causes a race where Accept
+	// gets an error and the channel receives nil.
 	sConn := <-acceptCh
+	ln.Close()
 	if sConn == nil {
 		cConn.Close()
 		t.Fatal("server accept returned nil")
