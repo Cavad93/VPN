@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -540,13 +541,14 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	// reducing per-packet TCP/IP overhead (~40 bytes/segment) by ~40%.
 	bufConn := transport.NewBufConn(conn)
 
-	// TLS obfuscation handshake.
-	// Failures are logged at DEBUG to avoid exposing VPN presence during
-	// mass scanning. A real HTTPS server would not log every bad TLS
-	// handshake at WARN level — and neither should we.
+	// TLS obfuscation handshake
 	obfs := transport.NewObfsConn(bufConn)
 	if err := obfs.ServerHandshake(); err != nil {
-		s.logger.Debug("obfs handshake failed", "err", err)
+		// Debug level: TLS probes that fail ObfsConn are expected during
+		// active probing. Logging at Warn would fingerprint the server.
+		s.logger.Debug("obfs handshake failed", "remote", conn.RemoteAddr())
+		// Drain silently per gfw.report — deny timing information.
+		drainConn(conn)
 		return
 	}
 
@@ -557,21 +559,18 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 	session, err := s.doNoiseHandshake(obfs)
 	if err != nil {
-		// DEBUG level: probes replaying partial handshakes trigger this path.
-		// WARN would create log noise during mass scanning, fingerprinting
-		// the server as a VPN to anyone with log access.
-		s.logger.Debug("noise handshake failed", "err", err)
+		s.logger.Debug("noise handshake failed", "remote", conn.RemoteAddr())
+		drainConn(conn)
 		return
 	}
 	if s.Perf != nil {
 		s.Perf.TrackLatency(perf.StageHandshake, time.Since(hsStart))
 	}
 
-	// Check if this key is allowed.
-	// DEBUG level: a probe that somehow completes Noise with a random key
-	// should not produce visible log entries.
+	// Check if this key is allowed
 	if !s.isKeyAllowed(session.RemoteStatic) {
-		s.logger.Debug("key not allowed", "key", hex.EncodeToString(session.RemoteStatic[:]))
+		s.logger.Debug("key not allowed", "remote", conn.RemoteAddr())
+		drainConn(conn)
 		return
 	}
 
@@ -604,7 +603,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	case ctlSecondary:
 		s.runSecondaryConn(ctx, session.RemoteStatic, firstStream, mux)
 	default:
-		s.logger.Warn("unknown ctl type", "type", typeBuf[0])
+		s.logger.Debug("unknown ctl type", "type", typeBuf[0])
 		firstStream.Close()
 		mux.Close()
 	}
@@ -1542,6 +1541,7 @@ func main() {
 	var relayTo string
 	var relayMetricsAddr string
 	var diagnosticsFile string
+	var httpFallbackAddr string
 	var openAccess bool
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
 	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
@@ -1559,6 +1559,7 @@ func main() {
 	flag.StringVar(&relayTo, "relay-to", "", "relay VPN traffic to this upstream address (e.g. 193.124.93.240:8443); disables local VPN termination")
 	flag.StringVar(&relayMetricsAddr, "relay-metrics-addr", ":9092", "relay metrics HTTP server address (per-segment throughput for AI diagnostics; empty to disable)")
 	flag.StringVar(&diagnosticsFile, "diagnostics-file", "", "path to append telemetry reports as JSONL (e.g. /var/log/cavadvpn/diagnostics.jsonl)")
+	flag.StringVar(&httpFallbackAddr, "http-addr", "", "optional plain HTTP listener for fallback cooking blog (e.g. :80); makes the server look like a normal website to port scanners")
 	flag.Parse()
 
 	// Anthropic API key: flag takes precedence, then environment variable.
@@ -1583,6 +1584,26 @@ func main() {
 	// Verify BBR is actually loaded — a missing tcp_bbr module silently
 	// falls back to CUBIC, causing 10× worse throughput on lossy links.
 	verifyBBR(logger)
+
+	// ── Optional plain HTTP fallback server ───────────────────────────────────
+	// Serves the cooking blog on a separate port (e.g. :80) so that port
+	// scanners checking common ports see a normal website. This runs in both
+	// relay mode and VPN mode.
+	if httpFallbackAddr != "" {
+		go func() {
+			srv := &http.Server{
+				Addr:         httpFallbackAddr,
+				Handler:      newFallbackHTTPHandler(),
+				ReadTimeout:  10 * time.Second,
+				WriteTimeout: 10 * time.Second,
+				IdleTimeout:  30 * time.Second,
+			}
+			logger.Info("fallback HTTP server listening", "addr", httpFallbackAddr)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Warn("fallback HTTP server error", "err", err)
+			}
+		}()
+	}
 
 	// ── Relay mode ────────────────────────────────────────────────────────────
 	// When -relay-to is set the process acts as a transparent TCP relay:
