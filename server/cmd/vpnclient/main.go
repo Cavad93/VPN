@@ -502,8 +502,8 @@ func (vs *vpnSession) connectSecondary(assignedIP string) (*secondaryConn, error
 
 	// 2. TLS obfuscation (with optional port-knock).
 	obfs := transport.NewObfsConn(bufConn2)
-	if sc.sess.knockKey != nil {
-		obfs.WithKnock(*sc.sess.knockKey)
+	if vs.knockKey != nil {
+		obfs.WithKnock(*vs.knockKey)
 	}
 	if err := obfs.ClientHandshake(); err != nil {
 		cleanupConn()
