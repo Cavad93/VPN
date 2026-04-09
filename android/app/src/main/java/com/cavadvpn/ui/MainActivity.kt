@@ -5,14 +5,17 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.drawable.GradientDrawable
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.view.View
-import android.widget.Button
+import android.view.animation.AccelerateDecelerateInterpolator
+import android.widget.ImageButton
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import com.cavadvpn.R
 import com.cavadvpn.config.ConfigStore
 import com.cavadvpn.crypto.generateKeyPair
@@ -21,6 +24,7 @@ import com.cavadvpn.vpn.ACTION_DISCONNECT
 import com.cavadvpn.vpn.ACTION_STATS_UPDATE
 import com.cavadvpn.vpn.ACTION_VPN_STATE_CHANGED
 import com.cavadvpn.vpn.CavadVpnService
+import com.cavadvpn.vpn.EXTRA_KNOCK_KEY
 import com.cavadvpn.vpn.EXTRA_PRIVATE_KEY
 import com.cavadvpn.vpn.EXTRA_SERVER_HOST
 import com.cavadvpn.vpn.EXTRA_SERVER_PORT
@@ -31,106 +35,89 @@ import com.cavadvpn.vpn.EXTRA_STATS_ASSIGNED_IP
 import com.cavadvpn.vpn.EXTRA_STATS_BYTES_IN
 import com.cavadvpn.vpn.EXTRA_STATS_BYTES_OUT
 import com.cavadvpn.vpn.EXTRA_STATS_CONNECTED_SINCE
-import com.cavadvpn.vpn.VpnConnectionState
 import com.cavadvpn.vpn.VpnStats
 import com.cavadvpn.vpn.formatBytes
 
-/**
- * Main screen: shows VPN connection status, stats, and connect/disconnect controls.
- */
 class MainActivity : AppCompatActivity() {
 
-    // Views
     private lateinit var tvStatus: TextView
+    private lateinit var statusDot: View
+    private lateinit var powerRing: View
+    private lateinit var btnConnect: ImageButton
+    private lateinit var tvConnectionAction: TextView
     private lateinit var tvAssignedIp: TextView
     private lateinit var tvBytesIn: TextView
     private lateinit var tvBytesOut: TextView
     private lateinit var tvUptime: TextView
-    private lateinit var btnConnectDisconnect: Button
-    private lateinit var btnSettings: Button
-    private lateinit var btnScanQr: Button
+    private lateinit var tvServerAddr: TextView
+    private lateinit var btnSettings: ImageButton
+    private lateinit var btnScanQr: ImageButton
 
     private var isConnected = false
-
-    // -----------------------------------------------------------------------
-    // VPN permission launcher
-    // -----------------------------------------------------------------------
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            doConnect()
-        }
+        if (result.resultCode == Activity.RESULT_OK) doConnect()
     }
-
-    // -----------------------------------------------------------------------
-    // QR scan result launcher
-    // -----------------------------------------------------------------------
 
     private val qrScanLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            // Config already saved by QrScanActivity; just update UI
-            updateConnectButtonState()
-        }
+        if (result.resultCode == Activity.RESULT_OK) refreshServerLabel()
     }
-
-    // -----------------------------------------------------------------------
-    // Broadcast receiver for stats and state updates from the service
-    // -----------------------------------------------------------------------
 
     private val statsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 ACTION_STATS_UPDATE -> {
-                    val bytesIn    = intent.getLongExtra(EXTRA_STATS_BYTES_IN, 0L)
-                    val bytesOut   = intent.getLongExtra(EXTRA_STATS_BYTES_OUT, 0L)
-                    val since      = intent.getLongExtra(EXTRA_STATS_CONNECTED_SINCE, 0L)
-                    val assignedIp = intent.getStringExtra(EXTRA_STATS_ASSIGNED_IP) ?: ""
-                    val stats = VpnStats(bytesIn, bytesOut, since, assignedIp)
+                    val stats = VpnStats(
+                        intent.getLongExtra(EXTRA_STATS_BYTES_IN, 0L),
+                        intent.getLongExtra(EXTRA_STATS_BYTES_OUT, 0L),
+                        intent.getLongExtra(EXTRA_STATS_CONNECTED_SINCE, 0L),
+                        intent.getStringExtra(EXTRA_STATS_ASSIGNED_IP) ?: ""
+                    )
                     updateStats(stats)
                 }
                 ACTION_VPN_STATE_CHANGED -> {
-                    val state = intent.getStringExtra(EXTRA_STATE) ?: return
-                    val errorMsg = intent.getStringExtra(EXTRA_ERROR_MSG)
-                    handleStateChange(state, errorMsg)
+                    handleStateChange(
+                        intent.getStringExtra(EXTRA_STATE) ?: return,
+                        intent.getStringExtra(EXTRA_ERROR_MSG)
+                    )
                 }
             }
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Lifecycle
-    // -----------------------------------------------------------------------
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        tvStatus              = findViewById(R.id.tvStatus)
-        tvAssignedIp          = findViewById(R.id.tvAssignedIp)
-        tvBytesIn             = findViewById(R.id.tvBytesIn)
-        tvBytesOut            = findViewById(R.id.tvBytesOut)
-        tvUptime              = findViewById(R.id.tvUptime)
-        btnConnectDisconnect  = findViewById(R.id.btnConnectDisconnect)
-        btnSettings           = findViewById(R.id.btnSettings)
-        btnScanQr             = findViewById(R.id.btnScanQr)
+        tvStatus           = findViewById(R.id.tvStatus)
+        statusDot          = findViewById(R.id.statusDot)
+        powerRing          = findViewById(R.id.powerRing)
+        btnConnect         = findViewById(R.id.btnConnectDisconnect)
+        tvConnectionAction = findViewById(R.id.tvConnectionAction)
+        tvAssignedIp       = findViewById(R.id.tvAssignedIp)
+        tvBytesIn          = findViewById(R.id.tvBytesIn)
+        tvBytesOut         = findViewById(R.id.tvBytesOut)
+        tvUptime           = findViewById(R.id.tvUptime)
+        tvServerAddr       = findViewById(R.id.tvServerAddr)
+        btnSettings        = findViewById(R.id.btnSettings)
+        btnScanQr          = findViewById(R.id.btnScanQr)
 
-        btnConnectDisconnect.setOnClickListener {
+        btnConnect.setOnClickListener {
             if (isConnected) disconnect() else requestVpnPermissionAndConnect()
         }
-
         btnSettings.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
-
         btnScanQr.setOnClickListener {
             qrScanLauncher.launch(Intent(this, QrScanActivity::class.java))
         }
 
-        updateConnectButtonState()
+        refreshServerLabel()
+        applyDisconnectedUI()
     }
 
     override fun onResume() {
@@ -145,6 +132,7 @@ class MainActivity : AppCompatActivity() {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(statsReceiver, filter)
         }
+        refreshServerLabel()
     }
 
     override fun onPause() {
@@ -152,18 +140,11 @@ class MainActivity : AppCompatActivity() {
         try { unregisterReceiver(statsReceiver) } catch (_: Exception) {}
     }
 
-    // -----------------------------------------------------------------------
-    // VPN connection helpers
-    // -----------------------------------------------------------------------
+    // --- VPN connection ---
 
     private fun requestVpnPermissionAndConnect() {
         val intent = VpnService.prepare(this)
-        if (intent != null) {
-            vpnPermissionLauncher.launch(intent)
-        } else {
-            // Permission already granted
-            doConnect()
-        }
+        if (intent != null) vpnPermissionLauncher.launch(intent) else doConnect()
     }
 
     private fun doConnect() {
@@ -174,8 +155,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // If the QR was a shared config (no private_key), auto-generate a key pair
-        // and persist it so reconnects reuse the same identity.
         val privateKeyHex = if (config.privateKeyHex.isBlank()) {
             val kp = generateKeyPair()
             val hex = kp.privateKey.joinToString("") { "%02x".format(it) }
@@ -191,74 +170,102 @@ class MainActivity : AppCompatActivity() {
             putExtra(EXTRA_SERVER_PORT,       config.serverPort)
             putExtra(EXTRA_PRIVATE_KEY,       privateKeyHex)
             putExtra(EXTRA_SERVER_PUBLIC_KEY, config.serverPublicKeyHex)
+            putExtra(EXTRA_KNOCK_KEY,         config.knockKeyHex)
         }
         startService(intent)
-
-        isConnected = false
-        tvStatus.text = getString(R.string.status_connecting)
-        btnConnectDisconnect.text = getString(R.string.action_disconnect)
+        applyConnectingUI()
     }
 
     private fun disconnect() {
-        val intent = Intent(this, CavadVpnService::class.java).apply {
+        startService(Intent(this, CavadVpnService::class.java).apply {
             action = ACTION_DISCONNECT
-        }
-        startService(intent)
-
-        isConnected = false
-        tvStatus.text = getString(R.string.status_disconnected)
-        tvAssignedIp.text = ""
-        tvBytesIn.text    = "↓ 0 B"
-        tvBytesOut.text   = "↑ 0 B"
-        tvUptime.text     = "00:00:00"
-        btnConnectDisconnect.text = getString(R.string.action_connect)
+        })
+        applyDisconnectedUI()
     }
 
-    // -----------------------------------------------------------------------
-    // UI update helpers
-    // -----------------------------------------------------------------------
+    // --- UI state ---
 
     private fun updateStats(stats: VpnStats) {
-        isConnected = true
-        tvStatus.text     = getString(R.string.status_connected)
+        if (!isConnected) applyConnectedUI()
         tvAssignedIp.text = stats.assignedIp
-        tvBytesIn.text    = "↓ ${formatBytes(stats.bytesIn)}"
-        tvBytesOut.text   = "↑ ${formatBytes(stats.bytesOut)}"
-        tvUptime.text     = stats.formatUptime()
-        btnConnectDisconnect.text = getString(R.string.action_disconnect)
+        tvAssignedIp.visibility = if (stats.assignedIp.isNotBlank()) View.VISIBLE else View.GONE
+        tvBytesIn.text  = formatBytes(stats.bytesIn)
+        tvBytesOut.text = formatBytes(stats.bytesOut)
+        tvUptime.text   = stats.formatUptime()
     }
 
     private fun handleStateChange(state: String, errorMsg: String? = null) {
         when (state) {
-            "CONNECTED" -> {
-                isConnected = true
-                tvStatus.text = getString(R.string.status_connected)
-                btnConnectDisconnect.text = getString(R.string.action_disconnect)
-            }
-            "DISCONNECTED" -> {
-                isConnected = false
-                tvStatus.text = getString(R.string.status_disconnected)
-                btnConnectDisconnect.text = getString(R.string.action_connect)
-            }
-            "CONNECTING" -> {
-                tvStatus.text = getString(R.string.status_connecting)
-            }
-            "ERROR" -> {
-                isConnected = false
-                tvStatus.text = if (errorMsg != null) {
-                    "${getString(R.string.status_error)}: $errorMsg"
-                } else {
-                    getString(R.string.status_error)
-                }
-                btnConnectDisconnect.text = getString(R.string.action_connect)
+            "CONNECTED"    -> applyConnectedUI()
+            "DISCONNECTED" -> applyDisconnectedUI()
+            "CONNECTING"   -> applyConnectingUI()
+            "ERROR"        -> {
+                applyDisconnectedUI()
+                tvStatus.text = errorMsg?.let { "${getString(R.string.status_error)}: $it" }
+                    ?: getString(R.string.status_error)
+                setDotColor(R.color.status_error)
             }
         }
     }
 
-    private fun updateConnectButtonState() {
-        btnConnectDisconnect.text = if (isConnected)
-            getString(R.string.action_disconnect)
-        else
-            getString(R.string.action_connect)
+    private fun applyConnectedUI() {
+        isConnected = true
+        tvStatus.text = getString(R.string.status_connected)
+        tvConnectionAction.text = getString(R.string.tap_to_disconnect)
+        setDotColor(R.color.status_connected)
+        powerRing.setBackgroundResource(R.drawable.bg_power_ring_connected)
+        animatePowerRing()
+    }
+
+    private fun applyDisconnectedUI() {
+        isConnected = false
+        tvStatus.text = getString(R.string.status_disconnected)
+        tvConnectionAction.text = getString(R.string.tap_to_connect)
+        tvAssignedIp.visibility = View.GONE
+        tvBytesIn.text  = "0 B"
+        tvBytesOut.text = "0 B"
+        tvUptime.text   = "00:00"
+        setDotColor(R.color.status_disconnected)
+        powerRing.setBackgroundResource(R.drawable.bg_power_ring)
+        powerRing.scaleX = 1f
+        powerRing.scaleY = 1f
+    }
+
+    private fun applyConnectingUI() {
+        tvStatus.text = getString(R.string.status_connecting)
+        tvConnectionAction.text = getString(R.string.securing_connection)
+        setDotColor(R.color.status_connecting)
+    }
+
+    private fun setDotColor(colorRes: Int) {
+        val bg = statusDot.background
+        if (bg is GradientDrawable) {
+            bg.setColor(ContextCompat.getColor(this, colorRes))
+        }
+    }
+
+    private fun animatePowerRing() {
+        powerRing.animate()
+            .scaleX(1.08f).scaleY(1.08f)
+            .setDuration(600)
+            .setInterpolator(AccelerateDecelerateInterpolator())
+            .withEndAction {
+                powerRing.animate()
+                    .scaleX(1f).scaleY(1f)
+                    .setDuration(600)
+                    .setInterpolator(AccelerateDecelerateInterpolator())
+                    .start()
+            }
+            .start()
+    }
+
+    private fun refreshServerLabel() {
+        val prefs = getSharedPreferences("vpn_config", Context.MODE_PRIVATE)
+        val config = ConfigStore.load(prefs)
+        tvServerAddr.text = if (config != null) {
+            "${config.serverHost}:${config.serverPort}"
+        } else {
+            getString(R.string.label_not_configured)
+        }
     }
 }

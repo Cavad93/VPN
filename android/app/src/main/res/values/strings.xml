@@ -16,23 +16,42 @@
     <string name="action_disconnect">Disconnect</string>
     <string name="action_settings">Settings</string>
     <string name="action_scan_qr">Scan QR</string>
-    <string name="action_save">Save</string>
+    <string name="action_save">Save Configuration</string>
     <string name="action_generate">Generate</string>
     <string name="action_cancel">Cancel</string>
+    <string name="tap_to_connect">Tap to connect</string>
+    <string name="tap_to_disconnect">Tap to disconnect</string>
+    <string name="securing_connection">Securing connection…</string>
+
+    <!-- Section headers -->
+    <string name="title_settings">Settings</string>
+    <string name="section_server">SERVER</string>
+    <string name="section_security">SECURITY</string>
+    <string name="section_network">NETWORK</string>
 
     <!-- Settings labels -->
     <string name="label_server_host">Server Host</string>
     <string name="label_server_port">Port</string>
-    <string name="label_private_key">Private Key (hex, 64 chars)</string>
+    <string name="label_private_key">Client Private Key (hex)</string>
     <string name="label_server_public_key">Server Public Key (hex, optional)</string>
+    <string name="label_knock_key">Knock Key (hex, for relay)</string>
     <string name="label_dns_server">DNS Server</string>
 
-    <!-- Settings hints -->
+    <!-- Settings hints / helpers -->
     <string name="hint_server_host">e.g. vpn.example.com</string>
     <string name="hint_server_port">443</string>
     <string name="hint_private_key">64 hex characters</string>
     <string name="hint_server_public_key">64 hex characters (optional)</string>
+    <string name="hint_knock_key">64 hex characters</string>
+    <string name="hint_knock_key_helper">Required when connecting through a relay with port knocking</string>
     <string name="hint_dns_server">8.8.8.8</string>
+
+    <!-- Stat labels -->
+    <string name="label_download">DOWNLOAD</string>
+    <string name="label_upload">UPLOAD</string>
+    <string name="label_duration">DURATION</string>
+    <string name="label_server">SERVER</string>
+    <string name="label_not_configured">Not configured</string>
 
     <!-- Validation errors -->
     <string name="error_host_required">Server host is required</string>

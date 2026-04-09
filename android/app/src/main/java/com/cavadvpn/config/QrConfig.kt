@@ -34,6 +34,9 @@ object QrConfig {
             append("{")
             append("\"server\":\"$serverField\"")
             append(",\"key\":\"${config.privateKeyHex}\"")
+            if (config.knockKeyHex.isNotBlank()) {
+                append(",\"knock_key\":\"${config.knockKeyHex}\"")
+            }
             if (config.dnsServer.isNotBlank()) {
                 append(",\"dns\":\"${config.dnsServer}\"")
             }
@@ -71,12 +74,16 @@ object QrConfig {
         val key = map["key"] ?: map["private_key"] ?: ""
         if (key.isNotEmpty()) validateKey(key)
 
+        val knockKey = map["knock_key"] ?: ""
+        if (knockKey.isNotEmpty()) validateKey(knockKey)
+
         return VpnConfig(
-            serverHost        = host,
-            serverPort        = port,
-            privateKeyHex     = key,
+            serverHost         = host,
+            serverPort         = port,
+            privateKeyHex      = key,
             serverPublicKeyHex = map["server_key"] ?: "",
-            dnsServer         = map["dns"] ?: "8.8.8.8"
+            knockKeyHex        = knockKey,
+            dnsServer          = map["dns"] ?: "8.8.8.8"
         )
     }
 
@@ -121,12 +128,16 @@ object QrConfig {
         val key = params["key"] ?: params["private_key"] ?: ""
         if (key.isNotEmpty()) validateKey(key)
 
+        val knockKey = params["knock_key"] ?: ""
+        if (knockKey.isNotEmpty()) validateKey(knockKey)
+
         return VpnConfig(
-            serverHost        = host,
-            serverPort        = port,
-            privateKeyHex     = key,
+            serverHost         = host,
+            serverPort         = port,
+            privateKeyHex      = key,
             serverPublicKeyHex = params["server_key"] ?: "",
-            dnsServer         = params["dns"] ?: "8.8.8.8"
+            knockKeyHex        = knockKey,
+            dnsServer          = params["dns"] ?: "8.8.8.8"
         )
     }
 

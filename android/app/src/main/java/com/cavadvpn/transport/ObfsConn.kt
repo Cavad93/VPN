@@ -4,6 +4,8 @@ import java.io.BufferedInputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.security.SecureRandom
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 // TLS record content type bytes
 private const val TLS_CCS       : Byte = 0x14  // ChangeCipherSpec (middlebox compat, RFC 8446 §5.1)
@@ -36,7 +38,8 @@ private const val MAX_OBFS_PAYLOAD = 16383  // 2^14 - 1
  */
 class ObfsConn(
     inputStream: InputStream,
-    private val outputStream: OutputStream
+    private val outputStream: OutputStream,
+    private val knockKey: ByteArray? = null
 ) {
     // 64 KB kernel-side buffer: one socket read typically delivers ~45 TLS records,
     // eliminating per-record syscalls on the hot receive path.
@@ -163,9 +166,17 @@ class ObfsConn(
 
     private fun buildClientHello(): ByteArray {
         val rng = SecureRandom()
-        val random    = ByteArray(32).also { rng.nextBytes(it) }
-        val sessionId = ByteArray(32).also { rng.nextBytes(it) }
-        // Build body directly as ByteArray — avoids boxing every byte into a Byte object.
+        val random = ByteArray(32).also { rng.nextBytes(it) }
+        // Reality-style port knocking: session_id = HMAC-SHA256(knockKey, random).
+        // Relay verifies this to authenticate VPN clients before forwarding.
+        // Without knockKey, session_id is random (compatible with non-knock servers).
+        val sessionId = if (knockKey != null) {
+            val mac = Mac.getInstance("HmacSHA256")
+            mac.init(SecretKeySpec(knockKey, "HmacSHA256"))
+            mac.doFinal(random)
+        } else {
+            ByteArray(32).also { rng.nextBytes(it) }
+        }
         // Layout: version(2) + random(32) + sessionIdLen(1) + sessionId(32) + cipherSuites(8) + compression(2)
         val body = ByteArray(2 + 32 + 1 + 32 + 8 + 2)
         var i = 0

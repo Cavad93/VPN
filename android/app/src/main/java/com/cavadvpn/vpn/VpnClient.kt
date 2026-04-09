@@ -69,8 +69,8 @@ class VpnClient(private val config: VpnConfig) {
         sock.soTimeout = config.readTimeoutMs
         socket = sock
 
-        // 2. TLS obfuscation
-        val obfsConn = ObfsConn(sock.getInputStream(), sock.getOutputStream())
+        // 2. TLS obfuscation (with optional port-knock HMAC in session_id)
+        val obfsConn = ObfsConn(sock.getInputStream(), sock.getOutputStream(), config.knockKeyBytes())
         obfsConn.clientHandshake()
         obfs = obfsConn
 

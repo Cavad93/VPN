@@ -32,6 +32,7 @@ const val EXTRA_SERVER_HOST       = "server_host"
 const val EXTRA_SERVER_PORT       = "server_port"
 const val EXTRA_PRIVATE_KEY       = "private_key_hex"
 const val EXTRA_SERVER_PUBLIC_KEY = "server_public_key_hex"
+const val EXTRA_KNOCK_KEY         = "knock_key_hex"
 
 const val EXTRA_STATE               = "state"
 const val EXTRA_ERROR_MSG           = "error_msg"
@@ -75,10 +76,11 @@ class CavadVpnService : VpnService() {
                     ?: run { Log.e(TAG, "No server host in intent"); return START_NOT_STICKY }
 
                 val config = VpnConfig(
-                    serverHost        = host,
-                    serverPort        = intent.getIntExtra(EXTRA_SERVER_PORT, 443),
-                    privateKeyHex     = intent.getStringExtra(EXTRA_PRIVATE_KEY) ?: "",
-                    serverPublicKeyHex = intent.getStringExtra(EXTRA_SERVER_PUBLIC_KEY) ?: ""
+                    serverHost         = host,
+                    serverPort         = intent.getIntExtra(EXTRA_SERVER_PORT, 443),
+                    privateKeyHex      = intent.getStringExtra(EXTRA_PRIVATE_KEY) ?: "",
+                    serverPublicKeyHex = intent.getStringExtra(EXTRA_SERVER_PUBLIC_KEY) ?: "",
+                    knockKeyHex        = intent.getStringExtra(EXTRA_KNOCK_KEY) ?: ""
                 )
                 startVpn(config)
             }

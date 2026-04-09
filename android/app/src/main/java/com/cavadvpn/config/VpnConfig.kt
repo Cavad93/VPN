@@ -18,6 +18,7 @@ data class VpnConfig(
     val serverPort: Int = 443,
     val privateKeyHex: String = "",
     val serverPublicKeyHex: String = "",
+    val knockKeyHex: String = "",
     val dnsServer: String = "8.8.8.8",
     val mtu: Int = 1400,
     val connectTimeoutMs: Int = 15_000,
@@ -39,6 +40,15 @@ data class VpnConfig(
             "serverPublicKeyHex must be 64 hex characters, got ${serverPublicKeyHex.length}"
         }
         return hexToBytes(serverPublicKeyHex)
+    }
+
+    /** Decodes [knockKeyHex] to raw 32-byte PSK. Returns null if empty (no port knocking). */
+    fun knockKeyBytes(): ByteArray? {
+        if (knockKeyHex.isBlank()) return null
+        require(knockKeyHex.length == 64) {
+            "knockKeyHex must be 64 hex characters, got ${knockKeyHex.length}"
+        }
+        return hexToBytes(knockKeyHex)
     }
 
     private fun hexToBytes(hex: String): ByteArray {
