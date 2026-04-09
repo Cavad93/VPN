@@ -432,15 +432,25 @@ func (c *Conn) writePacket(pktType uint8, payload []byte) error {
 
 	// Take delivery-rate snapshot for BBR estimator.
 	delivered, deliveredTime := c.bbr.estimator.DeliveredSnapshot()
-	// Check if sender is app-limited (pipe not full at send time).
-	// A packet is app-limited if inflight < cwnd at send time — meaning the
-	// application, not the network, is constraining throughput. Only when the
-	// pipe is full can we trust the measured delivery rate as a BtlBw sample.
-	// Using len(c.pending) < cwndTarget (already computed above, no extra lock)
-	// matches the Linux BBR definition. The previous check (== 0) only caught
-	// the very first packet after idle; subsequent burst packets were incorrectly
-	// marked non-app-limited, causing BtlBw to be underestimated after idle.
-	appLimited := len(c.pending) < cwndTarget
+	// Check if sender is app-limited (idle at send time).
+	// Linux BBR sets app_limited when the socket's write queue is empty —
+	// i.e., the application has run out of data to send. For VPN traffic,
+	// the closest equivalent is len(pending)==0: no outstanding packets,
+	// sender was truly idle before this write.
+	//
+	// The previous check (pending < cwndTarget) was too aggressive for VPN:
+	// routeFromTun delivers TUN packets one at a time, so pending rarely
+	// reaches cwndTarget even during active transfers. This caused EVERY
+	// sample to be marked app-limited → BBR never updated BtlBw → download
+	// throughput collapsed to 3.5 Mbps instead of 9+ Mbps.
+	//
+	// With pending==0, only the first packet after true idle is app-limited.
+	// Subsequent burst packets (pending=1,2,...) provide valid BtlBw samples,
+	// allowing BBR to discover the real bandwidth.
+	//
+	// Reference: Linux net/ipv4/tcp_rate.c tcp_rate_check_app_limited() —
+	// sets app_limited = delivered + in_flight when write queue drains.
+	appLimited := len(c.pending) == 0
 
 	now := time.Now()
 

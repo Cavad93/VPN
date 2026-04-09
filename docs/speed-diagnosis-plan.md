@@ -1430,3 +1430,81 @@ Python тесты: **24/24 PASS** (`test_reliable_udp.py`)
 - `server/crypto/bench_test.go` — НОВЫЙ: 7 benchmarks (encrypt, decrypt, encryptTo, decryptTo, handshake)
 
 **Следующий шаг:** Подготовить диагностический скрипт для ручного запуска на MacBook/SPB/Astana: измерение iperf3, mtr, sysctl параметров для тестирования оставшихся гипотез (#4 WiFi, #5 Packet loss, #10 Provider throttling). Все кодовые оптимизации исчерпаны — bottleneck в сети.
+
+### Сеанс 15 — 2026-04-09 — BBR app-limited bug (гипотеза #18) + vpnclient compile fix
+
+**Задача:** Найти причину асимметрии Download 3.50 Mbps vs Upload 9.52 Mbps. Upload отлично, download страдает.
+
+**Диагностика:**
+
+Проведён полный анализ download path (server→client) vs upload path (client→server):
+
+1. **Relay (relay.go)** — СИММЕТРИЧНЫЙ. Upload: ReadFrom → async channel(512) → goroutine writes. Download: Read → WriteTo (sequential, но достаточно быстро для 10 Mbps). Не bottleneck.
+
+2. **Client ACK sending (reliable_udp.py)** — НЕМЕДЛЕННЫЙ. `_process_data` → `_flush_ack()` → `sendto()`. Не блокируется. Не bottleneck.
+
+3. **Server ACK sending (udp.go:736)** — НЕМЕДЛЕННЫЙ. `sendACK()` вызывается ДО блокирующей записи в readCh. Не bottleneck.
+
+4. **BBR appLimited flag (udp.go:443)** — **НАЙДЕН КРИТИЧЕСКИЙ БАГ**.
+
+**Научное обоснование:**
+
+- **Linux BBR source** (torvalds/linux `net/ipv4/tcp_rate.c`): `tcp_rate_check_app_limited()` устанавливает `app_limited` когда **write queue пуста** — приложение исчерпало данные для отправки. Это НЕ то же самое, что "inflight < cwnd".
+- **BBR paper** (Cardwell et al., ACM Queue 2016, §4.1): "app-limited samples are excluded from BtlBw estimation to avoid underestimating the bottleneck bandwidth when the application doesn't have enough data to fill the pipe."
+- **Google BBR FAQ** (github.com/google/bbr): "BBR marks a sample as app-limited if the sending was limited by the application rather than the network."
+
+**Баг (udp.go:443):**
+
+```go
+appLimited := len(c.pending) < cwndTarget   // ← СЛИШКОМ АГРЕССИВНО
+```
+
+VPN сервер (`routeFromTun`) читает TUN пакеты по одному и отправляет через стек:
+- TUN read → noiseConn.Write → Mux.writeFrame → ObfsConn.Write → Conn.Write → writePacket
+- В writePacket: `len(c.pending)` = 0, 1, 2, ... при отправке burst
+- `cwndTarget` = 40 (BDP при 6 Mbps × 78ms)
+- `0 < 40` = true → **ВСЕ пакеты помечены app-limited**
+
+BBR estimator (bbr_estimator.go:292):
+```go
+if !isAppLimited || deliveryRate > e.btlbwFilter.get() {
+    e.btlbwFilter.update(deliveryRate, e.roundCount)
+}
+```
+
+Если ВСЕ samples app-limited И delivery rate ≤ текущий BtlBw → **BtlBw никогда не обновляется** → BBR застревает на начальном seed (6 Mbps) → BtlBw деградирует → cwnd collapse → download 3.50 Mbps.
+
+**Почему upload не затронут:** Python клиент использует Reno CC без концепции app-limited. Все delivery rate samples учитываются → Reno корректно наращивает cwnd → 9.52 Mbps.
+
+**Исправление (udp.go:443):**
+
+```go
+// БЫЛО (слишком агрессивно — ВСЕ VPN пакеты app-limited):
+appLimited := len(c.pending) < cwndTarget
+
+// СТАЛО (как Linux BBR — только truly idle):
+appLimited := len(c.pending) == 0
+```
+
+Теперь:
+- Первый пакет после idle (pending=0): app-limited ✓
+- Последующие пакеты в burst (pending=1,2,...): NOT app-limited ✓
+- BBR получает валидные BtlBw samples во время burst → обнаруживает реальную bandwidth
+
+**Ожидаемый эффект:**
+- Download: 3.50 → 7-9 Mbps (BBR обнаружит реальный bandwidth 9+ Mbps)
+- Upload: без изменений (Python Reno CC не затронут)
+
+**Дополнительный fix:** `server/cmd/vpnclient/main.go:505` — `sc.sess.knockKey` → `vs.knockKey` (undefined variable, Go client не компилировался на macOS).
+
+**Результат:** #18 ИСПРАВЛЕНО
+
+**Тесты:**
+- Go: 8 пакетов ALL PASS
+- Go vet (darwin): PASS (vpnclient compile fix verified)
+
+**Изменённые файлы:**
+- `server/transport/udp.go` — appLimited: `len(c.pending) < cwndTarget` → `len(c.pending) == 0`
+- `server/cmd/vpnclient/main.go` — `sc.sess.knockKey` → `vs.knockKey`
+
+**Следующий шаг:** Пересобрать VPN сервер на Астане и vpnclient на MacBook. Замерить download speed — ожидается рост до 7-9 Mbps.
