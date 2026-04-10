@@ -21,3 +21,6 @@ func setForcedSocketBuffers(conn *net.TCPConn, size int) {
 	conn.SetReadBuffer(size)  //nolint:errcheck
 	conn.SetWriteBuffer(size) //nolint:errcheck
 }
+
+// setConnTTL64 is a no-op on non-Linux/non-Windows platforms (macOS default is already 64).
+func setConnTTL64(_ net.Conn) {}

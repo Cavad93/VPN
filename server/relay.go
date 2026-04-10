@@ -113,7 +113,7 @@ func runRelay(ctx context.Context, listenAddr, relayTarget string, knockKey *tra
 				continue
 			}
 		}
-		// Apply the same TCP socket tuning as the full VPN server.
+		setConnTTL64(conn) // Anti-fingerprint: TTL=64 on Windows
 		if tc, ok := conn.(*net.TCPConn); ok {
 			setForcedSocketBuffers(tc, 4<<20)
 			tc.SetNoDelay(true)

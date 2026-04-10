@@ -245,3 +245,23 @@ func setForcedSocketBuffers(conn *net.TCPConn, size int) {
 		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpNotSentLowat, notSentLowatBytes) //nolint:errcheck
 	})
 }
+
+// setConnTTL64 sets IP TTL to 64 on any net.Conn that supports SyscallConn.
+// Linux default is already 64, but we set it explicitly to ensure consistency
+// regardless of sysctl net.ipv4.ip_default_ttl changes.
+func setConnTTL64(conn net.Conn) {
+	type syscaller interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	sc, ok := conn.(syscaller)
+	if !ok {
+		return
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return
+	}
+	raw.Control(func(fd uintptr) { //nolint:errcheck
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, 64) //nolint:errcheck
+	})
+}

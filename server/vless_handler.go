@@ -86,6 +86,7 @@ func (s *Server) RunVLESS(ctx context.Context, cfg VLESSConfig) error {
 				continue
 			}
 		}
+		setConnTTL64(conn) // Anti-fingerprint: TTL=64 on Windows
 		go s.handleVLESSConn(ctx, conn, cfg)
 	}
 }

@@ -122,5 +122,31 @@ func setForcedSocketBuffers(conn *net.TCPConn, size int) {
 		// TCP_NOTSENT_LOWAT: limit unsent data to 16 KB.
 		// Reduces retransmit penalty on packet loss from megabytes to 16 KB.
 		syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_TCP, tcpNotSentLowat, notSentLowatBytes) //nolint:errcheck
+
+		// Anti-fingerprint: set TTL=64 (Linux default) instead of Windows default 128.
+		// p0f and passive OS fingerprinting tools identify the OS primarily by TTL
+		// in SYN+ACK packets: Linux=64, Windows=128, macOS=64. Setting 64 makes
+		// the server indistinguishable from a Linux nginx/Caddy host.
+		syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IP, syscall.IP_TTL, 64) //nolint:errcheck
+	})
+}
+
+// setConnTTL64 sets IP TTL to 64 on any net.Conn that supports SyscallConn.
+// Used for accepted connections and outgoing dials. On Linux this is already 64
+// by default; on Windows the default is 128 which fingerprints the OS.
+func setConnTTL64(conn net.Conn) {
+	type syscaller interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	sc, ok := conn.(syscaller)
+	if !ok {
+		return
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return
+	}
+	raw.Control(func(fd uintptr) { //nolint:errcheck
+		syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IP, syscall.IP_TTL, 64) //nolint:errcheck
 	})
 }

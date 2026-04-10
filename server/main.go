@@ -281,13 +281,10 @@ func (s *Server) runTCP(ctx context.Context) error {
 		// to spike (80ms → 321ms due to bufferbloat); 4 MB is the safe ceiling.
 		// setForcedSocketBuffers uses SO_RCVBUFFORCE/SO_SNDBUFFORCE on Linux
 		// (requires CAP_NET_ADMIN) to bypass net.core.rmem_max.
+		setConnTTL64(conn) // Anti-fingerprint: TTL=64 (Linux) instead of 128 (Windows)
 		if tc, ok := conn.(*net.TCPConn); ok {
 			setForcedSocketBuffers(tc, 4<<20) // 4 MB per bond connection
 			tc.SetNoDelay(true)               // disable Nagle — VPN packets must not be coalesced
-			// TCP keepalive: probe idle connections every 15 s with 3 retries.
-			// Detects dead connections in 30 s (15+3×5) — 2× faster than before.
-			// Prevents ISP NAT/firewall from silently dropping "idle" VPN connections
-			// after a few minutes (common with Rostelecom / MTS stateful firewalls).
 			tc.SetKeepAlive(true)
 			tc.SetKeepAlivePeriod(15 * time.Second)
 		}
@@ -340,6 +337,7 @@ func (s *Server) runUDP(ctx context.Context) error {
 						continue
 					}
 				}
+				setConnTTL64(conn)
 				if tc, ok := conn.(*net.TCPConn); ok {
 					setForcedSocketBuffers(tc, 4<<20)
 					tc.SetNoDelay(true)
