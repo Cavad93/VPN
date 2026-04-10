@@ -1257,13 +1257,13 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 	// (inner) starts SECOND. This prevents the timer inversion bug where
 	// the subtimer could exceed its container.
 	//
-	// Read deadline: cap the maximum blocking time at 60 seconds.
+	// Read deadline: cap the maximum blocking time at 120 seconds.
 	// The mux keepalive (transport.muxKeepaliveInterval = 15s) sends a
 	// FramePing every 15s, resetting this deadline on each receive.
-	// 60s = 4× keepalive interval → tolerates up to 3 dropped/delayed pings
-	// before declaring the connection dead. Without keepalives a 30s cap would
-	// disconnect idle but valid connections (e.g. user not browsing for 30s).
-	nc.conn.SetReadDeadline(time.Now().Add(60 * time.Second)) //nolint:errcheck
+	// 120s = 8× keepalive interval → tolerates up to 7 dropped/delayed pings
+	// before declaring the connection dead. Generous to handle macOS WiFi
+	// power saving which can pause UDP for 30-60s during idle.
+	nc.conn.SetReadDeadline(time.Now().Add(120 * time.Second)) //nolint:errcheck
 	var obfsReadStart, afterRead time.Time
 	if nc.perf != nil {
 		obfsReadStart = time.Now()

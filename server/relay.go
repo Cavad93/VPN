@@ -200,7 +200,9 @@ func relayOne(client net.Conn, target string, knockKey *transport.KnockPSK, logg
 //
 // Sessions are cleaned up after udpSessionTimeout of inactivity.
 
-const udpSessionTimeout = 5 * time.Minute
+// udpSessionTimeout is generous (10 min) to survive macOS WiFi power saving
+// which can pause UDP traffic for 30-60s during idle periods.
+const udpSessionTimeout = 10 * time.Minute
 
 // udpBufSize is the receive buffer size — max UDP datagram.
 const udpBufSize = 65536
