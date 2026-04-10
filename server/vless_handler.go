@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"bufio"
 	"io"
+	"net/http"
+	"strings"
 	"log/slog"
 	"math/big"
 	"net"
@@ -123,22 +125,38 @@ func (s *Server) handleVLESSConn(ctx context.Context, conn net.Conn, cfg VLESSCo
 		writer = conn
 		closer = func() {}
 	} else if first[0] == 'G' || first[0] == 'P' || first[0] == 'H' {
-		// HTTP-like — try WebSocket upgrade; on failure serve cover site.
-		ws, err := transport.WSUpgradeFromReader(conn, br, cfg.WSPath)
+		// HTTP-like: parse request first, then check for WebSocket upgrade.
+		// Must parse before WSUpgrade because WSUpgrade consumes the request
+		// from the reader — if it fails, the request is gone and cover site
+		// gets an empty buffer (→ 400 Bad Request).
+		httpReq, err := http.ReadRequest(br)
 		if err != nil {
-			s.logger.Debug("vless ws upgrade failed, serving cover site", "remote", remote)
-			// Serve HTTPS cover site — scanner sees a recipe blog over TLS.
-			serveCoverSiteFromBufio(conn, br)
+			s.logger.Debug("vless http parse failed", "remote", remote)
 			return
 		}
-		s.logger.Debug("vless ws upgraded", "remote", remote)
-		reader = ws
-		writer = ws
-		closer = func() { ws.Close() }
+		defer httpReq.Body.Close()
+
+		if strings.EqualFold(httpReq.Header.Get("Upgrade"), "websocket") {
+			// WebSocket upgrade with already-parsed request
+			ws, err := transport.WSUpgradeFromParsedRequest(conn, httpReq, cfg.WSPath)
+			if err != nil {
+				s.logger.Debug("vless ws upgrade failed, serving cover", "remote", remote)
+				serveCoverFromParsedRequest(conn, httpReq)
+				return
+			}
+			s.logger.Debug("vless ws upgraded", "remote", remote)
+			reader = ws
+			writer = ws
+			closer = func() { ws.Close() }
+		} else {
+			// Regular HTTP (browser/scanner) → serve cover site over HTTPS
+			s.logger.Debug("vless serving cover site (no ws upgrade)", "remote", remote)
+			serveCoverFromParsedRequest(conn, httpReq)
+			return
+		}
 	} else {
-		// Unknown protocol over TLS — serve cover site (looks like HTTPS blog).
-		s.logger.Debug("vless unknown protocol, serving cover site", "remote", remote)
-		serveCoverSiteFromBufio(conn, br)
+		// Unknown protocol over TLS — close silently
+		s.logger.Debug("vless unknown protocol", "remote", remote)
 		return
 	}
 	defer closer()

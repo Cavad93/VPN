@@ -168,6 +168,30 @@ func serveCoverSiteFromPeeked(conn net.Conn, firstByte byte) {
 	serveCoverSite(pc)
 }
 
+// serveCoverFromParsedRequest serves the cover website using an already-parsed
+// HTTP request. Used by the VLESS handler when it detects non-WebSocket HTTP
+// traffic over TLS — the scanner sees "Pork Kitchen" as an HTTPS site.
+func serveCoverFromParsedRequest(conn net.Conn, req *http.Request) {
+	_ = conn.SetDeadline(time.Now().Add(coverSiteDeadline()))
+
+	rw := &coverResponseWriter{header: make(http.Header)}
+	coverHandler().ServeHTTP(rw, req)
+	if rw.code == 0 {
+		rw.code = http.StatusOK
+	}
+
+	resp := &http.Response{
+		StatusCode:    rw.code,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        rw.header,
+		Body:          io.NopCloser(&rw.buf),
+		ContentLength: int64(rw.buf.Len()),
+	}
+	resp.Write(conn) //nolint:errcheck
+}
+
 // serveCoverSiteFromBufio serves the cover website on a TLS connection where
 // a bufio.Reader has already been created (e.g. VLESS handler that detected
 // non-VLESS traffic). The scanner sees a recipe blog over HTTPS.

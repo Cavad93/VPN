@@ -133,6 +133,57 @@ func WSUpgradeFromReader(conn net.Conn, br *bufio.Reader, expectedPath string) (
 	}, nil
 }
 
+// WSUpgradeFromParsedRequest performs WebSocket upgrade using an already-parsed
+// HTTP request. Use when the caller parsed the request to check headers before
+// deciding whether to upgrade or serve a cover site.
+func WSUpgradeFromParsedRequest(conn net.Conn, req *http.Request, expectedPath string) (*WSConn, error) {
+	if !headerContains(req.Header, "Connection", "upgrade") {
+		return nil, errors.New("ws: missing Connection: upgrade header")
+	}
+	wsKey := req.Header.Get("Sec-WebSocket-Key")
+	if wsKey == "" {
+		return nil, errors.New("ws: missing Sec-WebSocket-Key")
+	}
+	if expectedPath != "" && req.URL.Path != expectedPath {
+		return nil, fmt.Errorf("ws: path %q does not match %q", req.URL.Path, expectedPath)
+	}
+
+	h := sha1.New()
+	h.Write([]byte(wsKey))
+	h.Write([]byte(wsGUID))
+	acceptKey := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	var earlyData []byte
+	subProto := req.Header.Get("Sec-WebSocket-Protocol")
+	respSubProto := ""
+	if subProto != "" {
+		if decoded, err := base64.RawURLEncoding.DecodeString(subProto); err == nil && len(decoded) > 0 && len(decoded) <= 2048 {
+			earlyData = decoded
+		}
+		respSubProto = subProto
+	}
+
+	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: " + acceptKey + "\r\n"
+	if respSubProto != "" {
+		resp += "Sec-WebSocket-Protocol: " + respSubProto + "\r\n"
+	}
+	resp += "\r\n"
+
+	if _, err := conn.Write([]byte(resp)); err != nil {
+		return nil, fmt.Errorf("ws: write response: %w", err)
+	}
+
+	return &WSConn{
+		conn:      conn,
+		br:        bufio.NewReaderSize(conn, 4096),
+		path:      req.URL.Path,
+		earlyData: earlyData,
+	}, nil
+}
+
 // Path returns the URL path from the upgrade request.
 func (ws *WSConn) Path() string { return ws.path }
 
