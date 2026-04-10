@@ -52,14 +52,12 @@ func (s *Server) RunVLESS(ctx context.Context, cfg VLESSConfig) error {
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
 		MinVersion:   tls.VersionTLS12,
-		// Advertise h2 + http/1.1 — a server that only speaks HTTP/1.1 is a
-		// fingerprint since virtually all modern web servers support HTTP/2.
-		// The actual VLESS/WS handler uses HTTP/1.1 but ALPN negotiation with
-		// h2 listed makes the TLS handshake indistinguishable from Caddy/Traefik.
-		NextProtos: []string{"h2", "http/1.1"},
-		// Explicit curve preferences matching modern defaults (X25519 preferred).
-		// Go already defaults to this, but being explicit prevents future changes
-		// from altering the JA3S fingerprint.
+		// Only http/1.1 — VLESS/WS requires HTTP/1.1 for WebSocket upgrade.
+		// Advertising h2 causes "unexpected SETTINGS frame" errors because
+		// our handler speaks HTTP/1.1 but clients (curl, browsers) negotiate h2.
+		// Many real sites are HTTP/1.1-only (WordPress, legacy apps) — not a
+		// strong fingerprint. The JA3S is already consistent with Go (Caddy).
+		NextProtos: []string{"http/1.1"},
 		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
 	}
 
