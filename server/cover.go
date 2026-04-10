@@ -168,6 +168,36 @@ func serveCoverSiteFromPeeked(conn net.Conn, firstByte byte) {
 	serveCoverSite(pc)
 }
 
+// serveCoverSiteFromBufio serves the cover website on a TLS connection where
+// a bufio.Reader has already been created (e.g. VLESS handler that detected
+// non-VLESS traffic). The scanner sees a recipe blog over HTTPS.
+func serveCoverSiteFromBufio(conn net.Conn, br *bufio.Reader) {
+	_ = conn.SetDeadline(time.Now().Add(coverSiteDeadline()))
+
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		return
+	}
+	defer req.Body.Close()
+
+	rw := &coverResponseWriter{header: make(http.Header)}
+	coverHandler().ServeHTTP(rw, req)
+	if rw.code == 0 {
+		rw.code = http.StatusOK
+	}
+
+	resp := &http.Response{
+		StatusCode:    rw.code,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        rw.header,
+		Body:          io.NopCloser(&rw.buf),
+		ContentLength: int64(rw.buf.Len()),
+	}
+	resp.Write(conn) //nolint:errcheck
+}
+
 // serveCoverHTTP serves the cover website on a plain HTTP listener.
 // Blocks until the listener is closed. Used for port 80 cover site.
 func serveCoverHTTP(addr string, onReady chan<- struct{}) error {

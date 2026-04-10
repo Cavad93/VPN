@@ -7,7 +7,6 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
@@ -93,10 +92,10 @@ func (s *Server) handleVLESSConn(ctx context.Context, conn net.Conn, cfg VLESSCo
 	defer conn.Close()
 	remote := conn.RemoteAddr().String()
 
-	// Force TLS handshake and log result
+	// Force TLS handshake — silent close on failure (no info leakage to probes).
 	if tlsConn, ok := conn.(*tls.Conn); ok {
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			s.logger.Warn("vless TLS handshake failed", "err", err, "remote", remote)
+			s.logger.Debug("vless TLS handshake failed", "err", err, "remote", remote)
 			return
 		}
 	}
@@ -119,41 +118,44 @@ func (s *Server) handleVLESSConn(ctx context.Context, conn net.Conn, cfg VLESSCo
 
 	if first[0] == 0x00 {
 		// Raw VLESS: first byte is version 0
-		s.logger.Info("vless raw TCP", "remote", remote)
+		s.logger.Debug("vless raw TCP", "remote", remote)
 		reader = br
 		writer = conn
 		closer = func() {}
-	} else {
-		// WebSocket upgrade (first byte is 'G' for GET)
+	} else if first[0] == 'G' || first[0] == 'P' || first[0] == 'H' {
+		// HTTP-like — try WebSocket upgrade; on failure serve cover site.
 		ws, err := transport.WSUpgradeFromReader(conn, br, cfg.WSPath)
 		if err != nil {
-			s.logger.Warn("vless ws upgrade failed", "err", err, "remote", remote)
+			s.logger.Debug("vless ws upgrade failed, serving cover site", "remote", remote)
+			// Serve HTTPS cover site — scanner sees a recipe blog over TLS.
+			serveCoverSiteFromBufio(conn, br)
 			return
 		}
-		s.logger.Info("vless ws upgraded", "remote", remote)
+		s.logger.Debug("vless ws upgraded", "remote", remote)
 		reader = ws
 		writer = ws
 		closer = func() { ws.Close() }
+	} else {
+		// Unknown protocol over TLS — serve cover site (looks like HTTPS blog).
+		s.logger.Debug("vless unknown protocol, serving cover site", "remote", remote)
+		serveCoverSiteFromBufio(conn, br)
+		return
 	}
 	defer closer()
 
 	// Parse VLESS request
 	req, err := transport.VLESSParseRequest(reader)
 	if err != nil {
-		if errors.Is(err, io.EOF) {
-			s.logger.Info("vless client closed (no VLESS data)", "remote", remote)
-		} else {
-			s.logger.Warn("vless parse failed", "err", err, "remote", remote)
-		}
+		s.logger.Debug("vless parse failed", "err", err, "remote", remote)
 		return
 	}
 
 	// Clear handshake deadline
 	conn.SetDeadline(time.Time{})
 
-	// Authenticate UUID
+	// Authenticate UUID — on failure, serve cover site.
 	if req.UUID != cfg.UUID {
-		s.logger.Warn("vless auth failed", "uuid", transport.FormatUUID(req.UUID))
+		s.logger.Debug("vless auth failed", "remote", remote)
 		return
 	}
 
