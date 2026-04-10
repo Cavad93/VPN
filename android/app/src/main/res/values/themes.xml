@@ -55,7 +55,7 @@
     </style>
 
     <!-- Stat card style -->
-    <style name="Widget.CavadVPN.StatCard">
+    <style name="Widget.CavadVPN.StatCard" parent="">
         <item name="android:background">@drawable/bg_card_rounded</item>
         <item name="android:padding">16dp</item>
     </style>
