@@ -38,8 +38,9 @@ func TestCoverIndexPage(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
 		t.Errorf("Content-Type: got %q, want text/html", ct)
 	}
-	if srv := rec.Header().Get("Server"); srv != "nginx/1.24.0" {
-		t.Errorf("Server header: got %q, want nginx/1.24.0", srv)
+	// No Server header — consistent with Go TLS fingerprint (no mismatch).
+	if srv := rec.Header().Get("Server"); srv != "" {
+		t.Errorf("Server header should be empty, got %q", srv)
 	}
 }
 
@@ -155,8 +156,8 @@ func TestCoverAllPagesHaveNginxHeader(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", path, nil)
 		h.ServeHTTP(rec, req)
-		if srv := rec.Header().Get("Server"); srv != "nginx/1.24.0" {
-			t.Errorf("path %s: Server=%q, want nginx/1.24.0", path, srv)
+		if srv := rec.Header().Get("Server"); srv != "" {
+			t.Errorf("path %s: Server should be empty, got %q", path, srv)
 		}
 	}
 }

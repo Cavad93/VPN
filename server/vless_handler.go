@@ -52,7 +52,15 @@ func (s *Server) RunVLESS(ctx context.Context, cfg VLESSConfig) error {
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
 		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"http/1.1"}, // WS requires HTTP/1.1, no h2
+		// Advertise h2 + http/1.1 — a server that only speaks HTTP/1.1 is a
+		// fingerprint since virtually all modern web servers support HTTP/2.
+		// The actual VLESS/WS handler uses HTTP/1.1 but ALPN negotiation with
+		// h2 listed makes the TLS handshake indistinguishable from Caddy/Traefik.
+		NextProtos: []string{"h2", "http/1.1"},
+		// Explicit curve preferences matching modern defaults (X25519 preferred).
+		// Go already defaults to this, but being explicit prevents future changes
+		// from altering the JA3S fingerprint.
+		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
 	}
 
 	ln, err := tls.Listen("tcp", cfg.ListenAddr, tlsConfig)

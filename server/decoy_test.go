@@ -214,9 +214,9 @@ func TestPeekAndRouteHTTPScannerGetsCoverSite(t *testing.T) {
 	if !bytes.Contains(resp, []byte("Pork Kitchen")) {
 		t.Fatalf("expected cover website 'Pork Kitchen' in response, got: %q", truncate(resp, 300))
 	}
-	// Must have nginx Server header for scanner fingerprinting.
-	if !bytes.Contains(resp, []byte("nginx/1.24.0")) {
-		t.Fatalf("expected nginx Server header in cover response, got: %q", truncate(resp, 300))
+	// No Server header — avoids mismatch with Go TLS fingerprint.
+	if bytes.Contains(resp, []byte("Server: nginx")) {
+		t.Fatalf("should NOT have nginx Server header (JA3S mismatch), got: %q", truncate(resp, 300))
 	}
 }
 

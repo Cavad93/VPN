@@ -155,8 +155,8 @@ func TestRelayServesDecoyForNonVPNProbe(t *testing.T) {
 	if !bytes.Contains(resp, []byte("Pork Kitchen")) {
 		t.Fatalf("expected cover website 'Pork Kitchen' in response, got: %q", resp)
 	}
-	if !bytes.Contains(resp, []byte("nginx/1.24.0")) {
-		t.Fatalf("expected nginx Server header in cover response, got: %q", resp)
+	if bytes.Contains(resp, []byte("Server: nginx")) {
+		t.Fatalf("should NOT have nginx Server header (JA3S mismatch), got: %q", resp)
 	}
 }
 

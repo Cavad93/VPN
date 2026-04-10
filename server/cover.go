@@ -8,7 +8,7 @@
 //
 // Design rationale (based on Trojan-GFW and V2Ray VLESS fallback research):
 //   - Multiple pages with internal links increase scanner confidence
-//   - Consistent Server header (nginx) across all responses
+//   - No Server header (consistent with Go TLS JA3S fingerprint)
 //   - Proper HTTP/1.1 with Content-Length, Content-Type, Connection headers
 //   - 404 for unknown paths (what a real server does)
 //   - No TLS — cover site runs over plain HTTP, which is normal for
@@ -87,9 +87,11 @@ func coverHandler() http.Handler {
 	return mux
 }
 
-// serveCoverPage writes an HTML response with nginx-like headers.
+// serveCoverPage writes an HTML response with standard headers.
 func serveCoverPage(w http.ResponseWriter, body string, status int) {
-	w.Header().Set("Server", "nginx/1.24.0")
+	// No Server header — Go's net/http default. Eliminates the mismatch
+	// fingerprint: "Server: nginx" + Go TLS JA3S → instant detection.
+	// Many real sites (behind CDN, Caddy, Traefik) omit Server too.
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Connection", "close")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -105,7 +107,9 @@ func serveCover404(w http.ResponseWriter, _ *http.Request) {
 // serveCoverFavicon serves a minimal 16x16 ICO favicon (cooking pot icon).
 // A missing favicon is a fingerprint — every real site has one.
 func serveCoverFavicon(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Server", "nginx/1.24.0")
+	// No Server header — Go's net/http default. Eliminates the mismatch
+	// fingerprint: "Server: nginx" + Go TLS JA3S → instant detection.
+	// Many real sites (behind CDN, Caddy, Traefik) omit Server too.
 	w.Header().Set("Content-Type", "image/x-icon")
 	w.Header().Set("Cache-Control", "public, max-age=604800")
 	w.Header().Set("Connection", "close")
@@ -114,7 +118,9 @@ func serveCoverFavicon(w http.ResponseWriter, _ *http.Request) {
 
 // serveCoverRobotsTxt serves a standard robots.txt allowing all crawlers.
 func serveCoverRobotsTxt(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Server", "nginx/1.24.0")
+	// No Server header — Go's net/http default. Eliminates the mismatch
+	// fingerprint: "Server: nginx" + Go TLS JA3S → instant detection.
+	// Many real sites (behind CDN, Caddy, Traefik) omit Server too.
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Connection", "close")
 	io.WriteString(w, "User-agent: *\nAllow: /\n\nSitemap: /sitemap.xml\n") //nolint:errcheck
@@ -122,7 +128,9 @@ func serveCoverRobotsTxt(w http.ResponseWriter, _ *http.Request) {
 
 // serveCoverSitemap serves a minimal XML sitemap with all cover pages.
 func serveCoverSitemap(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Server", "nginx/1.24.0")
+	// No Server header — Go's net/http default. Eliminates the mismatch
+	// fingerprint: "Server: nginx" + Go TLS JA3S → instant detection.
+	// Many real sites (behind CDN, Caddy, Traefik) omit Server too.
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.Header().Set("Connection", "close")
 	host := r.Host
