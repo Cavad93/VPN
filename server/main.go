@@ -868,25 +868,46 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 	}
 }
 
-// markECNCE marks the ECN field of an IPv4 packet as Congestion Experienced (CE=11).
-// It only modifies packets that advertise ECN-capable transport (ECT(0)=10 or ECT(1)=01);
-// Non-ECT packets (00) and already-CE packets (11) are left unchanged.
+// markECNCE marks the ECN field of an inner IP packet (IPv4 or IPv6) as
+// Congestion Experienced (CE=11).
 //
-// After marking, the IPv4 header checksum is recomputed over the (variable-length) header
-// so that downstream stacks accept the packet without dropping it as corrupt.
+// It only modifies packets that advertise ECN-capable transport (ECT(0)=10 or
+// ECT(1)=01); Non-ECT packets (00) and already-CE packets (11) are left
+// unchanged.
 //
-// Purpose: Double-CC mitigation — when our BBR pipe is near-full (Congested()==true),
-// marking CE in the inner IP header signals the inner TCP sender to reduce its rate via
-// RFC 3168 ECN-Echo, synchronising it with our BBR instead of reacting independently.
+// Purpose: Double-CC mitigation — when our BBR pipe is near-full
+// (Congested()==true), marking CE in the inner IP header signals the inner TCP
+// sender to reduce its rate via RFC 3168 ECN-Echo, synchronising it with our
+// BBR instead of reacting independently.
 //
-// IPv4 header byte layout relevant here:
+// IPv4 header byte layout:
 //
 //	byte[0]   — version(4b) + IHL(4b)
 //	byte[1]   — DSCP(6b) + ECN(2b): ECN bits 1-0; CE = 11
-//	bytes[10-11] — header checksum (ones-complement)
+//	bytes[10-11] — header checksum (ones-complement, recomputed after marking)
+//
+// IPv6 header byte layout (RFC 8200 §3):
+//
+//	byte[0]   — version(4b, =6) + Traffic Class bits[7:4]
+//	byte[1]   — Traffic Class bits[3:0] + Flow Label bits[19:16]
+//	             TC = DSCP(6b) + ECN(2b); ECN bits are byte[1] bits[5:4]
+//	             No header checksum → no recomputation needed.
 func markECNCE(buf []byte, n int) {
-	if n < 20 || buf[0]>>4 != 4 {
-		return // not a valid IPv4 packet
+	if n < 1 {
+		return
+	}
+	switch buf[0] >> 4 {
+	case 4:
+		markECNCEv4(buf, n)
+	case 6:
+		markECNCEv6(buf, n)
+	}
+}
+
+// markECNCEv4 is the IPv4-specific helper for markECNCE.
+func markECNCEv4(buf []byte, n int) {
+	if n < 20 {
+		return // too short for IPv4 header
 	}
 	ecn := buf[1] & 0x03
 	if ecn == 0x00 || ecn == 0x03 {
@@ -914,6 +935,29 @@ func markECNCE(buf []byte, n int) {
 	csum := ^uint16(sum)
 	buf[10] = byte(csum >> 8)
 	buf[11] = byte(csum)
+}
+
+// markECNCEv6 is the IPv6-specific helper for markECNCE.
+//
+// IPv6 Traffic Class layout within the first two header bytes:
+//
+//	byte[0] bits[3:0] = TC bits[7:4]  (DSCP high nibble)
+//	byte[1] bits[7:4] = TC bits[3:0]  (DSCP low 2b + ECN 2b)
+//	byte[1] bits[5:4] = ECN bits[1:0]
+//
+// Marking CE sets those two bits to 11 and leaves all other bits untouched.
+// IPv6 has no header checksum, so no recalculation is required.
+func markECNCEv6(buf []byte, n int) {
+	if n < 40 {
+		return // minimum IPv6 header is 40 bytes
+	}
+	// ECN occupies bits[5:4] of byte[1] (= TC bits[1:0]).
+	ecn := (buf[1] >> 4) & 0x03
+	if ecn == 0x00 || ecn == 0x03 {
+		return // Not-ECT or already CE: nothing to do
+	}
+	// Set ECN=CE=11 by setting bits[5:4] of byte[1]; preserve DSCP and Flow Label.
+	buf[1] = (buf[1] &^ 0x30) | 0x30
 }
 
 // tunReadBufPool pools the 64 KB TUN read buffers used in routeFromTun.

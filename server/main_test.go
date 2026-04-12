@@ -2184,16 +2184,132 @@ func TestMarkECNCE_TooShort(t *testing.T) {
 	markECNCE(short, len(short)) // must not panic
 }
 
-func TestMarkECNCE_IPv6Ignored(t *testing.T) {
-	// IPv6 packet (version=6) must be left unchanged (we only handle IPv4).
-	pkt := make([]byte, 40)
-	pkt[0] = 0x60 // version=6
-	pkt[1] = 0x02 // Traffic Class ECT(0) in lower nibble (approx)
+// buildIPv6 constructs a minimal 40-byte IPv6 header with the given Traffic
+// Class byte and an optional payload.  The TC byte is split across byte[0]
+// (low nibble) and byte[1] (high nibble) as per RFC 8200.
+func buildIPv6(tc byte, payloadLen int) []byte {
+	buf := make([]byte, 40+payloadLen)
+	// Version=6 (high nibble) + TC bits[7:4] (low nibble of byte[0])
+	buf[0] = 0x60 | (tc >> 4)
+	// TC bits[3:0] (high nibble of byte[1]) + Flow Label = 0 (low nibble)
+	buf[1] = (tc << 4) & 0xF0
+	// Payload length
+	plen := uint16(payloadLen)
+	buf[4] = byte(plen >> 8)
+	buf[5] = byte(plen)
+	buf[6] = 6  // Next Header: TCP
+	buf[7] = 64 // Hop Limit
+	// Src: 2001:db8::1
+	buf[8] = 0x20; buf[9] = 0x01; buf[10] = 0x0d; buf[11] = 0xb8
+	buf[23] = 0x01
+	// Dst: 2001:db8::2
+	buf[24] = 0x20; buf[25] = 0x01; buf[26] = 0x0d; buf[27] = 0xb8
+	buf[39] = 0x02
+	return buf
+}
+
+// extractIPv6ECN returns the ECN bits from an IPv6 packet (byte[1] bits[5:4]).
+func extractIPv6ECN(buf []byte) byte {
+	return (buf[1] >> 4) & 0x03
+}
+
+// TestMarkECNCE_IPv6NonECT verifies that a Non-ECT IPv6 packet is not modified.
+func TestMarkECNCE_IPv6NonECT(t *testing.T) {
+	pkt := buildIPv6(0x00, 10) // TC=0x00, ECN=00 (Not-ECT)
 	original := make([]byte, len(pkt))
 	copy(original, pkt)
 	markECNCE(pkt, len(pkt))
 	if !bytes.Equal(pkt, original) {
-		t.Error("markECNCE modified an IPv6 packet")
+		t.Error("markECNCE modified a Non-ECT IPv6 packet")
+	}
+}
+
+// TestMarkECNCE_IPv6AlreadyCE verifies that an already-CE IPv6 packet is not modified.
+func TestMarkECNCE_IPv6AlreadyCE(t *testing.T) {
+	pkt := buildIPv6(0x03, 10) // TC=0x03, ECN=11 (CE)
+	original := make([]byte, len(pkt))
+	copy(original, pkt)
+	markECNCE(pkt, len(pkt))
+	if !bytes.Equal(pkt, original) {
+		t.Error("markECNCE modified an already-CE IPv6 packet")
+	}
+}
+
+// TestMarkECNCE_IPv6ECT0 verifies that ECT(0) IPv6 packet is marked CE.
+func TestMarkECNCE_IPv6ECT0(t *testing.T) {
+	// TC=0x02 → ECN bits in TC = 10 = ECT(0).
+	// After buildIPv6: byte[1] high nibble = TC[3:0] = 0x2 → byte[1] = 0x20.
+	// ECN = (byte[1]>>4)&0x03 = (0x20>>4)&0x03 = 2&3 = 2 = ECT(0). ✓
+	pkt := buildIPv6(0x02, 10)
+	markECNCE(pkt, len(pkt))
+	if ecn := extractIPv6ECN(pkt); ecn != 0x03 {
+		t.Errorf("IPv6 ECT(0) not marked CE: got ECN=%02x, want 0x03", ecn)
+	}
+}
+
+// TestMarkECNCE_IPv6ECT1 verifies that ECT(1) IPv6 packet is marked CE.
+func TestMarkECNCE_IPv6ECT1(t *testing.T) {
+	// TC=0x01 → ECN=01 = ECT(1).
+	pkt := buildIPv6(0x01, 10)
+	markECNCE(pkt, len(pkt))
+	if ecn := extractIPv6ECN(pkt); ecn != 0x03 {
+		t.Errorf("IPv6 ECT(1) not marked CE: got ECN=%02x, want 0x03", ecn)
+	}
+}
+
+// TestMarkECNCE_IPv6PreservesDSCP verifies that DSCP bits are not altered.
+func TestMarkECNCE_IPv6PreservesDSCP(t *testing.T) {
+	// TC=0x28|0x02 = 0x2A → DSCP=CS5 (bits[7:2]=0x28>>2=0x0A), ECN=ECT(0).
+	const tc = byte(0x28 | 0x02)
+	pkt := buildIPv6(tc, 10)
+	origByte0 := pkt[0]
+	origByte1High := pkt[1] & 0xC0 // DSCP bits in byte[1] high two bits
+	markECNCE(pkt, len(pkt))
+	if pkt[0] != origByte0 {
+		t.Errorf("markECNCE altered byte[0]: want %02x got %02x", origByte0, pkt[0])
+	}
+	if pkt[1]&0xC0 != origByte1High {
+		t.Errorf("markECNCE altered DSCP in byte[1]: want %02x got %02x", origByte1High, pkt[1]&0xC0)
+	}
+}
+
+// TestMarkECNCE_IPv6PreservesFlowLabel verifies that the Flow Label (bytes 1-3 low bits) is not altered.
+func TestMarkECNCE_IPv6PreservesFlowLabel(t *testing.T) {
+	pkt := buildIPv6(0x02, 10)
+	// Set a non-zero flow label in byte[1] low nibble and bytes[2-3].
+	pkt[1] |= 0x05 // low nibble: flow label bits[19:16] = 5
+	pkt[2] = 0xAB
+	pkt[3] = 0xCD
+	origByte1Low := pkt[1] & 0x0F
+	markECNCE(pkt, len(pkt))
+	if pkt[1]&0x0F != origByte1Low {
+		t.Errorf("markECNCE altered Flow Label low nibble of byte[1]: want %x got %x", origByte1Low, pkt[1]&0x0F)
+	}
+	if pkt[2] != 0xAB || pkt[3] != 0xCD {
+		t.Errorf("markECNCE altered Flow Label bytes[2:3]: want AB CD got %02X %02X", pkt[2], pkt[3])
+	}
+}
+
+// TestMarkECNCE_IPv6TooShort verifies that short buffers do not panic.
+func TestMarkECNCE_IPv6TooShort(t *testing.T) {
+	// 39 bytes is one short of the 40-byte minimum IPv6 header.
+	short := make([]byte, 39)
+	short[0] = 0x60 // version=6
+	short[1] = 0x20 // ECT(0) in TC
+	markECNCE(short, len(short)) // must not panic
+}
+
+// TestMarkECNCE_UnknownVersionIgnored verifies that packets with unknown IP
+// version (e.g. version=5) are left unchanged.
+func TestMarkECNCE_UnknownVersionIgnored(t *testing.T) {
+	pkt := make([]byte, 40)
+	pkt[0] = 0x52 // version=5 (unknown)
+	pkt[1] = 0x20 // would-be ECT(0) if IPv6
+	original := make([]byte, len(pkt))
+	copy(original, pkt)
+	markECNCE(pkt, len(pkt))
+	if !bytes.Equal(pkt, original) {
+		t.Error("markECNCE modified a packet with unknown IP version")
 	}
 }
 

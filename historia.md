@@ -1463,3 +1463,101 @@ curl -H "X-API-Key: <TOKEN>" http://127.0.0.1:8080/api/v1/stats
 curl -v http://127.0.0.1:8080/api/v1/sessions
 # Ожидаемый ответ: HTTP/1.1 401 Unauthorized
 ```
+
+---
+
+## Запуск 27 — 2026-04-12
+
+### Выполнено: IPv6 ECN CE marking — расширение Double CC protection на IPv6 inner tunnel
+
+**Файлы:** `server/main.go`, `server/main_test.go`
+
+**Контекст:**
+
+Запуск 11 реализовал ECN CE propagation (RFC 3168 §9.3.1) как механизм Double-CC mitigation:
+когда наш BBR заполнен на 75%+, в inner IPv4 пакетах проставляется бит CE=11, что синхронизирует
+inner TCP CC с нашим BBR. Функция `markECNCE` намеренно игнорировала IPv6 inner пакеты
+(`TestMarkECNCE_IPv6Ignored`), оставляя это как future work.
+
+**Проблема:**
+
+IPv6 inner трафик (браузеры с QUIC, dual-stack endpoint-ы, IPv6-only сайты) не получал ECN CE
+при congestion. Inner TCP/QUIC продолжал подавать данные в полном темпе → накопление в очереди
+→ рост RTT → оба CC реагировали с задержкой и независимо. Асимметрия Double CC сохранялась
+для всего IPv6-трафика внутри туннеля.
+
+**Исправление:**
+
+**IPv6 Traffic Class byte layout (RFC 8200 §3):**
+```
+byte[0] = 0x60 | (TC >> 4)          — version=6 + TC bits[7:4]
+byte[1] = (TC << 4) | flow_label_hi — TC bits[3:0] + Flow Label bits[19:16]
+          ^^^^^^^ bits[7:4] = TC[3:0] = DSCP[1:0] + ECN[1:0]
+ECN = (byte[1] >> 4) & 0x03         — bits[5:4] of byte[1]
+```
+
+Чтобы пометить CE=11: `buf[1] = (buf[1] &^ 0x30) | 0x30`
+- Сохраняет DSCP (byte[0] весь + byte[1] bits[7:6])
+- Сохраняет Flow Label (byte[1] bits[3:0] + bytes[2-3])
+- **Нет пересчёта checksum** — у IPv6 нет header checksum
+
+**Рефакторинг `markECNCE`:**
+
+```go
+// Было (монолитная функция только для IPv4):
+func markECNCE(buf []byte, n int) {
+    if n < 20 || buf[0]>>4 != 4 { return }
+    ...
+}
+
+// Стало (dispatcher + два хелпера):
+func markECNCE(buf []byte, n int) {
+    if n < 1 { return }
+    switch buf[0] >> 4 {
+    case 4: markECNCEv4(buf, n)
+    case 6: markECNCEv6(buf, n)
+    }
+}
+func markECNCEv4(buf []byte, n int) { /* прежняя логика */ }
+func markECNCEv6(buf []byte, n int) {
+    if n < 40 { return }
+    ecn := (buf[1] >> 4) & 0x03
+    if ecn == 0x00 || ecn == 0x03 { return }
+    buf[1] = (buf[1] &^ 0x30) | 0x30  // set ECN=CE, preserve DSCP + Flow Label
+}
+```
+
+**Эффект:**
+- Весь IPv6 inner трафик (TCP, QUIC) теперь получает ECN CE при congestion
+- Inner sender (браузер, curl, YouTube) реагирует через RFC 3168 синхронно с BBR
+- Double CC mitigation распространяется на 100% туннельного трафика (ранее только IPv4)
+- Нулевых аллокаций — только 3 операции AND/OR на байт
+- Backward-compatible: IPv4 поведение не изменилось; пакеты с неизвестной версией игнорируются
+
+**Тесты добавлены (7 новых):**
+- `TestMarkECNCE_IPv6NonECT` — Non-ECT IPv6 пакет не изменён
+- `TestMarkECNCE_IPv6AlreadyCE` — уже-CE IPv6 пакет не изменён
+- `TestMarkECNCE_IPv6ECT0` — ECT(0) → CE=11 (byte[1] bits[5:4] = 11)
+- `TestMarkECNCE_IPv6ECT1` — ECT(1) → CE=11
+- `TestMarkECNCE_IPv6PreservesDSCP` — DSCP биты (byte[0] low nibble + byte[1] high 2 bits) не тронуты
+- `TestMarkECNCE_IPv6PreservesFlowLabel` — Flow Label (byte[1] low nibble + bytes[2-3]) не тронут
+- `TestMarkECNCE_IPv6TooShort` — буфер < 40 байт не паникует
+- `TestMarkECNCE_UnknownVersionIgnored` — IP version ≠ 4,6 → пакет не изменён
+
+(Тест `TestMarkECNCE_IPv6Ignored` удалён — он проверял старое поведение «не трогать IPv6».)
+
+`go test ./... -count=1` — все 8 пакетов зелёные (14/14 TestMarkECNCE* прошли).
+
+---
+
+## Следующие задачи (приоритетный бэклог)
+
+1. **pprof под нагрузкой** — Запуск 24 добавил pprof endpoint. Следующий шаг: реально
+   проанализировать CPU профиль при 30 Mbps нагрузке, найти оставшиеся hotspot-ы.
+
+2. **IPv6 outer tunnel** — текущий `ipPool` поддерживает только IPv4 CIDRs. Расширение
+   до IPv6 потребует рефакторинга `ipToUint32`, `routeFromTun` и TUN настройки.
+
+3. **QUIC ECN feedback** — QUIC имеет собственный механизм ECN feedback (RFC 9000 §13.4).
+   Текущая реализация рассчитана на TCP ECN-Echo. Проверить, корректно ли QUIC реагирует
+   на CE marking в inner IPv6 пакетах.
