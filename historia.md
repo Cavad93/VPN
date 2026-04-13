@@ -1783,15 +1783,75 @@ Improvement незначительный в абсолютных цифрах (~
 
 ---
 
+## Запуск 30 — 2026-04-13
+
+### Выполнено: IPv6 outer tunnel — Sub-task 1: ip6Pool + ip6Index (адресный пул)
+
+**Файлы:** `server/main.go`, `server/main_test.go`
+
+**Задача (бэклог):**
+Первый из трёх атомарных шагов расширения VPN-туннеля до dual-stack (IPv4+IPv6).
+`ipPool` поддерживал только IPv4. Серверу нужна аналогичная структура для IPv6.
+
+**Добавлено в `Config`:**
+```go
+Tun6CIDR string  // "fc00::1/120"; пустая строка = отключено
+```
+Флаг `-tun6-cidr` в `main()`.
+
+**Новая структура `ip6Pool`:**
+- `network *net.IPNet` — IPv6 сеть
+- `server net.IP` — 16-байтный адрес сервера (pre-marked used)
+- `used map[[16]byte]bool` — занятые адреса
+
+Методы: `newIP6Pool(cidr)`, `allocate()`, `release(ip)`, `serverIP()`, `prefixLen()`.
+
+Ключевые отличия от `ipPool`:
+- Ключ карты — `[16]byte` вместо `uint32` (128 бит против 32 бит)
+- Нет broadcast-адреса (IPv6 не имеет broadcast), поэтому перебор идёт до `!network.Contains(current)`
+- `incrementIP` работает для 16-байтных слайсов без изменений (big-endian carry)
+- Нет `isBroadcast` на IPv6-пути
+
+**Новые хелперы:**
+- `ipToKey16(ip net.IP) [16]byte` — конвертация IPv6 → сравнимый map-ключ
+- `cloneIP6(ip net.IP) net.IP` — 16-байтная копия без утечки ссылок
+
+**Изменения в `Server`:**
+```go
+ip6Index sync.Map   // [16]byte → *clientSession (только когда pool6 != nil)
+pool6    *ip6Pool   // nil пока Tun6CIDR не задан
+```
+В `NewServer`: если `cfg.Tun6CIDR != ""` → создаётся `p6` через `newIP6Pool`, сохраняется в `s.pool6`. Ошибка разбора → ранний выход.
+
+**Тесты (8 новых):**
+- `TestNewIP6Pool` — valid/invalid CIDR + IPv4 CIDR rejected
+- `TestIP6PoolAllocate` — два разных адреса, не совпадают с serverIP
+- `TestIP6PoolRelease` — освобождённый адрес возвращается при следующей аллокации
+- `TestIP6PoolExhausted` — /127 (2 адреса: network+server) → немедленная ошибка
+- `TestIP6PoolServerIP` — serverIP == "fc00::1", prefixLen == 120
+- `TestIPToKey16` — разные адреса → разные ключи; тот же адрес → тот же ключ
+- `TestNewServerWithTun6CIDR` — `pool6 != nil`, serverIP корректен
+- `TestNewServerInvalidTun6CIDR` — плохой CIDR → NewServer возвращает ошибку
+
+`go test ./... -count=1` — все 8 пакетов зелёные.
+
+**Следующие под-задачи IPv6 outer tunnel (в очереди):**
+- **Sub-task 2**: TUN config — `ip -6 addr add <pool6.serverIP()>/N dev tunX` при запуске
+- **Sub-task 3**: `routeFromTun` routing — детект IPv6 (ver=6), lookup в `ip6Index`, forward
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **pprof под нагрузкой** — Запуск 24 добавил pprof endpoint. Следующий шаг: реально
    проанализировать CPU профиль при 30 Mbps нагрузке, найти оставшиеся hotspot-ы.
 
-2. **IPv6 outer tunnel** — `ipPool` поддерживает только IPv4 CIDRs. Расширение до IPv6:
-   - Добавить `ip6Index sync.Map` ([4]uint64 ключ) в `Server`
-   - Аллоцировать IPv6 адрес из `fc00::/8` подсети для клиента в `handleControlStream`
-   - В `routeFromTun`: детектировать IPv6 (ver=6, dst в bytes 24–40), lookup в ip6Index
-   - Настроить IPv6 адрес на TUN интерфейсе (`ip -6 addr add fc00::1/64 dev tunX`)
-   - Разбить на 3 атомарных под-задачи (ipPool → TUN config → routeFromTun routing)
+2. **IPv6 outer tunnel Sub-task 2** — TUN configure:
+   - В `tun_linux.go`: добавить `ip -6 addr add <pool6.serverIP()>/N dev <name> && ip -6 route add <prefix> dev <name>` в `ConfigureTun6`
+   - В `tun_configure_windows.go`: добавить `netsh interface ipv6 add address`
+   - В `main()`: при `cfg.Tun6CIDR != "" && s.pool6 != nil` → вызвать `ConfigureTun6`
+
+3. **IPv6 outer tunnel Sub-task 3** — routeFromTun routing:
+   - После существующего IPv4 lookup добавить: `if n >= 40 && buf[0]>>4 == 6` → `dstKey6 := ipToKey16(buf[24:40])` → `s.ip6Index.Load(dstKey6)`
+   - В `handleControlStream`: аллоцировать IPv6 (если `pool6 != nil`), сохранить в `ip6Index`, сообщить клиенту
 

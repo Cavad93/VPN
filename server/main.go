@@ -54,6 +54,7 @@ type TunDevice interface {
 type Config struct {
 	ListenAddr      string
 	TunCIDR         string
+	Tun6CIDR        string // optional IPv6 CIDR for dual-stack, e.g. "fc00::1/120"; empty = disabled
 	PrivKeyFile     string
 	Transport       string // "tcp" (default) or "udp" (user-space BBR)
 	AllowedKeysFile string // path to persist the allowed-keys list across restarts
@@ -206,9 +207,14 @@ type Server struct {
 	// happen only on connect/disconnect (rare).  sync.Map avoids any lock
 	// in the steady-state read path via an atomic pointer swap.
 	ipIndex     sync.Map
+	// ip6Index maps [16]byte IPv6 destination address → *clientSession.
+	// Only populated when pool6 != nil (Tun6CIDR is configured).
+	// Same read-heavy access pattern as ipIndex — sync.Map is optimal.
+	ip6Index    sync.Map
 	allowedKeys map[[32]byte]struct{}
 	tun         TunDevice
 	pool        *ipPool
+	pool6       *ip6Pool // nil when Tun6CIDR is not configured
 	nextIDMu    sync.Mutex
 	nextID      uint64
 	// notifSvc is optional; when set, push notifications are fired on
@@ -241,6 +247,14 @@ func NewServer(cfg Config, kp *crypto.KeyPair, tun TunDevice, allowedKeys [][cry
 		tun:      tun,
 		pool:     pool,
 		nextID:   1,
+	}
+
+	if cfg.Tun6CIDR != "" {
+		p6, err := newIP6Pool(cfg.Tun6CIDR)
+		if err != nil {
+			return nil, fmt.Errorf("server: invalid Tun6CIDR: %w", err)
+		}
+		s.pool6 = p6
 	}
 
 	if len(allowedKeys) > 0 {
@@ -1565,6 +1579,108 @@ func isBroadcast(ip net.IP, network *net.IPNet) bool {
 }
 
 // ---------------------------------------------------------------------------
+// ip6Pool — IPv6 address allocator
+// ---------------------------------------------------------------------------
+
+// ip6Pool allocates client IPv6 addresses from a ULA CIDR subnet.
+// The host address in the CIDR is the server address and is pre-marked as used.
+// Only pure IPv6 CIDRs are accepted; use newIPPool for IPv4.
+type ip6Pool struct {
+	mu      sync.Mutex
+	network *net.IPNet
+	server  net.IP          // 16-byte IPv6
+	used    map[[16]byte]bool
+}
+
+// newIP6Pool parses cidr (must be an IPv6 CIDR, e.g. "fc00::1/120") and
+// returns an ip6Pool. The host address in cidr becomes the server address and
+// is pre-marked as used along with the network address.
+func newIP6Pool(cidr string) (*ip6Pool, error) {
+	ip, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, fmt.Errorf("ip6Pool: parse CIDR %q: %w", cidr, err)
+	}
+	// Reject IPv4 addresses (including IPv4-mapped IPv6).
+	if ip.To4() != nil {
+		return nil, errors.New("ip6Pool: only IPv6 CIDRs are supported")
+	}
+	serverIP := ip.To16()
+	if serverIP == nil {
+		return nil, errors.New("ip6Pool: invalid IPv6 address")
+	}
+	p := &ip6Pool{
+		network: network,
+		server:  cloneIP6(serverIP),
+		used:    make(map[[16]byte]bool),
+	}
+	// Pre-mark network address and server address as used.
+	p.used[ipToKey16(network.IP)] = true
+	p.used[ipToKey16(serverIP)] = true
+	return p, nil
+}
+
+// allocate returns the next available IPv6 address in the subnet.
+func (p *ip6Pool) allocate() (net.IP, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Start from network address + 1.
+	current := cloneIP6(p.network.IP)
+	incrementIP(current) // incrementIP works for any slice length
+
+	for p.network.Contains(current) {
+		key := ipToKey16(current)
+		if !p.used[key] {
+			p.used[key] = true
+			return cloneIP6(current), nil
+		}
+		incrementIP(current)
+	}
+	return nil, errors.New("ip6Pool: address space exhausted")
+}
+
+// release marks ip as available again.
+func (p *ip6Pool) release(ip net.IP) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Guard: only release genuine IPv6 (not IPv4-mapped).
+	if ip.To4() == nil {
+		if ip6 := ip.To16(); ip6 != nil {
+			delete(p.used, ipToKey16(ip6))
+		}
+	}
+}
+
+// serverIP returns the server's IPv6 address in the subnet.
+func (p *ip6Pool) serverIP() net.IP { return cloneIP6(p.server) }
+
+// prefixLen returns the network prefix length.
+func (p *ip6Pool) prefixLen() int {
+	ones, _ := p.network.Mask.Size()
+	return ones
+}
+
+// ipToKey16 converts an IPv6 address to a comparable [16]byte map key.
+func ipToKey16(ip net.IP) [16]byte {
+	var key [16]byte
+	if ip6 := ip.To16(); ip6 != nil {
+		copy(key[:], ip6)
+	}
+	return key
+}
+
+// cloneIP6 returns a 16-byte copy of an IPv6 address.
+func cloneIP6(ip net.IP) net.IP {
+	ip6 := ip.To16()
+	if ip6 == nil {
+		return nil
+	}
+	out := make(net.IP, 16)
+	copy(out, ip6)
+	return out
+}
+
+// ---------------------------------------------------------------------------
 // Key pair loading / generation
 // ---------------------------------------------------------------------------
 
@@ -1644,6 +1760,7 @@ func main() {
 	var openAccess bool
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
 	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
+	flag.StringVar(&cfg.Tun6CIDR, "tun6-cidr", cfg.Tun6CIDR, "TUN IPv6 CIDR for dual-stack clients (e.g. fc00::1/120; empty to disable)")
 	flag.StringVar(&cfg.PrivKeyFile, "privkey", cfg.PrivKeyFile, "path to hex-encoded private key file")
 	flag.StringVar(&cfg.Transport, "transport", cfg.Transport, "transport protocol: tcp (kernel CC) or udp (user-space BBR)")
 	flag.StringVar(&cfg.AllowedKeysFile, "allowed-keys-file", cfg.AllowedKeysFile, "path to file with allowed client public keys (one hex key per line); persists across restarts")

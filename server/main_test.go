@@ -279,6 +279,221 @@ func TestIsBroadcast(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TestNewIP6Pool
+// ---------------------------------------------------------------------------
+
+func TestNewIP6Pool(t *testing.T) {
+	t.Parallel()
+
+	// Valid IPv6 CIDR
+	pool, err := newIP6Pool("fc00::1/120")
+	if err != nil {
+		t.Fatalf("newIP6Pool valid: %v", err)
+	}
+	if pool == nil {
+		t.Fatal("pool is nil")
+	}
+
+	// Invalid CIDR
+	_, err = newIP6Pool("not-a-cidr")
+	if err == nil {
+		t.Error("expected error for invalid CIDR")
+	}
+
+	// IPv4 CIDR must be rejected
+	_, err = newIP6Pool("10.8.0.1/24")
+	if err == nil {
+		t.Error("expected error for IPv4 CIDR")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestIP6PoolAllocate
+// ---------------------------------------------------------------------------
+
+func TestIP6PoolAllocate(t *testing.T) {
+	t.Parallel()
+	pool, err := newIP6Pool("fc00::1/120")
+	if err != nil {
+		t.Fatalf("newIP6Pool: %v", err)
+	}
+
+	serverIP := pool.serverIP()
+
+	ip1, err := pool.allocate()
+	if err != nil {
+		t.Fatalf("first allocate: %v", err)
+	}
+	if ip1.Equal(serverIP) {
+		t.Errorf("first allocation must not be server IP %s", serverIP)
+	}
+	// Must be a proper IPv6 address (16 bytes)
+	if len(ip1) != 16 {
+		t.Errorf("allocated IP length: got %d, want 16", len(ip1))
+	}
+
+	ip2, err := pool.allocate()
+	if err != nil {
+		t.Fatalf("second allocate: %v", err)
+	}
+	if ip1.Equal(ip2) {
+		t.Errorf("two allocations returned same IP: %s", ip1)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestIP6PoolRelease
+// ---------------------------------------------------------------------------
+
+func TestIP6PoolRelease(t *testing.T) {
+	t.Parallel()
+	pool, err := newIP6Pool("fc00::1/120")
+	if err != nil {
+		t.Fatalf("newIP6Pool: %v", err)
+	}
+
+	ip1, err := pool.allocate()
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+
+	pool.release(ip1)
+
+	// Re-allocate — should get the same IP back (first available after network addr).
+	ip2, err := pool.allocate()
+	if err != nil {
+		t.Fatalf("re-allocate after release: %v", err)
+	}
+	if !ip1.Equal(ip2) {
+		t.Errorf("expected %s after release, got %s", ip1, ip2)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestIP6PoolExhausted
+// ---------------------------------------------------------------------------
+
+func TestIP6PoolExhausted(t *testing.T) {
+	t.Parallel()
+	// /127: only fc00::0 (network) and fc00::1 (server) — both pre-marked used.
+	// Unlike IPv4, IPv6 has no broadcast address, but /127 leaves 0 allocatable
+	// addresses (the entire 2-address block is consumed by network + server).
+	pool, err := newIP6Pool("fc00::1/127")
+	if err != nil {
+		t.Fatalf("newIP6Pool /127: %v", err)
+	}
+
+	// First allocation must fail immediately — no free slots.
+	_, err = pool.allocate()
+	if err == nil {
+		t.Error("expected error when pool is exhausted")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestIP6PoolServerIP
+// ---------------------------------------------------------------------------
+
+func TestIP6PoolServerIP(t *testing.T) {
+	t.Parallel()
+	pool, err := newIP6Pool("fc00::1/120")
+	if err != nil {
+		t.Fatalf("newIP6Pool: %v", err)
+	}
+
+	sip := pool.serverIP()
+	want := net.ParseIP("fc00::1")
+	if !sip.Equal(want) {
+		t.Errorf("serverIP: got %s, want %s", sip, want)
+	}
+
+	plen := pool.prefixLen()
+	if plen != 120 {
+		t.Errorf("prefixLen: got %d, want 120", plen)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestIPToKey16
+// ---------------------------------------------------------------------------
+
+func TestIPToKey16(t *testing.T) {
+	t.Parallel()
+
+	ip := net.ParseIP("fc00::1")
+	key := ipToKey16(ip)
+
+	// The key should not be all zeros.
+	allZero := true
+	for _, b := range key {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		t.Error("ipToKey16: returned all-zero key for fc00::1")
+	}
+
+	// Two different addresses must produce different keys.
+	ip2 := net.ParseIP("fc00::2")
+	key2 := ipToKey16(ip2)
+	if key == key2 {
+		t.Errorf("ipToKey16: fc00::1 and fc00::2 produced the same key")
+	}
+
+	// Same address must produce the same key.
+	key3 := ipToKey16(net.ParseIP("fc00::1"))
+	if key != key3 {
+		t.Errorf("ipToKey16: same address produced different keys (%v vs %v)", key, key3)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestNewServerWithTun6CIDR
+// ---------------------------------------------------------------------------
+
+func TestNewServerWithTun6CIDR(t *testing.T) {
+	t.Parallel()
+	tun := newMockTun()
+	defer tun.Close()
+
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	logger := slog.Default()
+
+	cfg := DefaultConfig()
+	cfg.Tun6CIDR = "fc00::1/120"
+	srv, err := NewServer(cfg, kp, tun, nil, logger)
+	if err != nil {
+		t.Fatalf("NewServer with Tun6CIDR: %v", err)
+	}
+	if srv.pool6 == nil {
+		t.Error("pool6 is nil after setting Tun6CIDR")
+	}
+	sip := srv.pool6.serverIP()
+	if !sip.Equal(net.ParseIP("fc00::1")) {
+		t.Errorf("pool6 serverIP: got %s, want fc00::1", sip)
+	}
+}
+
+func TestNewServerInvalidTun6CIDR(t *testing.T) {
+	t.Parallel()
+	tun := newMockTun()
+	defer tun.Close()
+
+	kp, _ := crypto.GenerateKeyPair()
+	cfg := DefaultConfig()
+	cfg.Tun6CIDR = "not-a-valid-cidr"
+	_, err := NewServer(cfg, kp, tun, nil, slog.Default())
+	if err == nil {
+		t.Error("expected error for invalid Tun6CIDR")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TestNewServer
 // ---------------------------------------------------------------------------
 
