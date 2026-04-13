@@ -2313,6 +2313,150 @@ func TestMarkECNCE_UnknownVersionIgnored(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// QUIC ECN feedback verification (RFC 9000 §13.4)
+// ---------------------------------------------------------------------------
+//
+// QUIC runs over IPv4/UDP or IPv6/UDP.  markECNCE operates purely on the IP
+// header ECN bits and does not touch any bytes beyond the header — so the
+// UDP header and the QUIC payload are always preserved verbatim.
+//
+// When the OS delivers the CE-marked inner IP packet to the QUIC socket via
+// the TUN interface, the QUIC stack reads the ECN field through
+// IP_RECVTOS (IPv4) or IPV6_RECVTCLASS (IPv6).  If the CE counter in the
+// peer's QUIC ACK frame increases, the sender's congestion controller reduces
+// its rate — exactly the Double-CC mitigation we want.
+//
+// The tests below confirm that CE marking is payload-agnostic: only the ECN
+// bits in the IP header change; the UDP header and QUIC first byte are intact.
+
+// buildIPv4UDP constructs a minimal IPv4/UDP packet with the given TOS byte.
+// The first 8 bytes of payload are a synthetic UDP header (src/dst port, len,
+// checksum).  Bytes after that are the "QUIC" payload filled with a pattern.
+func buildIPv4UDP(tos byte, quicPayloadLen int) []byte {
+	const udpHdrLen = 8
+	totalPayload := udpHdrLen + quicPayloadLen
+	pkt := buildIPv4(tos, totalPayload) // builds IPv4 header + zero payload
+	pkt[9] = 17                         // Protocol: UDP (overwrite TCP=6)
+	// UDP header (bytes 20-27).
+	pkt[20] = 0x12; pkt[21] = 0x34              // src port 0x1234
+	pkt[22] = 0x01; pkt[23] = 0xBB              // dst port 443
+	pkt[24] = 0x00; pkt[25] = byte(udpHdrLen + quicPayloadLen) // UDP length
+	pkt[26] = 0xAB; pkt[27] = 0xCD              // checksum (not verified by VPN)
+	// QUIC short-header first byte (Fixed Bit=1, Spin=0 → 0x40).
+	pkt[28] = 0x40
+	for i := 29; i < len(pkt); i++ {
+		pkt[i] = byte(i ^ 0xA5)
+	}
+	return pkt
+}
+
+// buildIPv6UDP constructs a minimal IPv6/UDP packet with the given Traffic
+// Class byte.  Next Header is set to 17 (UDP).  The UDP header occupies
+// bytes 40-47 and the QUIC payload fills the rest.
+func buildIPv6UDP(tc byte, quicPayloadLen int) []byte {
+	const udpHdrLen = 8
+	pkt := buildIPv6(tc, udpHdrLen+quicPayloadLen)
+	pkt[6] = 17 // Next Header: UDP (overwrite TCP=6)
+	// UDP header (bytes 40-47).
+	pkt[40] = 0x12; pkt[41] = 0x34
+	pkt[42] = 0x01; pkt[43] = 0xBB
+	pkt[44] = 0x00; pkt[45] = byte(udpHdrLen + quicPayloadLen)
+	pkt[46] = 0xAB; pkt[47] = 0xCD
+	// QUIC long-header first byte (Header Form=1, Fixed Bit=1 → 0xC0).
+	pkt[48] = 0xC0
+	for i := 49; i < len(pkt); i++ {
+		pkt[i] = byte(i ^ 0x5A)
+	}
+	return pkt
+}
+
+// TestMarkECNCE_QUICIPv4PayloadPreserved verifies that CE marking on an inner
+// IPv4/UDP packet only changes the ECN bits and leaves the UDP header and QUIC
+// application payload completely unmodified.
+func TestMarkECNCE_QUICIPv4PayloadPreserved(t *testing.T) {
+	const quicLen = 30
+	pkt := buildIPv4UDP(0x02, quicLen) // ECT(0)
+
+	// Snapshot everything from the UDP header onwards.
+	transport := make([]byte, len(pkt)-20)
+	copy(transport, pkt[20:])
+
+	markECNCE(pkt, len(pkt))
+
+	// ECN must be CE=11.
+	if ecn := pkt[1] & 0x03; ecn != 0x03 {
+		t.Errorf("ECN not marked CE: got %02x", ecn)
+	}
+	// IPv4 checksum must be valid.
+	if !ipv4ChecksumValid(pkt) {
+		t.Error("IPv4 checksum invalid after CE marking")
+	}
+	// UDP header (src/dst port, len, checksum) must be byte-identical.
+	if !bytes.Equal(pkt[20:28], transport[:8]) {
+		t.Errorf("UDP header corrupted: want %x got %x", transport[:8], pkt[20:28])
+	}
+	// QUIC payload must be byte-identical.
+	if !bytes.Equal(pkt[28:], transport[8:]) {
+		t.Error("QUIC payload corrupted by markECNCE")
+	}
+}
+
+// TestMarkECNCE_QUICIPv6PayloadPreserved is the same verification for IPv6/UDP.
+func TestMarkECNCE_QUICIPv6PayloadPreserved(t *testing.T) {
+	const quicLen = 30
+	pkt := buildIPv6UDP(0x02, quicLen) // ECT(0)
+
+	// Snapshot from the UDP header onwards (IPv6 header = 40 bytes).
+	transport := make([]byte, len(pkt)-40)
+	copy(transport, pkt[40:])
+
+	markECNCE(pkt, len(pkt))
+
+	// ECN must be CE=11.
+	if ecn := extractIPv6ECN(pkt); ecn != 0x03 {
+		t.Errorf("IPv6 ECN not marked CE: got %02x", ecn)
+	}
+	// UDP header must be byte-identical.
+	if !bytes.Equal(pkt[40:48], transport[:8]) {
+		t.Errorf("UDP header corrupted: want %x got %x", transport[:8], pkt[40:48])
+	}
+	// QUIC payload must be byte-identical.
+	if !bytes.Equal(pkt[48:], transport[8:]) {
+		t.Error("QUIC payload corrupted by markECNCE")
+	}
+}
+
+// TestMarkECNCE_QUICIPv6NonECTUnchanged verifies that a QUIC/IPv6 packet with
+// Non-ECT (TC=0x00) is not modified at all — QUIC stacks that do not set ECT
+// are not affected.
+func TestMarkECNCE_QUICIPv6NonECTUnchanged(t *testing.T) {
+	const quicLen = 20
+	pkt := buildIPv6UDP(0x00, quicLen) // Non-ECT
+	original := make([]byte, len(pkt))
+	copy(original, pkt)
+
+	markECNCE(pkt, len(pkt))
+
+	if !bytes.Equal(pkt, original) {
+		t.Error("markECNCE modified a Non-ECT QUIC/IPv6 packet")
+	}
+}
+
+// TestMarkECNCE_QUICIPv4NonECTUnchanged verifies the same for IPv4/UDP/QUIC.
+func TestMarkECNCE_QUICIPv4NonECTUnchanged(t *testing.T) {
+	const quicLen = 20
+	pkt := buildIPv4UDP(0x00, quicLen) // Non-ECT
+	original := make([]byte, len(pkt))
+	copy(original, pkt)
+
+	markECNCE(pkt, len(pkt))
+
+	if !bytes.Equal(pkt, original) {
+		t.Error("markECNCE modified a Non-ECT QUIC/IPv4 packet")
+	}
+}
+
 // TestConnCongested verifies that Congested() returns false when idle.
 // It uses the low-level transport.Conn directly (no UDP round-trip needed
 // for this check — inflight==0 is the initial state).

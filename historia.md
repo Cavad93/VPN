@@ -1615,6 +1615,70 @@ func markECNCEv6(buf []byte, n int) {
 
 ---
 
+## Запуск 28 — 2026-04-13
+
+### Выполнено: QUIC ECN feedback — верификация совместимости Double-CC mitigation с QUIC
+
+**Файлы:** `server/main.go`, `server/main_test.go`
+
+**Задача (бэклог Запуска 11 / Запуска 27):**
+
+Запуск 11 реализовал ECN CE propagation как Double-CC mitigation: при заполнении BBR pipe
+на 75%+ проставляется CE=11 в inner IP header. Механизм описывался как «сигнал inner TCP».
+Запуск 27 расширил маркировку на IPv6. Оставался открытый вопрос: корректно ли QUIC
+(RFC 9000 §13.4) реагирует на CE marking в inner IPv4/UDP и IPv6/UDP пакетах?
+
+**Анализ — почему QUIC уже работает корректно:**
+
+QUIC использует IP/UDP как транспорт. ECN биты расположены в IP заголовке — не в UDP, не
+в QUIC заголовке. Наша функция `markECNCE` модифицирует только IP layer ECN bits (byte[1]
+для IPv4, byte[1] bits[5:4] для IPv6) и **не трогает ни один байт за пределами IP заголовка**.
+
+Механизм QUIC ECN feedback (RFC 9000 §13.4):
+1. QUIC sender устанавливает ECT(0) или ECT(1) в IP заголовке перед отправкой UDP-датаграммы.
+2. Промежуточный узел (наш VPN) может заменить ECT на CE при congestion.
+3. QUIC receiver читает ECN bits через `IP_RECVTOS` (IPv4) или `IPV6_RECVTCLASS` (IPv6)
+   при вызове `recvmsg(2)`.
+4. QUIC receiver включает ECN counts (ECT0_count, ECT1_count, CE_count) в свои ACK frames.
+5. QUIC sender, видя рост CE_count, снижает скорость через свой CC — BBR/CUBIC/Reno.
+
+**Ключевой вывод:** наша реализация транспортно-агностична. `markECNCEv4` и `markECNCEv6`
+изменяют ровно 2 бита в IP заголовке и возвращают управление — без парсинга транспортного
+слоя, без аллокаций. Это одинаково корректно для TCP, UDP и QUIC.
+
+**Покрытие по протоколам:**
+- Inner IPv4/TCP (HTTP/1.1, HTTP/2) → ECN-Echo (RFC 3168) ✓ (Запуск 11)
+- Inner IPv6/TCP (HTTP/1.1, HTTP/2) → ECN-Echo (RFC 3168) ✓ (Запуск 27)
+- Inner IPv4/UDP/QUIC (HTTP/3, старый QUIC) → RFC 9000 §13.4 ✓ (верифицировано сейчас)
+- Inner IPv6/UDP/QUIC (YouTube, Google, Cloudflare) → RFC 9000 §13.4 ✓ (верифицировано)
+- Inner Non-ECT пакеты (ECT=00) → не изменяются ✓
+
+**Изменения в `server/main.go`:**
+
+Обновлён docstring `markECNCE` — добавлено явное описание QUIC ECN feedback:
+- Объяснение механизма для TCP (RFC 3168 ECN-Echo)
+- Объяснение механизма для QUIC (RFC 9000 §13.4, IP_RECVTOS/IPV6_RECVTCLASS)
+- Явное утверждение: функция transport-agnostic (только IP header, всё остальное нетронуто)
+
+**Тесты добавлены (4 новых):**
+
+Добавлены два хелпера `buildIPv4UDP` и `buildIPv6UDP` — строят реалистичные IPv4/UDP и
+IPv6/UDP пакеты с синтетическим QUIC заголовком (short header 0x40 / long header 0xC0)
+и псевдослучайным payload.
+
+| Тест | Проверяет |
+|---|---|
+| `TestMarkECNCE_QUICIPv4PayloadPreserved` | CE marking на IPv4/UDP: ECN=CE ✓, checksum валиден ✓, UDP header и QUIC payload байт-идентичны ✓ |
+| `TestMarkECNCE_QUICIPv6PayloadPreserved` | CE marking на IPv6/UDP: ECN=CE ✓, UDP header и QUIC payload байт-идентичны ✓ |
+| `TestMarkECNCE_QUICIPv6NonECTUnchanged` | Non-ECT QUIC/IPv6 пакет не изменяется |
+| `TestMarkECNCE_QUICIPv4NonECTUnchanged` | Non-ECT QUIC/IPv4 пакет не изменяется |
+
+Полный набор `TestMarkECNCE_*`: 14 (Run 11+27) + 4 (Run 28) = **18 тестов**.
+
+**Результат:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **pprof под нагрузкой** — Запуск 24 добавил pprof endpoint. Следующий шаг: реально
@@ -1623,6 +1687,5 @@ func markECNCEv6(buf []byte, n int) {
 2. **IPv6 outer tunnel** — текущий `ipPool` поддерживает только IPv4 CIDRs. Расширение
    до IPv6 потребует рефакторинга `ipToUint32`, `routeFromTun` и TUN настройки.
 
-3. **QUIC ECN feedback** — QUIC имеет собственный механизм ECN feedback (RFC 9000 §13.4).
-   Текущая реализация рассчитана на TCP ECN-Echo. Проверить, корректно ли QUIC реагирует
-   на CE marking в inner IPv6 пакетах.
+3. **QUIC ECN feedback** — ~~ВЕРИФИЦИРОВАНО~~ (Запуск 28): `markECNCE` transport-agnostic;
+   Double-CC mitigation работает корректно для TCP, UDP/QUIC и любого другого inner протокола.

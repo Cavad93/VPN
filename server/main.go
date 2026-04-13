@@ -876,9 +876,22 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 // unchanged.
 //
 // Purpose: Double-CC mitigation — when our BBR pipe is near-full
-// (Congested()==true), marking CE in the inner IP header signals the inner TCP
-// sender to reduce its rate via RFC 3168 ECN-Echo, synchronising it with our
-// BBR instead of reacting independently.
+// (Congested()==true), marking CE in the inner IP header signals inner senders
+// to reduce their rate, synchronising them with our BBR:
+//
+//   - Inner TCP senders: CE triggers RFC 3168 ECN-Echo in the next TCP ACK;
+//     the TCP sender halves cwnd (just like a loss event) without actual loss.
+//
+//   - Inner QUIC senders (RFC 9000 §13.4): QUIC reads ECN bits from the IP
+//     header via IP_RECVTOS / IPV6_RECVTCLASS.  When the CE counter in QUIC
+//     ACK frames increases, the QUIC sender's congestion controller reduces its
+//     rate.  This covers all QUIC/HTTP-3 traffic (YouTube, Google, Cloudflare)
+//     running over both IPv4/UDP and IPv6/UDP without any additional handling —
+//     markECNCE only touches the IP-layer ECN bits and leaves the UDP header
+//     and QUIC payload completely unmodified.
+//
+// Implementation is transport-protocol-agnostic: only the two ECN bits in the
+// IP header are changed; all bytes beyond the IP header are untouched.
 //
 // IPv4 header byte layout:
 //
