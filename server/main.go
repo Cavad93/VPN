@@ -35,10 +35,13 @@ import (
 // Control message type constants.
 const (
 	ctlHello            = uint8(0x01) // client→server: request IP assignment
-	ctlAssign           = uint8(0x02) // server→client: IP assignment response
+	ctlAssign           = uint8(0x02) // server→client: IPv4-only IP assignment response
 	ctlError            = uint8(0xFF) // server→client: error
 	ctlSecondary        = uint8(0x03) // client→server: attach secondary download connection
+	ctlAssignDual       = uint8(0x05) // server→client: dual-stack (IPv4+IPv6) assignment
 	ctlAssignPayloadLen = 9           // 4(ip) + 1(prefix_len) + 4(gateway)
+	// ctlAssignDualPayloadLen: ip4(4)+pfx4(1)+gw4(4)+ip6(16)+pfx6(1)+gw6(16) = 42 bytes.
+	ctlAssignDualPayloadLen = 42
 
 	noiseHandshakeMsgMaxSize = 4096
 )
@@ -167,9 +170,10 @@ type clientSession struct {
 	remoteKey    [32]byte
 	noiseSession *crypto.Session
 	mux          *transport.Mux
-	rawConn      net.Conn       // underlying TCP/UDP connection
+	rawConn      net.Conn         // underlying TCP/UDP connection
 	congestion   congestionProber // non-nil in UDP+BBR mode only
 	assignedIP   net.IP
+	assignedIP6  net.IP // nil when server is IPv4-only (no -tun6-cidr)
 	bond         streamBond // round-robin across parallel download connections
 	bytesIn      atomic.Uint64
 	bytesOut     atomic.Uint64
@@ -712,6 +716,10 @@ func (s *Server) runPrimaryConn(ctx context.Context, rawConn net.Conn, session *
 			s.ipIndex.Delete(packed)
 			s.pool.release(cs.assignedIP)
 		}
+		if cs.assignedIP6 != nil {
+			s.ip6Index.Delete(ipToKey16(cs.assignedIP6))
+			s.pool6.release(cs.assignedIP6)
+		}
 		s.logger.Info("session closed", "id", cs.id, "bonds", cs.bond.count())
 		if s.notifSvc != nil && assignedIP != "" {
 			s.notifSvc.NotifySessionDisconnected(cs.id, assignedIP)
@@ -797,33 +805,60 @@ func (s *Server) runSecondaryConn(ctx context.Context, clientKey [32]byte, ctlSt
 func (s *Server) handleControlStream(ctx context.Context, cs *clientSession, stream *transport.Stream) error {
 	defer stream.Close()
 
-	// Allocate IP
+	// Allocate IPv4 address.
 	ip, err := s.pool.allocate()
 	if err != nil {
 		stream.Write([]byte{ctlError}) //nolint:errcheck
 		return fmt.Errorf("ip allocation failed: %w", err)
 	}
-
 	cs.assignedIP = ip
 
 	// Register in O(1) reverse IP index so routeFromTun avoids O(n) scan.
 	packed := binary.BigEndian.Uint32(ip.To4())
 	s.ipIndex.Store(packed, cs)
 
-	// Build 10-byte response: ctlAssign + ip[4] + prefixLen[1] + gw[4]
-	resp := make([]byte, 1+ctlAssignPayloadLen)
-	resp[0] = ctlAssign
-	ip4 := ip.To4()
-	copy(resp[1:5], ip4)
-	resp[5] = byte(s.pool.prefixLen())
-	gw := s.pool.serverIP().To4()
-	copy(resp[6:10], gw)
+	// Optionally allocate an IPv6 address when dual-stack is configured.
+	// A failure here is non-fatal: the client falls back to IPv4-only.
+	var ip6 net.IP
+	if s.pool6 != nil {
+		if a, err2 := s.pool6.allocate(); err2 == nil {
+			ip6 = a
+			cs.assignedIP6 = ip6
+			s.ip6Index.Store(ipToKey16(ip6), cs)
+		} else {
+			s.logger.Warn("IPv6 address allocation failed, falling back to IPv4-only", "err", err2)
+		}
+	}
+
+	var resp []byte
+	if ip6 != nil {
+		// Dual-stack response: ctlAssignDual(1) + ip4(4) + pfx4(1) + gw4(4) + ip6(16) + pfx6(1) + gw6(16)
+		resp = make([]byte, 1+ctlAssignDualPayloadLen)
+		resp[0] = ctlAssignDual
+		copy(resp[1:5], ip.To4())
+		resp[5] = byte(s.pool.prefixLen())
+		copy(resp[6:10], s.pool.serverIP().To4())
+		copy(resp[10:26], ip6.To16())
+		resp[26] = byte(s.pool6.prefixLen())
+		copy(resp[27:43], s.pool6.serverIP().To16())
+	} else {
+		// IPv4-only response: ctlAssign(1) + ip4(4) + pfx4(1) + gw4(4)
+		resp = make([]byte, 1+ctlAssignPayloadLen)
+		resp[0] = ctlAssign
+		copy(resp[1:5], ip.To4())
+		resp[5] = byte(s.pool.prefixLen())
+		copy(resp[6:10], s.pool.serverIP().To4())
+	}
 
 	if _, err := stream.Write(resp); err != nil {
 		return fmt.Errorf("write assign response: %w", err)
 	}
 
-	s.logger.Info("assigned IP", "id", cs.id, "ip", ip.String())
+	if ip6 != nil {
+		s.logger.Info("assigned IP", "id", cs.id, "ip4", ip.String(), "ip6", ip6.String())
+	} else {
+		s.logger.Info("assigned IP", "id", cs.id, "ip", ip.String())
+	}
 
 	// Fire push notification for new connection (non-blocking).
 	if s.notifSvc != nil {

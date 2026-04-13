@@ -1731,6 +1731,71 @@ IPAddresses: [все интерфейсы сервера + 127.0.0.1]
 
 ---
 
+## Запуск 33 — 2026-04-13
+
+### Выполнено: IPv6 outer tunnel Sub-task 2 — handleControlStream dual-stack wiring
+
+**Файлы:** `server/main.go`, `server/main_test.go`
+
+**Контекст (продолжение commit `523523f` — Sub-task 1):**
+
+Sub-task 1 создал `ip6Pool` и `ip6Index`, но `handleControlStream` и `routeFromTun` ещё не использовали их. Sub-task 2 — подключение `handleControlStream`.
+
+**Изменения в `server/main.go`:**
+
+1. **Два новых протокольных константы:**
+   ```go
+   ctlAssignDual        = uint8(0x05) // server→client: dual-stack (IPv4+IPv6) assignment
+   ctlAssignDualPayloadLen = 42       // ip4(4)+pfx4(1)+gw4(4)+ip6(16)+pfx6(1)+gw6(16)
+   ```
+
+2. **`clientSession.assignedIP6 net.IP`** — хранит выделенный IPv6-адрес (nil для IPv4-only сессий).
+
+3. **`handleControlStream` расширен:**
+   - Если `s.pool6 != nil`: вызывает `s.pool6.allocate()`, сохраняет в `cs.assignedIP6`, регистрирует в `s.ip6Index.Store(ipToKey16(ip6), cs)`.
+   - Если IPv6 выделен успешно: отправляет `ctlAssignDual` (43 байта) с обоими адресами.
+   - Если `pool6 == nil` или IPv6 allocation failed: fallback на `ctlAssign` (10 байт) — backward-compatible.
+   - Ошибка выделения IPv6 логируется как Warn (не fatal) — клиент продолжает работать в IPv4-only режиме.
+
+4. **Cleanup defer в `handleConn`** расширен:
+   ```go
+   if cs.assignedIP6 != nil {
+       s.ip6Index.Delete(ipToKey16(cs.assignedIP6))
+       s.pool6.release(cs.assignedIP6)
+   }
+   ```
+   IPv6-адрес возвращается в пул при завершении сессии (аналогично IPv4).
+
+**Wire format dual-stack response (`ctlAssignDual` = 43 байта):**
+```
+[0x05]         — тип ctlAssignDual
+[ip4:4]        — выделенный IPv4 (big-endian)
+[pfx4:1]       — prefix length IPv4 subnet
+[gw4:4]        — IPv4 gateway (server IP)
+[ip6:16]       — выделенный IPv6 (big-endian 16 bytes)
+[pfx6:1]       — prefix length IPv6 subnet
+[gw6:16]       — IPv6 gateway (server IP)
+```
+Итого: 1 + 42 = 43 байта.
+
+**Backward compatibility:**
+- Старые клиенты (без IPv6 поддержки) получат `ctlAssign` (0x02) если `-tun6-cidr` не задан.
+- Новые клиенты, подключённые к IPv4-only серверу, получат `ctlAssign` (0x02) и продолжат работать.
+- `ctlAssignDual` отправляется только когда и сервер настроен с `-tun6-cidr`, и IPv6 выделен успешно.
+
+**Следующий шаг (Sub-task 3):** `routeFromTun` — маршрутизация IPv6 пакетов из TUN через `ip6Index`.
+
+**Тесты (5 новых + 1 helper):**
+- `doCtlAssign(t, mux)` — helper: открывает control stream, шлёт ctlHello, читает ответ с авто-детектом размера по типу
+- `TestHandleControlStreamIPv4Only` — без Tun6CIDR → ctlAssign (10 байт), адрес в 10.8.0.x
+- `TestHandleControlStreamDualStackAssign` — с Tun6CIDR=fc00::1/120 → ctlAssignDual (43 байта), IPv4 в 10.8.0.x, IPv6 в fc00::/120, gw6=fc00::1, pfx6=120
+- `TestHandleControlStreamDualStackIP6IndexRegistered` — после assign: `ip6Index` содержит `[16]byte → *clientSession`
+- `TestHandleControlStreamDualStackReleaseOnDisconnect` — после disconnect: `ip6Index` очищен
+
+**Результат:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог — обновлено 2026-04-13)
 
 1. **~~BBR app-limited~~** — ~~РЕШЕНО~~ (Run 4, регрессия, re-fix в pост-Run26 [E]).
@@ -1743,9 +1808,11 @@ IPAddresses: [все интерфейсы сервера + 127.0.0.1]
 8. **~~TLS cert fingerprint~~** — ~~РЕШЕНО~~ (Run 31): нет "CavadVPN" в CN/SAN, 90-day validity, no IP SANs.
 9. **~~IPv6 inner tunnel~~** — ~~РЕШЕНО~~ (Run 27 + пост-Run26 [A]): `markECNCE` обрабатывает IPv6 Traffic Class.
 10. **~~Certificate rotation~~** — ~~РЕШЕНО~~ (Run 32): zero-downtime hot-swap через `atomic.Pointer`, фоновая горутина 24h.
+11. **~~IPv6 outer tunnel Sub-task 1~~** — ~~РЕШЕНО~~ (commit `523523f`): `ip6Pool` + `ip6Index` аллокатор.
+12. **~~IPv6 outer tunnel Sub-task 2~~** — ~~РЕШЕНО~~ (Run 33): `handleControlStream` dual-stack wiring.
 
-Основной бэклог исчерпан. Потенциальные следующие задачи:
-- **IPv6 outer tunnel** — продолжение суб-задачи из commit `523523f` (ip6Pool + ip6Index готов).
+Следующие задачи:
+- **IPv6 outer tunnel Sub-task 3** — `routeFromTun`: добавить ветку `case 6` (IPv6 pkt), lookup в `ip6Index`, forward к сессии. Параллельно с IPv4-путём.
 - **pprof анализ под нагрузкой** — использовать `/debug/pprof/` endpoints (Запуск 24) для поиска CPU hotspots при 30 Mbps реальной нагрузке.
 
 ---

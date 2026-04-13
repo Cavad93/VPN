@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -2018,6 +2019,260 @@ func streamReadFull(s *transport.Stream, buf []byte) (int, error) {
 		}
 	}
 	return total, nil
+}
+
+// ---------------------------------------------------------------------------
+// IPv6 dual-stack handleControlStream tests (Sub-task 2)
+// ---------------------------------------------------------------------------
+
+// doCtlAssign opens a control stream on mux, sends ctlHello, and reads the
+// response into a returned byte slice. The caller is responsible for closing
+// the stream.
+func doCtlAssign(t *testing.T, mux *transport.Mux) ([]byte, *transport.Stream) {
+	t.Helper()
+	stream, err := mux.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	if _, err := stream.Write([]byte{ctlHello}); err != nil {
+		t.Fatalf("write ctlHello: %v", err)
+	}
+	// Read type byte first
+	typeBuf := make([]byte, 1)
+	if _, err := streamReadFull(stream, typeBuf); err != nil {
+		t.Fatalf("read type byte: %v", err)
+	}
+	var payload []byte
+	switch typeBuf[0] {
+	case ctlAssign:
+		payload = make([]byte, ctlAssignPayloadLen)
+	case ctlAssignDual:
+		payload = make([]byte, ctlAssignDualPayloadLen)
+	default:
+		t.Fatalf("unexpected ctl type byte: 0x%02x", typeBuf[0])
+	}
+	if _, err := streamReadFull(stream, payload); err != nil {
+		t.Fatalf("read payload: %v", err)
+	}
+	resp := append(typeBuf, payload...)
+	return resp, stream
+}
+
+// TestHandleControlStreamIPv4Only verifies that when pool6 is nil (no -tun6-cidr),
+// handleControlStream sends the original ctlAssign (10-byte) response.
+func TestHandleControlStreamIPv4Only(t *testing.T) {
+	t.Parallel()
+
+	tun := newMockTun()
+	defer tun.Close()
+
+	serverKP, _ := crypto.GenerateKeyPair()
+	clientKP, _ := crypto.GenerateKeyPair()
+
+	cfg := DefaultConfig() // no Tun6CIDR → pool6 == nil
+	srv, err := NewServer(cfg, serverKP, tun, nil, newTestLogger())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	sConn, cConn := net.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go srv.handleConn(ctx, sConn)
+
+	mux, _ := runClientHandshake(t, cConn, clientKP)
+	defer mux.Close()
+
+	resp, stream := doCtlAssign(t, mux)
+	defer stream.Close()
+
+	if resp[0] != ctlAssign {
+		t.Errorf("expected ctlAssign (0x%02x), got 0x%02x", ctlAssign, resp[0])
+	}
+	if len(resp) != 1+ctlAssignPayloadLen {
+		t.Errorf("expected %d bytes, got %d", 1+ctlAssignPayloadLen, len(resp))
+	}
+	// IPv4 should be in TunCIDR subnet (10.8.0.x)
+	assignedIP := net.IP(resp[1:5])
+	if !strings.HasPrefix(assignedIP.String(), "10.8.0.") {
+		t.Errorf("assigned IPv4 not in expected subnet: %s", assignedIP)
+	}
+}
+
+// TestHandleControlStreamDualStackAssign verifies that when pool6 is configured,
+// handleControlStream sends ctlAssignDual (43-byte) response with both IPv4 and IPv6.
+func TestHandleControlStreamDualStackAssign(t *testing.T) {
+	t.Parallel()
+
+	tun := newMockTun()
+	defer tun.Close()
+
+	serverKP, _ := crypto.GenerateKeyPair()
+	clientKP, _ := crypto.GenerateKeyPair()
+
+	cfg := DefaultConfig()
+	cfg.Tun6CIDR = "fc00::1/120"
+	srv, err := NewServer(cfg, serverKP, tun, nil, newTestLogger())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	sConn, cConn := net.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go srv.handleConn(ctx, sConn)
+
+	mux, _ := runClientHandshake(t, cConn, clientKP)
+	defer mux.Close()
+
+	resp, stream := doCtlAssign(t, mux)
+	defer stream.Close()
+
+	if resp[0] != ctlAssignDual {
+		t.Errorf("expected ctlAssignDual (0x%02x), got 0x%02x", ctlAssignDual, resp[0])
+	}
+	if len(resp) != 1+ctlAssignDualPayloadLen {
+		t.Errorf("expected %d bytes, got %d", 1+ctlAssignDualPayloadLen, len(resp))
+	}
+
+	// IPv4 part (bytes 1-9)
+	assignedIP4 := net.IP(resp[1:5])
+	if !strings.HasPrefix(assignedIP4.String(), "10.8.0.") {
+		t.Errorf("assigned IPv4 not in expected subnet: %s", assignedIP4)
+	}
+	pfx4 := resp[5]
+	if pfx4 == 0 {
+		t.Errorf("prefix4 should not be zero")
+	}
+	gw4 := net.IP(resp[6:10])
+	if !gw4.Equal(net.ParseIP("10.8.0.1")) {
+		t.Errorf("gateway4: got %s, want 10.8.0.1", gw4)
+	}
+
+	// IPv6 part (bytes 10-42)
+	assignedIP6 := net.IP(resp[10:26])
+	if !strings.HasPrefix(assignedIP6.String(), "fc00::") {
+		t.Errorf("assigned IPv6 not in fc00::/120 subnet: %s", assignedIP6)
+	}
+	pfx6 := resp[26]
+	if pfx6 != 120 {
+		t.Errorf("prefix6: got %d, want 120", pfx6)
+	}
+	gw6 := net.IP(resp[27:43])
+	if !gw6.Equal(net.ParseIP("fc00::1")) {
+		t.Errorf("gateway6: got %s, want fc00::1", gw6)
+	}
+}
+
+// TestHandleControlStreamDualStackIP6IndexRegistered verifies that after a
+// dual-stack assignment the assigned IPv6 address is stored in ip6Index.
+func TestHandleControlStreamDualStackIP6IndexRegistered(t *testing.T) {
+	t.Parallel()
+
+	tun := newMockTun()
+	defer tun.Close()
+
+	serverKP, _ := crypto.GenerateKeyPair()
+	clientKP, _ := crypto.GenerateKeyPair()
+
+	cfg := DefaultConfig()
+	cfg.Tun6CIDR = "fc00::1/120"
+	srv, err := NewServer(cfg, serverKP, tun, nil, newTestLogger())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	sConn, cConn := net.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go srv.handleConn(ctx, sConn)
+
+	mux, _ := runClientHandshake(t, cConn, clientKP)
+	defer mux.Close()
+
+	resp, stream := doCtlAssign(t, mux)
+	defer stream.Close()
+
+	if resp[0] != ctlAssignDual {
+		t.Fatalf("expected ctlAssignDual, got 0x%02x", resp[0])
+	}
+
+	// Extract the assigned IPv6 from response bytes 10:26
+	ip6bytes := make([]byte, 16)
+	copy(ip6bytes, resp[10:26])
+	var key [16]byte
+	copy(key[:], ip6bytes)
+
+	val, ok := srv.ip6Index.Load(key)
+	if !ok {
+		t.Fatal("ip6Index does not contain the assigned IPv6 address")
+	}
+	cs := val.(*clientSession)
+	if cs.assignedIP6 == nil {
+		t.Fatal("clientSession.assignedIP6 is nil")
+	}
+	if !cs.assignedIP6.Equal(net.IP(ip6bytes)) {
+		t.Errorf("assignedIP6 mismatch: got %s, want %s", cs.assignedIP6, net.IP(ip6bytes))
+	}
+}
+
+// TestHandleControlStreamDualStackReleaseOnDisconnect verifies that the IPv6
+// address is released from ip6Index and pool6 when the session ends.
+func TestHandleControlStreamDualStackReleaseOnDisconnect(t *testing.T) {
+	t.Parallel()
+
+	tun := newMockTun()
+	defer tun.Close()
+
+	serverKP, _ := crypto.GenerateKeyPair()
+	clientKP, _ := crypto.GenerateKeyPair()
+
+	cfg := DefaultConfig()
+	cfg.Tun6CIDR = "fc00::1/120"
+	srv, err := NewServer(cfg, serverKP, tun, nil, newTestLogger())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	sConn, cConn := net.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go srv.handleConn(ctx, sConn)
+
+	mux, _ := runClientHandshake(t, cConn, clientKP)
+
+	resp, stream := doCtlAssign(t, mux)
+	stream.Close()
+
+	if resp[0] != ctlAssignDual {
+		t.Fatalf("expected ctlAssignDual, got 0x%02x", resp[0])
+	}
+
+	var key [16]byte
+	copy(key[:], resp[10:26])
+
+	// Confirm entry is registered while session is alive.
+	if _, ok := srv.ip6Index.Load(key); !ok {
+		t.Fatal("ip6Index should contain entry before disconnect")
+	}
+
+	// Disconnect the client by closing mux and cancelling the context.
+	mux.Close()
+	cancel()
+
+	// Wait for the server goroutine to clean up (deferred cleanup runs synchronously
+	// after mux.Close and ctx.Done propagate).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := srv.ip6Index.Load(key); !ok {
+			break // cleaned up
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if _, ok := srv.ip6Index.Load(key); ok {
+		t.Error("ip6Index still contains entry after disconnect — IPv6 address not released")
+	}
 }
 
 // ---------------------------------------------------------------------------
