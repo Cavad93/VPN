@@ -1644,18 +1644,109 @@ IPAddresses: [все интерфейсы сервера + 127.0.0.1]
 
 ---
 
+## Запуск 32 — 2026-04-13
+
+### Выполнено: Автоматическая ротация TLS-сертификата — zero-downtime hot-swap
+
+**Файлы:** `server/vless_handler.go`, `server/cover_test.go`
+
+**Проблема (бэклог 10):**
+
+`ensureTLSCert` генерировала сертификат один раз при первом запуске и сохраняла его на диск. `RunVLESS` загружал сертификат в статический `tls.Config.Certificates` при старте. Сертификат действителен 90 дней (Let's Encrypt style). При длительном запуске сервера (типично для VPN: несколько месяцев без перезапуска) сертификат истекал без замены → TLS handshake начинал падать с ошибкой "certificate has expired" у всех новых клиентов.
+
+**Решение:**
+
+1. **`certNotAfter(certPath string) time.Time`**
+   - Читает PEM файл, декодирует первый блок, парсит X.509.
+   - Возвращает zero time при любой ошибке (файл отсутствует, неверный PEM, invalid DER) — zero time = "unknown → нужна ротация".
+
+2. **`certNeedsRotation(certPath string, renewBefore time.Duration) bool`**
+   - `certNotAfter.IsZero()` → true (нет файла → нужна генерация).
+   - `time.Until(notAfter) < renewBefore` → true (скоро истечёт → нужна ротация).
+   - `renewBefore = tlsCertRenewBefore = 30 * 24 * time.Hour` — стандарт Certbot.
+
+3. **Рефакторинг `RunVLESS`:**
+
+   **До:**
+   ```go
+   tlsCert, _ := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+   tlsConfig := &tls.Config{Certificates: []tls.Certificate{tlsCert}, ...}
+   ```
+   Статический срез = сертификат загружался один раз навсегда.
+
+   **После:**
+   ```go
+   var currentCert atomic.Pointer[tls.Certificate]
+   currentCert.Store(initialCert)
+   tlsConfig := &tls.Config{
+       GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+           return currentCert.Load(), nil  // lock-free, O(1)
+       },
+       ...
+   }
+   ```
+   `GetCertificate` вызывается при каждом TLS handshake → отдаёт текущий (возможно свежий) сертификат.
+
+4. **`rotateCert()` closure:**
+   - Проверяет `certNeedsRotation(cfg.TLSCert, tlsCertRenewBefore)`.
+   - Если нужна ротация: `os.Remove(cert)`, `os.Remove(key)` → `ensureTLSCert(...)` → `tls.LoadX509KeyPair(...)`.
+   - Если не нужна: просто `ensureTLSCert` + `LoadX509KeyPair` (идемпотентно — файлы уже есть).
+
+5. **Фоновая горутина (`tlsCertCheckInterval = 24h`):**
+   ```go
+   go func() {
+       ticker := time.NewTicker(tlsCertCheckInterval)
+       for { select { case <-ticker.C:
+           if certNeedsRotation(cfg.TLSCert, tlsCertRenewBefore) {
+               newCert, err := rotateCert()
+               currentCert.Store(newCert)  // hot-swap
+           }
+       }}
+   }()
+   ```
+   - При ошибке генерации: `logger.Error(...)` + retry через следующий тик (24h).
+   - Zero downtime: in-flight handshakes завершаются со старым сертификатом, новые соединения получают новый.
+
+**Переменные (переопределяемые в тестах):**
+- `var tlsCertCheckInterval = 24 * time.Hour` — как часто проверять
+- `var tlsCertRenewBefore = 30 * 24 * time.Hour` — за сколько до истечения начинать
+
+**Производительность hot path:**
+- `GetCertificate` вызов = `atomic.Pointer.Load()` = 1 инструкция (vs. mutex.RLock в статическом Certificates).
+- Сертификат в памяти — нет disk I/O на handshake.
+- Фоновая проверка 1 раз в 24h — пренебрежимо мало.
+
+**Тесты (9 новых):**
+- `TestCertNotAfter_ValidCert` — парсит NotAfter корректно (±2s)
+- `TestCertNotAfter_MissingFile` — missing file → zero time
+- `TestCertNotAfter_InvalidPEM` — garbage PEM → zero time
+- `TestCertNeedsRotation_NewCert` — свежий 90-day cert → false (порог 30 дней)
+- `TestCertNeedsRotation_ExpiringCert` — 1 день до истечения → true
+- `TestCertNeedsRotation_ExpiredCert` — уже истёк → true
+- `TestCertNeedsRotation_MissingFile` — missing file → true
+- `TestCertNeedsRotation_ExactThreshold` — cert expires в threshold-1min → true (boundary)
+- `TestCertRotation_OldFilesDeletedAndNewCertGenerated` — e2e: expiring cert удаляется, новый генерируется, NotAfter > old NotAfter, новый не требует ротации
+
+**Результат:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог — обновлено 2026-04-13)
 
 1. **~~BBR app-limited~~** — ~~РЕШЕНО~~ (Run 4, регрессия, re-fix в pост-Run26 [E]).
 2. **~~Mutex contention~~** — ~~РЕШЕНО~~ (Run 8).
 3. **~~ObfsConn buffering~~** — ~~РЕШЕНО~~ (Run 1).
 4. **~~Double CC~~** — ~~РЕШЕНО~~ (Run 11: ECN CE propagation).
-5. **~~Download < upload asymmetry~~** — ~~РЕШЕНО~~ (Runs 17–23): download 6.0 Mbps = 83% потолка. Оставшийся gap (1.2 Mbps) = packet loss + BBR ProbeRTT 2% duty cycle. Кодовые оптимизации исчерпаны.
+5. **~~Download < upload asymmetry~~** — ~~РЕШЕНО~~ (Runs 17–23): download 6.0 Mbps = 83% потолка. Оставшийся gap = packet loss + BBR ProbeRTT 2%. Кодовые оптимизации исчерпаны.
 6. **~~API security~~** — ~~РЕШЕНО~~ (Run 18).
 7. **~~Active scan protection~~** — ~~РЕШЕНО~~ (Run 19: peek+route decoy, Run 26: relay, [A]: VLESS+cover site).
 8. **~~TLS cert fingerprint~~** — ~~РЕШЕНО~~ (Run 31): нет "CavadVPN" в CN/SAN, 90-day validity, no IP SANs.
-9. **IPv6 inner tunnel** — `markECNCE` только IPv4. При добавлении IPv6 VPN нужен путь для Traffic Class field (8 бит, смещение 0 в IPv6 заголовке).
-10. **Certificate rotation** — текущий сертификат генерируется один раз и хранится 90 дней. Нет авто-ротации по истечению. При длительном запуске сервера сертификат устаревает.
+9. **~~IPv6 inner tunnel~~** — ~~РЕШЕНО~~ (Run 27 + пост-Run26 [A]): `markECNCE` обрабатывает IPv6 Traffic Class.
+10. **~~Certificate rotation~~** — ~~РЕШЕНО~~ (Run 32): zero-downtime hot-swap через `atomic.Pointer`, фоновая горутина 24h.
+
+Основной бэклог исчерпан. Потенциальные следующие задачи:
+- **IPv6 outer tunnel** — продолжение суб-задачи из commit `523523f` (ip6Pool + ip6Index готов).
+- **pprof анализ под нагрузкой** — использовать `/debug/pprof/` endpoints (Запуск 24) для поиска CPU hotspots при 30 Mbps реальной нагрузке.
 
 ---
 

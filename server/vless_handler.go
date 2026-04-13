@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -10,14 +11,13 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"bufio"
 	"io"
-	"net/http"
-	"strings"
 	"log/slog"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -75,29 +75,105 @@ func pickTLSHostname(cfg VLESSConfig) string {
 	return tlsCoverDomains[n.Int64()]
 }
 
+// tlsCertCheckInterval is how often the VLESS listener polls the on-disk cert
+// for expiry.  Default 24 h; overridden in tests to a shorter duration.
+var tlsCertCheckInterval = 24 * time.Hour
+
+// tlsCertRenewBefore is how far before expiry we start rotating the cert.
+// 30 days matches Certbot / ACME client convention ("renew at 60 days,
+// expire at 90 days" → 30-day window for retries if generation fails).
+var tlsCertRenewBefore = 30 * 24 * time.Hour
+
+// certNotAfter returns the NotAfter timestamp of the first PEM certificate
+// block in certPath.  Returns the zero time on any error (missing file,
+// corrupt PEM, unparsable DER) so callers can treat the result as
+// "unknown → must rotate".
+func certNotAfter(certPath string) time.Time {
+	data, err := os.ReadFile(certPath)
+	if err != nil {
+		return time.Time{}
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return time.Time{}
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return time.Time{}
+	}
+	return cert.NotAfter
+}
+
+// certNeedsRotation returns true when the certificate at certPath is missing,
+// unreadable, or will expire within renewBefore.
+//
+// This mirrors the "renew 30 days before expiry" heuristic used by Certbot
+// and other ACME clients: starting rotation early leaves time to retry if
+// generation fails (e.g. disk full, permissions).
+func certNeedsRotation(certPath string, renewBefore time.Duration) bool {
+	notAfter := certNotAfter(certPath)
+	if notAfter.IsZero() {
+		return true // can't read → treat as missing
+	}
+	return time.Until(notAfter) < renewBefore
+}
+
 // RunVLESS starts the VLESS+WS+TLS listener. Blocks until ctx is cancelled.
+//
+// Certificate lifecycle:
+//   - On startup, generates a self-signed cert if none exists.
+//   - A background goroutine checks the cert every tlsCertCheckInterval.
+//   - When the cert is within tlsCertRenewBefore of expiry the files are
+//     deleted and a fresh cert is generated.
+//   - The new cert is hot-swapped via atomic.Pointer so in-flight TLS
+//     handshakes complete with the old cert while new connections use the
+//     new one — no listener restart required.
 func (s *Server) RunVLESS(ctx context.Context, cfg VLESSConfig) error {
-	// Auto-generate self-signed cert if files don't exist.
-	// pickTLSHostname returns cfg.TLSHostname or a random CDN domain — the
-	// domain is embedded in CN/SAN so the cert does not expose "CavadVPN".
-	if err := ensureTLSCert(cfg.TLSCert, cfg.TLSKey, pickTLSHostname(cfg), s.logger); err != nil {
-		return fmt.Errorf("vless: ensure TLS cert: %w", err)
+	domain := pickTLSHostname(cfg)
+
+	// rotateCert regenerates the cert files if they need rotation, then loads
+	// and returns the *tls.Certificate.  Safe to call concurrently because
+	// ensureTLSCert is called only after the old files are removed.
+	rotateCert := func() (*tls.Certificate, error) {
+		if certNeedsRotation(cfg.TLSCert, tlsCertRenewBefore) {
+			s.logger.Info("rotating TLS cert", "cert", cfg.TLSCert, "key", cfg.TLSKey)
+			_ = os.Remove(cfg.TLSCert)
+			_ = os.Remove(cfg.TLSKey)
+		}
+		if err := ensureTLSCert(cfg.TLSCert, cfg.TLSKey, domain, s.logger); err != nil {
+			return nil, fmt.Errorf("vless: ensure TLS cert: %w", err)
+		}
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+		if err != nil {
+			return nil, fmt.Errorf("vless: load TLS cert: %w", err)
+		}
+		return &cert, nil
 	}
 
-	tlsCert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+	// Initial cert: generate if missing, load.
+	cert, err := rotateCert()
 	if err != nil {
-		return fmt.Errorf("vless: load TLS cert: %w", err)
+		return err
 	}
+
+	// currentCert is atomically swapped during background rotation.
+	// GetCertificate is called on every TLS handshake — atomic.Load() is O(1)
+	// and contention-free.
+	var currentCert atomic.Pointer[tls.Certificate]
+	currentCert.Store(cert)
 
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
-		MinVersion:   tls.VersionTLS12,
+		// GetCertificate replaces a static Certificates slice so that rotated
+		// certs are picked up without restarting the listener.  It is called
+		// for every handshake because Certificates is left empty.
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return currentCert.Load(), nil
+		},
+		MinVersion: tls.VersionTLS12,
 		// Only http/1.1 — VLESS/WS requires HTTP/1.1 for WebSocket upgrade.
 		// Advertising h2 causes "unexpected SETTINGS frame" errors because
-		// our handler speaks HTTP/1.1 but clients (curl, browsers) negotiate h2.
-		// Many real sites are HTTP/1.1-only (WordPress, legacy apps) — not a
-		// strong fingerprint. The JA3S is already consistent with Go (Caddy).
-		NextProtos: []string{"http/1.1"},
+		// our handler speaks HTTP/1.1 but clients negotiate h2.
+		NextProtos:       []string{"http/1.1"},
 		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
 	}
 
@@ -111,6 +187,32 @@ func (s *Server) RunVLESS(ctx context.Context, cfg VLESSConfig) error {
 	go func() {
 		<-ctx.Done()
 		ln.Close()
+	}()
+
+	// Background rotation loop: check expiry every tlsCertCheckInterval.
+	// When the cert is within tlsCertRenewBefore of expiry, regenerate and
+	// hot-swap via atomic.Pointer — zero downtime for active connections.
+	go func() {
+		ticker := time.NewTicker(tlsCertCheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !certNeedsRotation(cfg.TLSCert, tlsCertRenewBefore) {
+					continue
+				}
+				s.logger.Info("TLS cert expiring soon, rotating", "cert", cfg.TLSCert)
+				newCert, err := rotateCert()
+				if err != nil {
+					s.logger.Error("TLS cert rotation failed", "err", err)
+					continue // retry on next tick
+				}
+				currentCert.Store(newCert)
+				s.logger.Info("TLS cert rotated and hot-swapped", "cert", cfg.TLSCert)
+			}
+		}
 	}()
 
 	for {

@@ -1,10 +1,15 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -484,4 +489,179 @@ func truncate(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "..."
+}
+
+// --- Certificate rotation tests -----------------------------------------------
+
+// generateTestCertWithExpiry creates a self-signed ECDSA cert with a specific
+// NotAfter time and writes it to dir/cert.pem + dir/key.pem.
+// Returns the cert and key paths.
+func generateTestCertWithExpiry(t *testing.T, dir string, notAfter time.Time) (certPath, keyPath string) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generateTestCertWithExpiry: generate key: %v", err)
+	}
+	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "test.example.com"},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"test.example.com"},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("generateTestCertWithExpiry: create cert: %v", err)
+	}
+	certPath = filepath.Join(dir, "cert.pem")
+	keyPath = filepath.Join(dir, "key.pem")
+
+	cf, err := os.Create(certPath)
+	if err != nil {
+		t.Fatalf("generateTestCertWithExpiry: create cert file: %v", err)
+	}
+	pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER}) //nolint:errcheck
+	cf.Close()
+
+	keyDER, _ := x509.MarshalECPrivateKey(priv)
+	kf, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		t.Fatalf("generateTestCertWithExpiry: create key file: %v", err)
+	}
+	pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}) //nolint:errcheck
+	kf.Close()
+	return certPath, keyPath
+}
+
+// TestCertNotAfter_ValidCert verifies that certNotAfter correctly parses the
+// NotAfter field from a fresh 90-day self-signed certificate.
+func TestCertNotAfter_ValidCert(t *testing.T) {
+	dir := t.TempDir()
+	want := time.Now().Add(90 * 24 * time.Hour).Truncate(time.Second)
+	certPath, _ := generateTestCertWithExpiry(t, dir, want)
+
+	got := certNotAfter(certPath)
+	if got.IsZero() {
+		t.Fatal("certNotAfter returned zero time for a valid cert")
+	}
+	// Allow ±2 s for test execution time.
+	diff := got.Sub(want)
+	if diff < -2*time.Second || diff > 2*time.Second {
+		t.Errorf("certNotAfter: got %v, want ~%v (diff %v)", got, want, diff)
+	}
+}
+
+// TestCertNotAfter_MissingFile verifies that certNotAfter returns the zero
+// time when the cert file does not exist.
+func TestCertNotAfter_MissingFile(t *testing.T) {
+	got := certNotAfter(filepath.Join(t.TempDir(), "nonexistent.pem"))
+	if !got.IsZero() {
+		t.Errorf("certNotAfter on missing file: got %v, want zero time", got)
+	}
+}
+
+// TestCertNotAfter_InvalidPEM verifies that certNotAfter returns the zero time
+// for a file that exists but contains invalid PEM data.
+func TestCertNotAfter_InvalidPEM(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.pem")
+	os.WriteFile(path, []byte("this is not valid PEM"), 0644) //nolint:errcheck
+	got := certNotAfter(path)
+	if !got.IsZero() {
+		t.Errorf("certNotAfter on invalid PEM: got %v, want zero time", got)
+	}
+}
+
+// TestCertNeedsRotation_NewCert verifies that a freshly generated 90-day cert
+// does not trigger rotation with the default 30-day threshold.
+func TestCertNeedsRotation_NewCert(t *testing.T) {
+	dir := t.TempDir()
+	certPath, _ := generateTestCertWithExpiry(t, dir, time.Now().Add(90*24*time.Hour))
+	if certNeedsRotation(certPath, 30*24*time.Hour) {
+		t.Error("certNeedsRotation: fresh 90-day cert should NOT need rotation with 30-day threshold")
+	}
+}
+
+// TestCertNeedsRotation_ExpiringCert verifies that a cert expiring in 1 day
+// triggers rotation with the default 30-day threshold.
+func TestCertNeedsRotation_ExpiringCert(t *testing.T) {
+	dir := t.TempDir()
+	certPath, _ := generateTestCertWithExpiry(t, dir, time.Now().Add(24*time.Hour))
+	if !certNeedsRotation(certPath, 30*24*time.Hour) {
+		t.Error("certNeedsRotation: cert expiring in 1 day SHOULD need rotation with 30-day threshold")
+	}
+}
+
+// TestCertNeedsRotation_ExpiredCert verifies that an already-expired cert
+// triggers rotation.
+func TestCertNeedsRotation_ExpiredCert(t *testing.T) {
+	dir := t.TempDir()
+	certPath, _ := generateTestCertWithExpiry(t, dir, time.Now().Add(-1*time.Hour))
+	if !certNeedsRotation(certPath, 30*24*time.Hour) {
+		t.Error("certNeedsRotation: expired cert SHOULD need rotation")
+	}
+}
+
+// TestCertNeedsRotation_MissingFile verifies that a missing cert file triggers
+// rotation (treat as "unknown → must generate").
+func TestCertNeedsRotation_MissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nope.pem")
+	if !certNeedsRotation(path, 30*24*time.Hour) {
+		t.Error("certNeedsRotation: missing file SHOULD need rotation")
+	}
+}
+
+// TestCertNeedsRotation_ExactThreshold verifies boundary behaviour: a cert
+// that expires in exactly 30 days should still trigger rotation (time.Until <
+// threshold, not ≤).
+func TestCertNeedsRotation_ExactThreshold(t *testing.T) {
+	dir := t.TempDir()
+	threshold := 30 * 24 * time.Hour
+	// Cert expires in threshold - 1 minute → needs rotation.
+	certPath, _ := generateTestCertWithExpiry(t, dir, time.Now().Add(threshold-time.Minute))
+	if !certNeedsRotation(certPath, threshold) {
+		t.Error("certNeedsRotation: cert just under threshold SHOULD need rotation")
+	}
+}
+
+// TestCertRotation_OldFilesDeletedAndNewCertGenerated verifies the full
+// rotation cycle: when an expiring cert exists, the rotation logic removes
+// the old files and generates a fresh cert with a longer lifetime.
+func TestCertRotation_OldFilesDeletedAndNewCertGenerated(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+
+	// Plant an expiring cert (1 day left — within 30-day threshold).
+	generateTestCertWithExpiry(t, dir, time.Now().Add(24*time.Hour))
+	oldNotAfter := certNotAfter(certPath)
+
+	// Simulate what rotateCert() does: detect expiry, delete, regenerate.
+	if certNeedsRotation(certPath, 30*24*time.Hour) {
+		os.Remove(certPath) //nolint:errcheck
+		os.Remove(keyPath)  //nolint:errcheck
+	}
+	if err := ensureTLSCert(certPath, keyPath, "cdn.jsdelivr.net", slog.Default()); err != nil {
+		t.Fatalf("ensureTLSCert after rotation: %v", err)
+	}
+
+	newNotAfter := certNotAfter(certPath)
+	if newNotAfter.IsZero() {
+		t.Fatal("new cert NotAfter is zero")
+	}
+	if !newNotAfter.After(oldNotAfter) {
+		t.Errorf("new cert NotAfter (%v) should be later than old NotAfter (%v)", newNotAfter, oldNotAfter)
+	}
+	// New cert should have ~90-day validity.
+	remaining := time.Until(newNotAfter)
+	if remaining < 89*24*time.Hour {
+		t.Errorf("new cert has only %v remaining — expected ~90 days", remaining)
+	}
+	// New cert must not need rotation with the 30-day threshold.
+	if certNeedsRotation(certPath, 30*24*time.Hour) {
+		t.Error("fresh cert SHOULD NOT need rotation immediately after generation")
+	}
 }
