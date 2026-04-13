@@ -50,9 +50,17 @@ const (
 	// probeBWCwndGain: 2× BDP headroom during ProbeBW.
 	probeBWCwndGain = 2.0
 
-	// probeRTTCwndPackets: minimum cwnd during ProbeRTT.
+	// probeRTTCwndPackets: cwnd during the ProbeRTT drain/hold phase.
+	// BBR v1 paper (Cardwell et al., 2016) specifies 4 segments.
+	// This deliberately bypasses the minCwndPackets=32 floor: ProbeRTT NEEDS
+	// to drain the queue aggressively so that the measured RTT reflects true
+	// propagation delay, not queuing delay. Using max(4, 32)=32 would leave
+	// ~28 packets queued at the bottleneck, biasing RTprop upwards by
+	// 28 × bytes_per_packet / bottleneck_bps and causing BBR to overestimate
+	// BDP → inflated cwnd → more queuing. The 200 ms hold at cwnd=4 causes a
+	// throughput dip (~56 KB/s at RTT=102 ms) but produces an accurate RTprop
+	// measurement that guides all subsequent ProbeBW cycles.
 	probeRTTCwndPackets = 4
-	// Note: actual ProbeRTT uses max(probeRTTCwndPackets, minCwndPackets).
 
 	// probeRTTDuration: how long to hold minimum cwnd in ProbeRTT.
 	probeRTTDuration = 200 * time.Millisecond

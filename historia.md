@@ -1689,3 +1689,109 @@ IPv6/UDP пакеты с синтетическим QUIC заголовком (s
 
 3. **QUIC ECN feedback** — ~~ВЕРИФИЦИРОВАНО~~ (Запуск 28): `markECNCE` transport-agnostic;
    Double-CC mitigation работает корректно для TCP, UDP/QUIC и любого другого inner протокола.
+
+---
+
+## Запуск 29 — 2026-04-13
+
+### Выполнено: streamBond.nextWithCount() — устранение лишнего mutex lock/unlock на горячем пути routeFromTun
+
+**Файлы:** `server/main.go`, `server/main_test.go`
+
+#### Проблема: два mutex-а вместо одного в routeFromTun
+
+До изменения `routeFromTun` вызывал:
+```go
+tried := bond.count()          // mu.Lock + len(list) + mu.Unlock
+for i := 0; i < tried; i++ {
+    ds := bond.next()          // mu.Lock + list[idx%n] + idx++ + mu.Unlock
+```
+
+В типичном случае (`bond_count=1`, write успешен):
+- **2 mutex lock/unlock** на каждый IP-пакет
+- При 30 Mbps (1430-байт пакеты): 2 × 21,000 = **42,000 mutex операций/сек**
+- Каждая uncontended mutex операция ≈ 10–20 нс → ~630 мкс/с CPU overhead
+
+**Суть:** первый вызов `count()` нужен только для инициализации ограничителя retry-цикла. Но и `count()`, и первый `next()` читают одно и то же поле `list` — их можно объединить.
+
+#### Решение: `nextWithCount()` — одна critical section для двух операций
+
+```go
+func (sb *streamBond) nextWithCount() (s dataWriter, total int) {
+    sb.mu.Lock()
+    total = len(sb.list)
+    if total > 0 {
+        s = sb.list[sb.idx%total]
+        sb.idx++
+    }
+    sb.mu.Unlock()
+    return s, total
+}
+```
+
+В `routeFromTun`:
+```go
+// До (2 lock/unlock на пакет):
+tried := bond.count()
+for i := 0; i < tried; i++ {
+    ds := bond.next()
+    ...
+}
+
+// После (1 lock/unlock на пакет в common case):
+ds, tried := bond.nextWithCount()
+for i := 0; ; i++ {
+    if ds == nil { break }
+    if _, err := ds.Write(buf[:n]); err == nil { ... break }
+    if i+1 >= tried { break }
+    ds = bond.next()
+}
+```
+
+**Correctness:** `total` может устареть если bond изменился после вызова — точно та же race, что существовала с `count()+next()`. Caller уже защищён: `ds == nil` проверяется перед каждым Write.
+
+#### Эффект
+
+| Метрика | До | После |
+|---|---|---|
+| Mutex lock/unlock / пакет (common path) | 2 | **1** |
+| Mutex ops/сек @ 30 Mbps | ~42,000 | **~21,000** |
+| CPU overhead mutex @ 15нс/op | ~630 мкс/с | **~315 мкс/с** |
+| Изменения в семантике | — | нет |
+
+Improvement незначительный в абсолютных цифрах (~0.03% CPU), но принципиально чище: одна atomic операция вместо двух.
+
+#### Дополнительно: исправлен вводящий в заблуждение комментарий ProbeRTT
+
+**Файл:** `server/transport/bbr_state.go`
+
+Комментарий `// Note: actual ProbeRTT uses max(probeRTTCwndPackets, minCwndPackets)` имплицировал, что код «должен» использовать max(4, 32) = 32, хотя код корректно использует 4 по спецификации BBR v1.
+
+**Почему cwnd=4 правильно (а не max(4,32)=32):**
+- ProbeRTT намеренно дренирует очередь до минимума — иначе RTprop будет измерен с queuing delay
+- При cwnd=32 в трубе остаётся ~28 пакетов × 1430 байт очереди → RTprop завышен → BDP завышен → cwnd завышен → больше queuing → спираль
+- При cwnd=4 очередь дренируется за ~100 мс, затем удерживается 200 мс при минимальной нагрузке → чистое измерение RTT без queuing overhead
+- `minCwndPackets=32` — это floor для ProbeBW/Startup (защита от недооценки BtlBw); к ProbeRTT не относится
+
+Комментарий заменён развёрнутым обоснованием.
+
+**Тесты:**
+- `TestStreamBondNextWithCount` — проверяет round-robin семантику `nextWithCount()` для пустого bond, 3 streams, wrap-around
+- `TestBBRProbeRTT`, `TestBBRProbeRTTRestoresCwnd` — по-прежнему зелёные (cwnd=4 верифицирован)
+
+`go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Следующие задачи (приоритетный бэклог)
+
+1. **pprof под нагрузкой** — Запуск 24 добавил pprof endpoint. Следующий шаг: реально
+   проанализировать CPU профиль при 30 Mbps нагрузке, найти оставшиеся hotspot-ы.
+
+2. **IPv6 outer tunnel** — `ipPool` поддерживает только IPv4 CIDRs. Расширение до IPv6:
+   - Добавить `ip6Index sync.Map` ([4]uint64 ключ) в `Server`
+   - Аллоцировать IPv6 адрес из `fc00::/8` подсети для клиента в `handleControlStream`
+   - В `routeFromTun`: детектировать IPv6 (ver=6, dst в bytes 24–40), lookup в ip6Index
+   - Настроить IPv6 адрес на TUN интерфейсе (`ip -6 addr add fc00::1/64 dev tunX`)
+   - Разбить на 3 атомарных под-задачи (ipPool → TUN config → routeFromTun routing)
+

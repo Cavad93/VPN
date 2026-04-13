@@ -1863,6 +1863,65 @@ func BenchmarkStreamBondWrite(b *testing.B) {
 	}
 }
 
+// TestStreamBondNextWithCount verifies that nextWithCount returns the stream
+// AND the bond size in a single call, and that it round-robins correctly.
+func TestStreamBondNextWithCount(t *testing.T) {
+	t.Parallel()
+
+	var bond streamBond
+
+	// Empty bond: nextWithCount must return (nil, 0).
+	s, n := bond.nextWithCount()
+	if s != nil || n != 0 {
+		t.Fatalf("empty bond: got (%v, %d), want (nil, 0)", s, n)
+	}
+
+	// Add three mock streams.
+	var w1, w2, w3 nopWriter
+	bond.add(&w1)
+	bond.add(&w2)
+	bond.add(&w3)
+
+	// First call: should return w1 (idx=0) with total=3.
+	s1, n1 := bond.nextWithCount()
+	if s1 != &w1 {
+		t.Fatalf("expected w1 on first call, got %v", s1)
+	}
+	if n1 != 3 {
+		t.Fatalf("expected total=3, got %d", n1)
+	}
+
+	// Subsequent calls via next() should round-robin to w2, w3, w1, w2, ...
+	s2 := bond.next()
+	if s2 != &w2 {
+		t.Fatalf("expected w2 on second call, got %v", s2)
+	}
+	s3 := bond.next()
+	if s3 != &w3 {
+		t.Fatalf("expected w3 on third call, got %v", s3)
+	}
+	// Wraps back to w1.
+	s4 := bond.next()
+	if s4 != &w1 {
+		t.Fatalf("expected w1 on fourth call (wrap), got %v", s4)
+	}
+
+	// nextWithCount itself also advances the round-robin pointer.
+	s5, n5 := bond.nextWithCount()
+	if s5 != &w2 {
+		t.Fatalf("expected w2 from nextWithCount at idx=4, got %v", s5)
+	}
+	if n5 != 3 {
+		t.Fatalf("expected total=3 from nextWithCount, got %d", n5)
+	}
+}
+
+// nopWriter is a minimal dataWriter that discards all data (used in unit tests).
+type nopWriter struct{}
+
+func (nw *nopWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (nw *nopWriter) Close() error                { return nil }
+
 // TestStreamBondResilientWrite verifies that streamBond.next() + Write
 // continues to succeed even when some bond streams are closed mid-session.
 // This mirrors the resilient upload round-robin in runForwarding: a dead bond

@@ -121,6 +121,30 @@ func (sb *streamBond) next() dataWriter {
 	return s
 }
 
+// nextWithCount returns the next stream in round-robin order together with the
+// current bond size in a single mutex acquisition.
+//
+// Hot-path optimisation for routeFromTun: the naive approach calls count() to
+// bound the retry loop and then next() for each attempt — 2 lock/unlock cycles
+// per packet in the common case (single bonded stream, write succeeds).
+// nextWithCount collapses both into one critical section so the common path
+// pays exactly 1 lock/unlock per IP packet routed from TUN to client.
+//
+// Thread safety: the returned total may be stale if streams are added or
+// removed concurrently between calls. This is the same race that existed with
+// the separate count()+next() pattern; the caller already handles it by
+// checking ds == nil before each write.
+func (sb *streamBond) nextWithCount() (s dataWriter, total int) {
+	sb.mu.Lock()
+	total = len(sb.list)
+	if total > 0 {
+		s = sb.list[sb.idx%total]
+		sb.idx++
+	}
+	sb.mu.Unlock()
+	return s, total
+}
+
 // count returns the number of bonded streams.
 func (sb *streamBond) count() int {
 	sb.mu.Lock()
@@ -1040,11 +1064,13 @@ func (s *Server) routeFromTun(ctx context.Context) {
 		}
 
 		// Round-robin across bonded streams (multiple TCP connections).
+		// nextWithCount is used for the first attempt: it returns the next stream
+		// AND the current bond size in a single mutex acquisition, saving one
+		// lock/unlock cycle per packet vs the previous count()+next() pattern.
 		bond := &target.bond
-		tried := bond.count()
+		ds, tried := bond.nextWithCount()
 		sent := false
-		for i := 0; i < tried; i++ {
-			ds := bond.next()
+		for i := 0; ; i++ {
 			if ds == nil {
 				break
 			}
@@ -1061,6 +1087,11 @@ func (s *Server) routeFromTun(ctx context.Context) {
 				sent = true
 				break
 			}
+			// Write failed — try the next bonded stream (up to tried−1 more times).
+			if i+1 >= tried {
+				break
+			}
+			ds = bond.next()
 		}
 		if pc != nil {
 			pc.TrackLatency(perf.StageFullEgress, time.Since(t0))
