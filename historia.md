@@ -2135,3 +2135,78 @@ pool6    *ip6Pool   // nil пока Tun6CIDR не задан
    - После существующего IPv4 lookup добавить: `if n >= 40 && buf[0]>>4 == 6` → `dstKey6 := ipToKey16(buf[24:40])` → `s.ip6Index.Load(dstKey6)`
    - В `handleControlStream`: аллоцировать IPv6 (если `pool6 != nil`), сохранить в `ip6Index`, сообщить клиенту
 
+
+---
+
+## Запуск 33 — 2026-04-13 (ветка claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: WSConn writeFrame — устранение heap-аллокации на каждый download-пакет
+
+**Файлы:** `server/transport/ws.go`, `server/transport/ws_test.go`
+
+**Проблема — download direction (VLESS+WS path):**
+
+В `WSConn.writeFrame()` каждый исходящий (server→client, download) VPN-пакет вызывал:
+
+```go
+buf := make([]byte, len(hdr)+length)  // heap-аллокация ~1434 байт
+copy(buf, hdr)
+copy(buf[len(hdr):], payload)
+_, err := ws.conn.Write(buf)
+```
+
+При 30 Mbps с 1430-байтными TUN фреймами:
+- ~2630 аллокаций/сек
+- ~1434 байт каждая = ~3.75 MB/сек heap pressure только от этой строки
+- GC cycles замедляют download goroutine → asymmetric latency download < upload
+
+**Диагностика асимметрии download < upload (VLESS mode):**
+
+| Причина | Направление | Статус |
+|---|---|---|
+| writeFrame make() allocation | Download (server→client write) | ИСПРАВЛЕНО |
+| readFrame make() allocation | Upload (client→server read) | В очереди |
+| WSConn bufio size 4096 | Upload | Анализ нужен |
+
+**Решение: embedded write buffer в WSConn struct**
+
+Добавлена константа `wsWriteBufSize = 1472` и поле `writeBuf [wsWriteBufSize]byte` в struct WSConn.
+
+Данные frames (binary/text/continuation) теперь собираются прямо в `ws.writeBuf` — нулевых heap-аллокаций для фреймов <= 1472 байт (весь VPN трафик <= 1459 байт).
+
+**Безопасность concurrent writes:**
+
+Control frames (ping/pong/close) могут приходить из read goroutine одновременно с data frames из mux write goroutine. Поэтому:
+- Control frames (wsOpPong, wsOpClose, wsOpPing): stack-allocated [2]byte заголовок → нет общего состояния
+- Data frames: используют ws.writeBuf → безопасно, т.к. сериализованы через mux.writeMu
+
+**Wire format для VPN пакетов 1430 байт (tunMTU):**
+
+```
+WS header:  4 байт  (FIN=1, opcode=0x02, length=extended-16)
+payload: 1455 байт  (mux=7 + noise=18 + IP=1430)
+total:   1459 байт <= wsWriteBufSize=1472  →  hot path
+```
+
+Slow path (payload > 1468 байт): heap alloc (никогда не встречается в VPN трафике; defensive code).
+
+**Эффект:**
+- Download path: make([]byte, 1434) × ~2630/сек → 0 аллокаций в steady-state
+- Экономия: ~3.75 MB/сек heap pressure → снижение GC pauses на download goroutine
+- Control frames (ping/pong/close): без изменений в поведении, stack allocation
+
+**Тесты (4 новых):**
+- `TestWSWriteFrameZeroAllocHotPath` — payloads 1–1468 байт: AllocsPerRun == 0
+- `TestWSWriteFrameOversizedPayload` — payload > wsWriteBufSize: данные корректны (slow path)
+- `TestWSWriteFrameDataIntegrity` — 1430-байтный фрейм: byte-for-byte идентичность
+- `TestWSWriteFrameControlNotAffected` — ping→pong: control frames корректны и независимы
+
+**Результат:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Следующие задачи (приоритетный бэклог — дополнение)
+
+1. **WSConn readFrame pool** — make([]byte, length) в readFrame(): upload path (client→server read). Похож на muxReadPool паттерн, но сложнее из-за masking. Следующий запуск.
+
+2. **WSConn bufio size** — bufio.NewReaderSize(conn, 4096): возможно мало для burst'ов при высокой нагрузке. Анализ нужен.

@@ -35,6 +35,17 @@ const (
 // wsGUID is the WebSocket magic GUID (RFC 6455 §4.2.2).
 const wsGUID = "258EAFA5-E914-47DA-95CA-5AB5DC085B11"
 
+// wsWriteBufSize is the size of the pre-allocated write buffer embedded in
+// WSConn. It must accommodate the largest expected WS frame in VPN operation:
+//
+//	tunMTU(1430) + mux overhead(7) + noise overhead(18) = 1455 bytes payload
+//	WS header for that length (126 ≤ n ≤ 65535)          =    4 bytes header
+//	total:                                                 = 1459 bytes
+//
+// 1472 bytes (a multiple of 16) gives 13 bytes of headroom and fits comfortably
+// in two CPU cache lines (64 bytes each → 23 cache lines for the buffer).
+const wsWriteBufSize = 1472
+
 // WSConn wraps a net.Conn with WebSocket binary message framing.
 // After Upgrade(), reads and writes are transparently framed.
 // Read implements io.Reader: a single WebSocket frame's payload may be
@@ -46,6 +57,16 @@ type WSConn struct {
 	closed    bool
 	earlyData []byte // V2Ray 0-RTT data from Sec-WebSocket-Protocol
 	readBuf   []byte // leftover from partially consumed frame
+
+	// writeBuf is a pre-allocated scratch buffer for assembling outgoing data
+	// frames (binary/text/continuation). Data writes are serialised by the
+	// mux layer (mux.writeMu), so only one goroutine touches writeBuf at a
+	// time — eliminating the make([]byte, hdrLen+length) allocation that
+	// previously appeared on every download-direction VPN packet.
+	//
+	// Control frames (ping/pong/close) do NOT use writeBuf; they use
+	// stack-allocated headers to remain safe under concurrent read/write.
+	writeBuf [wsWriteBufSize]byte
 }
 
 // Upgrade performs the server-side WebSocket upgrade handshake.
@@ -324,35 +345,75 @@ func (ws *WSConn) readFrame() (fin bool, opcode byte, payload []byte, err error)
 }
 
 // writeFrame writes a single WebSocket frame. Server→client frames are NOT masked.
+//
+// Data frames (binary/text/continuation) are assembled directly into the
+// pre-allocated ws.writeBuf, eliminating the make([]byte, hdrLen+length)
+// allocation that previously occurred on every download-direction VPN packet.
+// At 30 Mbps with 1430-byte TUN frames this was ~2630 allocations/sec
+// (≈3.75 MB/sec of heap pressure) — now zero for steady-state traffic.
+//
+// Control frames (ping/pong/close) use stack-allocated headers because they
+// may be written from the read goroutine (e.g. pong responses) concurrently
+// with data writes from the mux write goroutine; sharing writeBuf between
+// those goroutines would cause a data race.
 func (ws *WSConn) writeFrame(opcode byte, payload []byte) error {
 	length := len(payload)
-
-	// Build header
-	var hdr []byte
 	firstByte := byte(0x80) | (opcode & 0x0F) // FIN=1
 
-	if length <= 125 {
-		hdr = []byte{firstByte, byte(length)}
-	} else if length <= 65535 {
-		hdr = make([]byte, 4)
+	// ── Control frames (ping / pong / close) ────────────────────────────────
+	// RFC 6455 §5.5: control frame payloads must be ≤ 125 bytes.
+	// These may be sent from the read goroutine (pong auto-reply), so we must
+	// NOT touch ws.writeBuf here.
+	if opcode == wsOpClose || opcode == wsOpPing || opcode == wsOpPong {
+		if length > 125 {
+			return errors.New("ws: control frame payload exceeds 125 bytes")
+		}
+		var hdr [2]byte
 		hdr[0] = firstByte
-		hdr[1] = 126
-		binary.BigEndian.PutUint16(hdr[2:], uint16(length))
-	} else {
-		hdr = make([]byte, 10)
-		hdr[0] = firstByte
-		hdr[1] = 127
-		binary.BigEndian.PutUint64(hdr[2:], uint64(length))
-	}
-
-	// Write header + payload in one syscall when possible
-	if length == 0 {
-		_, err := ws.conn.Write(hdr)
+		hdr[1] = byte(length)
+		if length == 0 {
+			_, err := ws.conn.Write(hdr[:])
+			return err
+		}
+		// Control payloads are tiny (≤125 bytes); a small heap alloc is fine.
+		buf := make([]byte, 2+length)
+		copy(buf, hdr[:])
+		copy(buf[2:], payload)
+		_, err := ws.conn.Write(buf)
 		return err
 	}
-	buf := make([]byte, len(hdr)+length)
-	copy(buf, hdr)
-	copy(buf[len(hdr):], payload)
+
+	// ── Data frames (binary / text / continuation) ───────────────────────────
+	// Writes are serialised by mux.writeMu → only one goroutine here at a time.
+	// Build the full frame directly in ws.writeBuf (zero heap allocation).
+	var hdrLen int
+	ws.writeBuf[0] = firstByte
+	if length <= 125 {
+		ws.writeBuf[1] = byte(length)
+		hdrLen = 2
+	} else if length <= 65535 {
+		ws.writeBuf[1] = 126
+		binary.BigEndian.PutUint16(ws.writeBuf[2:], uint16(length))
+		hdrLen = 4
+	} else {
+		ws.writeBuf[1] = 127
+		binary.BigEndian.PutUint64(ws.writeBuf[2:], uint64(length))
+		hdrLen = 10
+	}
+
+	// Hot path: frame fits in embedded buffer → zero heap allocation.
+	if hdrLen+length <= wsWriteBufSize {
+		copy(ws.writeBuf[hdrLen:], payload)
+		_, err := ws.conn.Write(ws.writeBuf[:hdrLen+length])
+		return err
+	}
+
+	// Slow path: payload larger than wsWriteBufSize (not expected in VPN traffic;
+	// max steady-state payload is 1455 bytes < wsWriteBufSize=1472).
+	// Fall back to a single heap allocation to keep correctness.
+	buf := make([]byte, hdrLen+length)
+	copy(buf, ws.writeBuf[:hdrLen])
+	copy(buf[hdrLen:], payload)
 	_, err := ws.conn.Write(buf)
 	return err
 }

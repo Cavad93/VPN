@@ -395,6 +395,217 @@ func TestWSBufferedRead(t *testing.T) {
 	ws.Close()
 }
 
+// TestWSWriteFrameZeroAllocHotPath verifies that writing a VPN-sized binary
+// frame (≤ wsWriteBufSize) does not allocate on the heap.  Allocations in the
+// download direction (server→client) at ~2630 frames/sec caused ~3.75 MB/sec
+// of GC pressure before the embedded-buffer fix.
+func TestWSWriteFrameZeroAllocHotPath(t *testing.T) {
+	client, server := testPipe()
+
+	done := make(chan *WSConn, 1)
+	go func() {
+		ws, err := WSUpgrade(server, "")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		done <- ws
+	}()
+
+	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
+	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
+	client.Write([]byte(req))
+	respBuf := make([]byte, 4096)
+	client.Read(respBuf)
+
+	ws := <-done
+
+	// Drain client reads so net.Pipe doesn't block writes.
+	go io.Copy(io.Discard, client)
+
+	// Payload sizes that should all take the zero-alloc hot path.
+	// The condition is: hdrLen + length <= wsWriteBufSize.
+	//   - length ≤ 125:          hdrLen = 2  → max payload = wsWriteBufSize-2 = 1470
+	//   - 126 ≤ length ≤ 65535:  hdrLen = 4  → max payload = wsWriteBufSize-4 = 1468
+	//
+	// Max expected VPN payload: tunMTU(1430)+mux(7)+noise(18) = 1455 < 1468 → always hot path.
+	sizes := []int{
+		1,    // tiny
+		125,  // max single-byte length field
+		126,  // first extended-16 length
+		1430, // tunMTU (typical VPN IP packet)
+		1455, // max Noise+mux wrapped VPN frame  (worst-case in practice)
+		1468, // max payload that fits hot path with 4-byte extended-16 header
+	}
+	for _, sz := range sizes {
+		payload := bytes.Repeat([]byte{0xAB}, sz)
+		allocs := testing.AllocsPerRun(5, func() {
+			ws.Write(payload)
+		})
+		if allocs > 0 {
+			t.Errorf("Write(%d bytes): got %.0f allocs, want 0", sz, allocs)
+		}
+	}
+
+	client.Close()
+	ws.Close()
+}
+
+// TestWSWriteFrameOversizedPayload verifies that a payload larger than
+// wsWriteBufSize is sent correctly (slow-path heap alloc).
+func TestWSWriteFrameOversizedPayload(t *testing.T) {
+	client, server := testPipe()
+
+	done := make(chan *WSConn, 1)
+	go func() {
+		ws, err := WSUpgrade(server, "")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		done <- ws
+	}()
+
+	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
+	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
+	client.Write([]byte(req))
+	respBuf := make([]byte, 4096)
+	client.Read(respBuf)
+
+	ws := <-done
+
+	payload := bytes.Repeat([]byte{0xCD}, wsWriteBufSize+100)
+
+	// Receive data on client side concurrently (net.Pipe is synchronous).
+	gotCh := make(chan []byte, 1)
+	go func() {
+		gotCh <- readUnmaskedFrame(t, client)
+	}()
+
+	if _, err := ws.Write(payload); err != nil {
+		t.Fatalf("Write oversized: %v", err)
+	}
+
+	got := <-gotCh
+	if !bytes.Equal(got, payload) {
+		t.Errorf("oversized write: payload mismatch (len got=%d want=%d)", len(got), len(payload))
+	}
+
+	client.Close()
+	ws.Close()
+}
+
+// TestWSWriteFrameDataIntegrity verifies that the embedded writeBuf produces
+// byte-for-byte identical output to the previous heap-alloc implementation.
+func TestWSWriteFrameDataIntegrity(t *testing.T) {
+	client, server := testPipe()
+
+	done := make(chan *WSConn, 1)
+	go func() {
+		ws, err := WSUpgrade(server, "")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		done <- ws
+	}()
+
+	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
+	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
+	client.Write([]byte(req))
+	respBuf := make([]byte, 4096)
+	client.Read(respBuf)
+
+	ws := <-done
+
+	// Write a 1430-byte frame (typical tunMTU packet).
+	want := make([]byte, 1430)
+	for i := range want {
+		want[i] = byte(i & 0xFF)
+	}
+
+	gotCh := make(chan []byte, 1)
+	go func() {
+		gotCh <- readUnmaskedFrame(t, client)
+	}()
+
+	if _, err := ws.Write(want); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	got := <-gotCh
+	if !bytes.Equal(got, want) {
+		t.Errorf("data integrity failure: first diff at byte %d", func() int {
+			for i := range want {
+				if i >= len(got) || got[i] != want[i] {
+					return i
+				}
+			}
+			return -1
+		}())
+	}
+
+	client.Close()
+	ws.Close()
+}
+
+// TestWSWriteFrameControlNotAffected verifies that control frames (ping/pong/close)
+// remain correct after the writeBuf optimisation — they must NOT use writeBuf.
+func TestWSWriteFrameControlNotAffected(t *testing.T) {
+	client, server := testPipe()
+
+	done := make(chan *WSConn, 1)
+	go func() {
+		ws, err := WSUpgrade(server, "")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		done <- ws
+	}()
+
+	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
+	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
+	client.Write([]byte(req))
+	respBuf := make([]byte, 4096)
+	client.Read(respBuf)
+
+	ws := <-done
+
+	// Pattern for net.Pipe (synchronous): start the server-side reader goroutine
+	// FIRST, then write from the client side.  The reader goroutine handles the
+	// ping and auto-sends a pong; the client's pongCh goroutine reads the pong.
+
+	// 1. Start server reader — processes ping and replies with pong.
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1024)
+		_, err := ws.Read(buf) // blocks until ping arrives
+		readDone <- err
+	}()
+
+	// 2. Start client receiver — waits for the pong that ws.Read will auto-send.
+	pongCh := make(chan []byte, 1)
+	go func() {
+		pongCh <- readUnmaskedFrame(t, client)
+	}()
+
+	// 3. Client sends a ping; ws.Read() goroutine wakes up, processes it, sends pong.
+	pingPayload := []byte("keepalive-check")
+	sendMaskedFrame(t, client, wsOpPing, pingPayload)
+
+	// 4. Verify pong echoes the ping payload.
+	pong := <-pongCh
+	if !bytes.Equal(pong, pingPayload) {
+		t.Errorf("pong payload = %q, want %q", pong, pingPayload)
+	}
+
+	// 5. Close connections; ws.Read() goroutine will return with an error.
+	client.Close()
+	ws.Close()
+	<-readDone // drain to avoid goroutine leak
+}
+
 // --- Helpers for tests ---
 
 // sendMaskedFrame sends a WebSocket frame with masking (client→server).
