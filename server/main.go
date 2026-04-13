@@ -1750,7 +1750,7 @@ func main() {
 	cfg := DefaultConfig()
 	apiCfg := api.DefaultConfig()
 
-	var vlessAddr, vlessCert, vlessKey, vlessPath string
+	var vlessAddr, vlessCert, vlessKey, vlessPath, vlessSNI string
 	var anthropicKey string
 	var relayTo string
 	var knockKeyHex string
@@ -1771,6 +1771,7 @@ func main() {
 	flag.StringVar(&vlessCert, "vless-cert", "cert.pem", "TLS certificate file for VLESS")
 	flag.StringVar(&vlessKey, "vless-key", "key.pem", "TLS private key file for VLESS")
 	flag.StringVar(&vlessPath, "vless-path", "/tunnel", "WebSocket path for VLESS")
+	flag.StringVar(&vlessSNI, "vless-sni", "", "hostname for the auto-generated TLS cert CN/SAN (empty = random CDN domain for anti-fingerprinting)")
 	flag.StringVar(&anthropicKey, "anthropic-key", "", "Anthropic API key for telemetry analysis (or ANTHROPIC_API_KEY env)")
 	flag.StringVar(&relayTo, "relay-to", "", "relay VPN traffic to this upstream address (e.g. 193.124.93.240:38947); disables local VPN termination")
 	flag.StringVar(&knockKeyHex, "knock-key", "", "hex-encoded 32-byte PSK for relay port knocking (Reality-style HMAC in session_id); client must use the same key")
@@ -1919,11 +1920,12 @@ func main() {
 			os.Exit(1)
 		}
 		vlessCfg := VLESSConfig{
-			ListenAddr: vlessAddr,
-			UUID:       uuid,
-			WSPath:     vlessPath,
-			TLSCert:    vlessCert,
-			TLSKey:     vlessKey,
+			ListenAddr:  vlessAddr,
+			UUID:        uuid,
+			WSPath:      vlessPath,
+			TLSCert:     vlessCert,
+			TLSKey:      vlessKey,
+			TLSHostname: vlessSNI,
 		}
 		// Print VLESS links for easy import into V2Ray clients.
 		host, port := splitVLESSHostPort(vlessAddr)

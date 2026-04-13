@@ -1500,6 +1500,195 @@ func markECNCE(buf []byte, n int) {
 
 ### Гайд: полная настройка сервера (API + Decoy)
 
+---
+
+## Дополнение к истории: пост-Run26 изменения (2026-04-09 — 2026-04-13)
+
+Ниже задокументированы изменения, выполненные после Run 26, которые не были внесены в histórico.md в момент разработки (режим "speed-diag" - быстрых экспериментов).
+
+### [A] VLESS + WebSocket + TLS транспорт
+**Файлы:** `server/vless_handler.go`, `server/transport/vless.go`, `server/transport/vless_test.go`, `server/transport/ws.go`, `server/transport/ws_test.go`
+
+VLESS — лёгкий прокси-протокол из экосистемы V2Ray/Xray. Реализован полный стек:
+- **`server/transport/vless.go`** — парсинг VLESS заголовка (version+uuid+addons+cmd+addr)
+- **`server/transport/ws.go`** — WebSocket upgrade/framing поверх raw TCP
+- **`server/vless_handler.go`** — `Server.RunVLESS(ctx, cfg)`: TLS-листенер, автодетект raw-VLESS vs WS-VLESS, TCP/UDP прокси к целевому адресу, cover site для обычных HTTP-запросов
+- Режимы: `vless://UUID@HOST:PORT?security=tls` (raw) и `?type=ws` (WebSocket)
+- Авто-генерация self-signed TLS сертификата при первом запуске
+- Авто-генерация UUID с персистентностью в `vless_uuid.txt`
+
+**Ключевые параметры CLI:**
+```
+-vless-addr 0.0.0.0:443  # включает VLESS+TLS листенер
+-vless-path /tunnel       # WebSocket path
+-vless-cert cert.pem      # TLS cert (авто-генерируется)
+-vless-key key.pem        # TLS key
+-vless-sni <domain>       # домен для TLS cert (авто: случайный CDN домен)
+```
+
+### [B] Cover-website (кулинарный блог)
+**Файл:** `server/cover.go`, `server/cover_test.go`
+
+Реалистичный HTTP-сайт для обмана активных DPI-зондов. Вместо "400 Bad Request nginx" (которое само по себе является сигнатурой) показывает живой веб-сайт:
+- Главная страница, recipe1, recipe2, contacts, about — с внутренними ссылками
+- favicon.ico, robots.txt, sitemap.xml — полный набор "легитимного сайта"
+- Нет `Server:` заголовка (соответствует Go TLS JA3S — не выдаёт nginx/caddy mismatch)
+- Режим cover-site на порт 443 (VLESS TLS): любой HTTP-запрос → cover site
+- Отдельный `-cover-addr :80` флаг для plain HTTP cover на порту 80
+
+### [C] Reality-style port knocking
+**Файлы:** `server/transport/knock.go`, `server/transport/knock_test.go`
+
+HMAC-SHA256 аутентификация relay-клиентов до форварда:
+- Тег = `HMAC-SHA256(PSK, TLS_ClientHello.random)` вставляется в поле `session_id`
+- Relay проверяет тег в первых 76 байтах TCP-потока
+- PRF (псевдо-случайная функция) → session_id неотличим от случайных байт
+- В TLS 1.3 `legacy_session_id` уже должен быть случайным (RFC 8446 §4.1.2) — наш тег HMAC идеально соответствует ожидаемому формату
+
+**CLI:** `-knock-key <hex32>` (32-байтный PSK в hex)
+
+### [D] TCP fingerprint fix: IP_TTL=64
+**Файл:** `server/sockopt_windows.go`, `server/sockopt_linux.go`
+
+На Windows сервер по умолчанию использовал TTL=128 (Windows default). Пассивные fingerprinting-инструменты (p0f, nmap OS detection) детектировали это как Windows-сервер. Добавлен `setConnTTL64(conn)` — устанавливает `IP_TTL=64` на принятых соединениях, что соответствует Linux/Unix fingerprint и снижает сигнатурность.
+
+### [E] BBR app-limited regression и re-fix
+**Коммит:** `319e296`
+
+**Регрессия:** Run 4 установил `appLimited := len(c.pending) < cwndTarget`. Это было слишком агрессивно: `routeFromTun` доставляет TUN-пакеты по одному, поэтому `pending` почти никогда не достигает `cwndTarget`. Все пакеты маркировались как app-limited → BBR никогда не обновлял BtlBw → download 3.5 Mbps.
+
+**Исправление:** возврат к `appLimited := len(c.pending) == 0` (Linux BBR поведение: app-limited только при пустой очереди записи).
+
+**Результат:** download 3.50 → 6.0 Mbps (+71%), 83% от теоретического потолка (SPB upload = 7.64 Mbps → ceiling ≈ 7.2 Mbps с overhead). Оставшийся зазор (~1.2 Mbps) объясняется packet loss на маршруте SPB↔Астана и BBR ProbeRTT duty cycle (2%).
+
+### [F] VLESS ALPN fixes
+**Коммиты:** `a283546`, `b481d9e`
+
+Первоначально VLESS TLS конфигурировался с `NextProtos: []string{"h2", "http/1.1"}`. Это вызывало "unexpected SETTINGS frame" ошибку: клиенты (curl, браузеры) договаривались h2, но наш handler говорил HTTP/1.1. Убран h2.
+
+Также был исправлен JA3S mismatch: сервер добавлял `Server: nginx/1.24.0` header, что создавало противоречие между nginx Server-header и Go TLS JA3S fingerprint.
+
+**Итоговый статус:** `NextProtos: []string{"http/1.1"}` — корректно работает, не создаёт SETTINGS frame ошибки.
+
+### [G] Idle timeout fix
+**Коммит:** `6bcdc1d`
+
+При MacBook уходил в сон — TCP relay соединения зависали. Причина: `conn.SetDeadline(absolute_time)` вместо idle timeout. Заменено на `conn.SetDeadline(time.Now().Add(idleTimeout))` при каждой активности — соединение живёт пока есть трафик.
+
+---
+
+## Запуск 31 — 2026-04-13
+
+### Выполнено: TLS cert fingerprint — устранение "CavadVPN" CN/SAN
+
+**Файлы:** `server/vless_handler.go`, `server/cover_test.go`
+
+**Ветка:** `claude/reduce-vpn-bandwidth-NGVmG`
+
+**Обнаруженная уязвимость:**
+
+`ensureTLSCert` генерировала TLS-сертификат с жёстко закодированными идентифицирующими полями:
+```
+Subject: CN=CavadVPN
+X.509 SAN (DNS): CavadVPN
+Validity: 10 лет
+KeyUsage: KeyUsageDigitalSignature | KeyUsageKeyEncipherment
+IPAddresses: [все интерфейсы сервера + 127.0.0.1]
+```
+
+**Воздействие:** любой DPI/Censys/активный зонд, подключившийся к порту 443 и прочитавший TLS Certificate во время handshake, немедленно видел строку "CavadVPN":
+- CN/SAN = "CavadVPN" → прямая идентификация сервиса
+- Validity 10 лет → нетипично для web-серверов (Let's Encrypt: 90 дней, браузеры ограничены 398 дням)
+- IP SANs = характерны для k8s/VPN/internal PKI, а НЕ для публичных CDN
+- `KeyUsageKeyEncipherment` для ECDSA ключа = семантически неверно (RSA-only бит)
+
+Совокупность этих сигналов давала 100% точность идентификации в TLS fingerprinting инструментах.
+
+**Решение:**
+
+1. **`TLSHostname string`** добавлен в `VLESSConfig`:
+   - Если задан — используется как CN/SAN
+   - Если пуст — случайный CDN домен из `tlsCoverDomains` (7 доменов: cdn.jsdelivr.net, cdnjs.cloudflare.com, unpkg.com и др.)
+
+2. **`tlsCoverDomains []string`** (пул CDN-доменов):
+   - Все домены доступны из России (не заблокированы РКН)
+   - CDN-домены: обслуживают разнообразный контент (кулинарные блоги, SaaS, персональные сайты) — mismatch с реальным контентом нормален для CDN
+   - Выбор случаен на каждый запуск сервера — нет устойчивого fingerprint
+
+3. **`pickTLSHostname(cfg)` хелпер** — чистая функция, возвращает TLSHostname или случайный CDN домен.
+
+4. **`ensureTLSCert(certPath, keyPath, domain, logger)`** — новый параметр `domain`:
+   - `Subject: pkix.Name{CommonName: domain}` — без O/L/ST/C (DV-стиль Let's Encrypt)
+   - `DNSNames: []string{domain}` — только DNS SAN, без IP SANs
+   - `NotAfter: now + 90 days` — Let's Encrypt style
+   - `KeyUsage: KeyUsageDigitalSignature` только — ECDSA не использует KeyEncipherment
+
+5. **`-vless-sni <domain>` флаг** в `main.go` — позволяет оператору задать реальный домен (для SNI-маршрутизации через CDN-fronting).
+
+**Изменения в поведении:**
+
+До: `cert CN=CavadVPN, SAN=[CavadVPN], validity=10y, IPSANs=[...], KeyUsage=DS|KE`
+
+После: `cert CN=cdn.jsdelivr.net (random), SAN=[cdn.jsdelivr.net], validity=90d, no IPSANs, KeyUsage=DS`
+
+**Тесты (7 новых):**
+- `TestEnsureTLSCertNoCavadVPN` — CN == domain, SAN == domain, raw bytes НЕ содержат "CavadVPN"
+- `TestEnsureTLSCertValidity90Days` — validity ≤ 92 дней (не 10 лет)
+- `TestEnsureTLSCertNoIPSANs` — cert.IPAddresses == nil
+- `TestEnsureTLSCertECDSAKeyUsage` — KeyUsageDigitalSignature ✓, KeyUsageKeyEncipherment ✗
+- `TestEnsureTLSCertIdempotent` — повторный вызов не перезаписывает cert
+- `TestPickTLSHostnameExplicit` — cfg.TLSHostname возвращается as-is
+- `TestPickTLSHostnameFallbackIsCDN` — пустой TLSHostname → из tlsCoverDomains, никогда не "CavadVPN"
+
+**Результат:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Следующие задачи (приоритетный бэклог — обновлено 2026-04-13)
+
+1. **~~BBR app-limited~~** — ~~РЕШЕНО~~ (Run 4, регрессия, re-fix в pост-Run26 [E]).
+2. **~~Mutex contention~~** — ~~РЕШЕНО~~ (Run 8).
+3. **~~ObfsConn buffering~~** — ~~РЕШЕНО~~ (Run 1).
+4. **~~Double CC~~** — ~~РЕШЕНО~~ (Run 11: ECN CE propagation).
+5. **~~Download < upload asymmetry~~** — ~~РЕШЕНО~~ (Runs 17–23): download 6.0 Mbps = 83% потолка. Оставшийся gap (1.2 Mbps) = packet loss + BBR ProbeRTT 2% duty cycle. Кодовые оптимизации исчерпаны.
+6. **~~API security~~** — ~~РЕШЕНО~~ (Run 18).
+7. **~~Active scan protection~~** — ~~РЕШЕНО~~ (Run 19: peek+route decoy, Run 26: relay, [A]: VLESS+cover site).
+8. **~~TLS cert fingerprint~~** — ~~РЕШЕНО~~ (Run 31): нет "CavadVPN" в CN/SAN, 90-day validity, no IP SANs.
+9. **IPv6 inner tunnel** — `markECNCE` только IPv4. При добавлении IPv6 VPN нужен путь для Traffic Class field (8 бит, смещение 0 в IPv6 заголовке).
+10. **Certificate rotation** — текущий сертификат генерируется один раз и хранится 90 дней. Нет авто-ротации по истечению. При длительном запуске сервера сертификат устаревает.
+
+---
+
+### Гайд: VLESS+TLS настройка (обновлено Run 31)
+
+```bash
+# --- Запуск VPN сервера с VLESS+TLS (порт 443) ---
+# Авто-сертификат с случайным CDN-доменом в CN/SAN:
+./vpnserver -addr 0.0.0.0:38947 -vless-addr 0.0.0.0:443 -tun-cidr 10.8.0.1/24
+
+# С явным TLS-доменом (для SNI-fronting через CDN):
+./vpnserver -vless-addr 0.0.0.0:443 -vless-sni cdn.example.com \
+           -vless-cert /path/to/cert.pem -vless-key /path/to/key.pem
+
+# Проверить сертификат:
+echo | openssl s_client -connect SERVER_IP:443 2>/dev/null | \
+  openssl x509 -noout -subject -dates -ext subjectAltName
+# Ожидаемый CN: что-то из tlsCoverDomains (не "CavadVPN")
+# Ожидаемый NotAfter: ~90 дней от даты генерации
+# Ожидаемые SAN: только DNS, без IP
+
+# --- V2Ray/Xray конфиг для клиента ---
+# TCP режим:
+vless://UUID@SERVER_IP:443?security=tls&allowInsecure=1&fp=chrome#CavadVPN
+
+# WebSocket режим:
+vless://UUID@SERVER_IP:443?type=ws&security=tls&allowInsecure=1&path=/tunnel#CavadVPN
+
+# --- Cover site (порт 80 для HTTP-сканеров) ---
+./vpnserver -cover-addr :80
+# curl http://SERVER_IP/ → кулинарный блог "Pork Kitchen"
+```
+
 ```bash
 # 1. Запуск с явным токеном (рекомендуется для продакшна)
 ./vpnserver -addr 0.0.0.0:443 -api-addr 127.0.0.1:8080 -api-token $(openssl rand -hex 32)

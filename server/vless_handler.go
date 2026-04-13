@@ -35,12 +35,52 @@ type VLESSConfig struct {
 	// TLSCert and TLSKey are paths to the TLS certificate and key files.
 	TLSCert string
 	TLSKey  string
+	// TLSHostname is the domain name to embed in the auto-generated self-signed
+	// certificate's CN and SAN fields.  If empty, a random CDN hostname from
+	// tlsCoverDomains is chosen so the certificate does not fingerprint as a VPN
+	// server.  Set to your real domain when using a proper CA-signed certificate.
+	TLSHostname string
+}
+
+// tlsCoverDomains is a curated pool of CDN hostnames used for the Subject CN
+// and SAN of auto-generated self-signed certificates.
+//
+// Using a CDN-style domain prevents passive fingerprinting: an adversary
+// reading the certificate Subject would see a plausible CDN hostname rather
+// than a string like "CavadVPN" that immediately identifies the service.
+//
+// These are NOT used to spoof a real CA chain — the certificate remains
+// self-signed and clients must set allowInsecure=1.  The pool is only for
+// metadata blending against passive TLS fingerprinting tools (JA3, p0f, etc.).
+var tlsCoverDomains = []string{
+	"cdn.jsdelivr.net",
+	"cdnjs.cloudflare.com",
+	"unpkg.com",
+	"cdn.statically.io",
+	"assets-cdn.github.com",
+	"fastly.jsdelivr.net",
+	"cdn.bootcdn.net",
+}
+
+// pickTLSHostname returns cfg.TLSHostname if set, otherwise selects a random
+// entry from tlsCoverDomains.  The result is always a non-empty string.
+func pickTLSHostname(cfg VLESSConfig) string {
+	if cfg.TLSHostname != "" {
+		return cfg.TLSHostname
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(len(tlsCoverDomains))))
+	if err != nil {
+		return tlsCoverDomains[0] // fallback on rand failure (should never happen)
+	}
+	return tlsCoverDomains[n.Int64()]
 }
 
 // RunVLESS starts the VLESS+WS+TLS listener. Blocks until ctx is cancelled.
 func (s *Server) RunVLESS(ctx context.Context, cfg VLESSConfig) error {
 	// Auto-generate self-signed cert if files don't exist.
-	if err := ensureTLSCert(cfg.TLSCert, cfg.TLSKey, s.logger); err != nil {
+	// pickTLSHostname returns cfg.TLSHostname or a random CDN domain — the
+	// domain is embedded in CN/SAN so the cert does not expose "CavadVPN".
+	if err := ensureTLSCert(cfg.TLSCert, cfg.TLSKey, pickTLSHostname(cfg), s.logger); err != nil {
 		return fmt.Errorf("vless: ensure TLS cert: %w", err)
 	}
 
@@ -351,9 +391,24 @@ func loadOrGenerateVLESSUUID(path string, logger *slog.Logger) ([16]byte, error)
 }
 
 // ensureTLSCert checks if cert and key files exist. If not, generates a
-// self-signed ECDSA P-256 certificate valid for 10 years. This avoids the
-// need for OpenSSL or PowerShell certificate generation on Windows Server.
-func ensureTLSCert(certPath, keyPath string, logger *slog.Logger) error {
+// self-signed ECDSA P-256 certificate.
+//
+// Anti-fingerprinting design:
+//   - domain is embedded as Subject CN and DNS SAN. Caller passes a CDN-style
+//     hostname (e.g. "cdn.jsdelivr.net") so the certificate metadata does not
+//     reveal that this is a VPN server. Passive fingerprinting tools (JA3,
+//     p0f, Censys) inspect Subject/SAN fields — "CavadVPN" is an immediate
+//     identification signal; a CDN hostname is not.
+//   - KeyUsage is KeyUsageDigitalSignature only. ECDSA keys do not use
+//     KeyEncipherment (that bit is for RSA key exchange); including it would
+//     be a minor mismatch with real ECDSA TLS certificates.
+//   - No IP SANs — real CDN certificates do not carry IP SANs. IP SANs are
+//     characteristic of internal PKI / Kubernetes certs and are themselves a
+//     fingerprint.
+//   - Validity 90 days — matches Let's Encrypt's certificate lifetime since
+//     RFC 8555 / ACME became standard. A 10-year validity is a strong signal
+//     that the certificate was machine-generated for a non-web purpose.
+func ensureTLSCert(certPath, keyPath, domain string, logger *slog.Logger) error {
 	_, certErr := os.Stat(certPath)
 	_, keyErr := os.Stat(keyPath)
 	if certErr == nil && keyErr == nil {
@@ -361,40 +416,32 @@ func ensureTLSCert(certPath, keyPath string, logger *slog.Logger) error {
 		return nil
 	}
 
-	logger.Info("generating self-signed TLS certificate", "cert", certPath, "key", keyPath)
+	logger.Info("generating self-signed TLS certificate", "cert", certPath, "key", keyPath, "domain", domain)
 
-	// Generate ECDSA P-256 key
+	// Generate ECDSA P-256 key (matches Cloudflare, Let's Encrypt default).
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return fmt.Errorf("generate key: %w", err)
 	}
 
-	// Gather local IPs for SAN so cert validation can pass
-	var ipAddrs []net.IP
-	if ifaces, err := net.Interfaces(); err == nil {
-		for _, iface := range ifaces {
-			if addrs, err := iface.Addrs(); err == nil {
-				for _, addr := range addrs {
-					if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
-						ipAddrs = append(ipAddrs, ipNet.IP)
-					}
-				}
-			}
-		}
-	}
-	ipAddrs = append(ipAddrs, net.IPv4(127, 0, 0, 1))
-
-	// Build self-signed X.509 certificate with IP SANs
+	// Build self-signed X.509 certificate.
+	//
+	// Subject: CN only — DV (domain-validated) certificates issued by Let's
+	// Encrypt and major CAs include only CommonName, no O/L/ST/C, to match
+	// the minimal-disclosure DV standard.
+	//
+	// SAN: DNS only — no IP SANs.  RFC 5280 §4.2.1.6 requires at least one
+	// SAN for TLS; browsers ignore CN when SAN is present.
 	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "CavadVPN"},
+		Subject:      pkix.Name{CommonName: domain},
 		NotBefore:    time.Now().Add(-1 * time.Hour),
-		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		NotAfter:     time.Now().Add(90 * 24 * time.Hour), // 90 days — Let's Encrypt style
+		KeyUsage:     x509.KeyUsageDigitalSignature,       // ECDSA: no KeyEncipherment
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"CavadVPN"},
-		IPAddresses:  ipAddrs,
+		DNSNames:     []string{domain},
+		// No IPAddresses — CDN certs never carry IP SANs.
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
@@ -407,7 +454,7 @@ func ensureTLSCert(certPath, keyPath string, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("write cert: %w", err)
 	}
-	pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: certDER}) //nolint:errcheck
 	certFile.Close()
 
 	// Write key PEM
@@ -419,10 +466,10 @@ func ensureTLSCert(certPath, keyPath string, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("write key: %w", err)
 	}
-	pem.Encode(keyFile, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	pem.Encode(keyFile, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}) //nolint:errcheck
 	keyFile.Close()
 
-	logger.Info("self-signed TLS certificate generated", "cert", certPath, "key", keyPath)
+	logger.Info("self-signed TLS certificate generated", "cert", certPath, "key", keyPath, "domain", domain)
 	return nil
 }
 
