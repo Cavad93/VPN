@@ -1425,9 +1425,74 @@ sudo cavadvpn -server СПБ_IP:443 -transport tcp -bonds 64
 
 ---
 
+## Запуск 27 — 2026-04-13
+
+### Выполнено: IPv6 ECN CE propagation — расширение markECNCE на IPv6 Traffic Class
+
+**Файлы:** `server/main.go`, `server/main_test.go`
+
+**Контекст (задача из бэклога Запуска 11):**
+
+Запуск 11 реализовал ECN CE propagation как часть Double-CC mitigation: когда BBR pipe насыщен (inflight ≥ cwnd × 75%), inner IPv4 пакеты маркируются CE (Congestion Experienced), и inner TCP снижает rate через RFC 3168 ECN-Echo. Однако `markECNCE` обрабатывала только IPv4 — при туннелировании IPv6-трафика (dual-stack клиент, Android 5+, iOS 13+, Windows 10+) Double-CC mitigation не работала.
+
+**IPv6 Traffic Class / ECN layout (RFC 2460 + RFC 3168):**
+
+```
+Байт 0: version(4b)=6 | TC[7:4]   — верхние 4 бита Traffic Class
+Байт 1: TC[3:0] в битах [7:4]     — нижние 4 бита Traffic Class
+         + Flow Label верхний nibble в битах [3:0]
+         
+TC[1:0] = ECN field → byte[1] bits[5:4]
+
+Чтение ECN:  (buf[1] >> 4) & 0x03
+Запись CE:   buf[1] = (buf[1] &^ 0x30) | 0x30   (биты [5:4] = 11)
+
+Ключевое отличие от IPv4: IPv6 НЕ имеет header checksum →
+пересчёт контрольной суммы не нужен.
+```
+
+**Изменения в `markECNCE` (`server/main.go`):**
+
+До:
+```go
+func markECNCE(buf []byte, n int) {
+    if n < 20 || buf[0]>>4 != 4 {
+        return // not a valid IPv4 packet
+    }
+    ... // только IPv4
+}
+```
+
+После: функция использует `switch buf[0] >> 4` с двумя случаями:
+
+- **case 4 (IPv4):** логика без изменений — ECN в byte[1] bits[1:0], пересчёт checksum
+- **case 6 (IPv6):** минимальный guard `n < 40`, затем ECN в byte[1] bits[5:4], без checksum
+- **default:** всё остальное (version=5, QUIC, неизвестное) — игнорируется
+
+Производительность hot path при отсутствии IPv6 трафика: один дополнительный `switch` — компилируется в single comparison + branch (CPU предсказывает IPv4 как hot branch).
+
+**Тесты (8 новых + 1 helper):**
+
+Добавлен `buildIPv6(tc byte)` — строит 40-байтный IPv6 пакет с заданным Traffic Class (аналог `buildIPv4` для IPv4).
+
+| Тест | Проверяет |
+|---|---|
+| `TestMarkECNCE_IPv6NonECT` | Not-ECT (TC=0x00) → пакет неизменён |
+| `TestMarkECNCE_IPv6AlreadyCE` | CE (TC=0x03) → пакет неизменён |
+| `TestMarkECNCE_IPv6ECT0` | ECT(0) (TC=0x02) → ECN = 11 (CE) |
+| `TestMarkECNCE_IPv6ECT1` | ECT(1) (TC=0x01) → ECN = 11 (CE) |
+| `TestMarkECNCE_IPv6PreservesDSCPAndFlowLabel` | DSCP биты и Flow Label nibble не тронуты |
+| `TestMarkECNCE_IPv6TooShort` | буфер < 40 байт → без паники, без изменений |
+| `TestMarkECNCE_IPv6UnknownVersionIgnored` | version=5 → пакет неизменён |
+| (переименован) `TestMarkECNCE_IPv6NonECT` | заменяет старый `TestMarkECNCE_IPv6Ignored` с исправленным комментарием |
+
+**Результат:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
-1. **IPv6 inner tunnel** — `markECNCE` только IPv4. При расширении туннеля до IPv6 нужен путь для Traffic Class field.
+1. **IPv6 inner tunnel** — ~~РЕШЕНО~~ (Запуск 27): `markECNCE` теперь обрабатывает IPv6 Traffic Class.
 
 2. **pprof под нагрузкой** — ~~ДОБАВЛЕНО~~ (Запуск 24). Следующий шаг: реально проанализировать профили при 30 Mbps нагрузке и найти CPU hotspots.
 
