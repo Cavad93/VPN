@@ -1243,6 +1243,98 @@ func TestRouteFromTun(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TestRouteFromTunIPv6 — IPv6 TUN packet is routed to the correct client via ip6Index
+// ---------------------------------------------------------------------------
+
+func TestRouteFromTunIPv6(t *testing.T) {
+	t.Parallel()
+	t.Helper()
+
+	tun := newMockTun()
+	defer tun.Close()
+
+	serverKP, _ := crypto.GenerateKeyPair()
+	clientKP, _ := crypto.GenerateKeyPair()
+
+	cfg := DefaultConfig()
+	cfg.Transport = "tcp"
+	cfg.Tun6CIDR = "fc00::1/120" // enable dual-stack
+	srv, err := NewServer(cfg, serverKP, tun, nil, newTestLogger())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pre-bind: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	srv.cfg.ListenAddr = addr
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go srv.Run(ctx) //nolint:errcheck
+	time.Sleep(time.Millisecond)
+
+	rawConn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer rawConn.Close()
+
+	mux, _ := runClientHandshake(t, rawConn, clientKP)
+	defer mux.Close()
+
+	// Dual-stack control stream handshake: get ctlAssignDual (43-byte response).
+	resp, ctlStream := doCtlAssign(t, mux)
+	defer ctlStream.Close()
+
+	if resp[0] != ctlAssignDual {
+		t.Fatalf("expected ctlAssignDual (0x%02x), got 0x%02x", ctlAssignDual, resp[0])
+	}
+
+	// Extract the assigned IPv6 address from the dual-stack response.
+	// Wire format: type(1) + ip4(4) + pfx4(1) + gw4(4) + ip6(16) + pfx6(1) + gw6(16)
+	// ip6 starts at offset 10 (1+4+1+4).
+	ip6Bytes := make([]byte, 16)
+	copy(ip6Bytes, resp[10:26])
+
+	// Open data stream to receive the routed IPv6 packet.
+	dataStream, err := mux.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream (data): %v", err)
+	}
+	defer dataStream.Close()
+
+	time.Sleep(time.Millisecond) // wait for bond.add on server side
+
+	// Build a minimal 40-byte IPv6 packet with dst = assigned IPv6 address.
+	// IPv6 header layout: version+TC+FL(4B) | payloadLen(2B) | nextHdr(1B) | hopLimit(1B)
+	//                     | src(16B) | dst(16B)
+	pkt := make([]byte, 40)
+	pkt[0] = 0x60 // version=6, TC=0, FL=0
+	// dst address at bytes 24-39
+	copy(pkt[24:40], ip6Bytes)
+
+	select {
+	case tun.readCh <- pkt:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout sending IPv6 packet to tun.readCh")
+	}
+
+	buf := make([]byte, 64)
+	n, readErr := dataStream.Read(buf)
+	if readErr != nil {
+		t.Fatalf("dataStream.Read: %v", readErr)
+	}
+	if !bytes.Equal(buf[:n], pkt) {
+		t.Errorf("routed IPv6 packet mismatch:\n got  %x\n want %x", buf[:n], pkt)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TestNoiseConnDelegateMethods — covers LocalAddr, RemoteAddr, Set*Deadline
 // ---------------------------------------------------------------------------
 

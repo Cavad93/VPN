@@ -1810,10 +1810,103 @@ Sub-task 1 создал `ip6Pool` и `ip6Index`, но `handleControlStream` и `
 10. **~~Certificate rotation~~** — ~~РЕШЕНО~~ (Run 32): zero-downtime hot-swap через `atomic.Pointer`, фоновая горутина 24h.
 11. **~~IPv6 outer tunnel Sub-task 1~~** — ~~РЕШЕНО~~ (commit `523523f`): `ip6Pool` + `ip6Index` аллокатор.
 12. **~~IPv6 outer tunnel Sub-task 2~~** — ~~РЕШЕНО~~ (Run 33): `handleControlStream` dual-stack wiring.
+13. **~~IPv6 outer tunnel Sub-task 3~~** — ~~РЕШЕНО~~ (Запуск 34): `routeFromTun` IPv6 маршрутизация через `ip6Index`.
 
 Следующие задачи:
-- **IPv6 outer tunnel Sub-task 3** — `routeFromTun`: добавить ветку `case 6` (IPv6 pkt), lookup в `ip6Index`, forward к сессии. Параллельно с IPv4-путём.
 - **pprof анализ под нагрузкой** — использовать `/debug/pprof/` endpoints (Запуск 24) для поиска CPU hotspots при 30 Mbps реальной нагрузке.
+
+---
+
+## Запуск 34 — 2026-04-14
+
+### Выполнено: IPv6 outer tunnel Sub-task 3 — routeFromTun IPv6 маршрутизация
+
+**Файлы:** `server/main.go`, `server/main_test.go`
+
+**Контекст (завершение 3-частной задачи):**
+
+- Sub-task 1 (commit `523523f`): `ip6Pool` + `ip6Index` — аллокатор IPv6 адресов и индекс обратной маршрутизации.
+- Sub-task 2 (Run 33): `handleControlStream` — выделяет IPv6 адрес, регистрирует в `ip6Index`, отправляет `ctlAssignDual` (43-байтный ответ).
+- Sub-task 3 (этот запуск): `routeFromTun` — читает IPv6 пакеты из TUN и маршрутизирует к клиенту через `ip6Index`.
+
+**Проблема (до изменения):**
+
+`routeFromTun` поддерживал только IPv4:
+
+```go
+if n < 20 {
+    continue
+}
+// Only IPv4:
+dstKey := binary.BigEndian.Uint32(buf[16:20])
+val, ok := s.ipIndex.Load(dstKey)
+```
+
+IPv6 пакеты из TUN (dual-stack клиент → хост в интернете → сервер → TUN) тихо дропались: `ipIndex.Load` ничего не находил для 4-байтного "ключа" из первых 4 байт IPv6 адреса, а `ip6Index` не использовался вообще.
+
+**Изменение в `server/main.go` (функция `routeFromTun`):**
+
+Заменено плоское IPv4-only извлечение на `switch buf[0] >> 4` (версия IP):
+
+```go
+var target *clientSession
+switch buf[0] >> 4 {
+case 4:
+    // IPv4: dst at bytes 16:20
+    dstKey := binary.BigEndian.Uint32(buf[16:20])
+    val, ok := s.ipIndex.Load(dstKey)
+    if !ok { continue }
+    target = val.(*clientSession)
+case 6:
+    // IPv6: header ≥ 40 bytes, dst at bytes 24:40
+    if n < 40 { continue }
+    var dstKey [16]byte
+    copy(dstKey[:], buf[24:40])
+    val, ok := s.ip6Index.Load(dstKey)
+    if !ok { continue }
+    target = val.(*clientSession)
+default:
+    continue // неизвестная версия — дропаем
+}
+```
+
+**Производительность hot path:**
+- IPv4 path: ноль изменений — один switch comparison (CPU предсказывает case 4 как hot branch).
+- IPv6 path: один `n < 40` check + один `copy(16 байт)` + `sync.Map.Load` — аналогично IPv4 path по стоимости.
+- Неизвестная версия (version=5, QUIC, corrupted): немедленный `continue` без map lookup.
+- Ноль аллокаций: `var dstKey [16]byte` — stack-allocated, не heap.
+
+**IPv6 заголовок (RFC 2460):**
+```
+bytes 0-3:   version(4b) | TC(8b) | Flow Label(20b)
+bytes 4-5:   Payload Length
+byte  6:     Next Header
+byte  7:     Hop Limit
+bytes 8-23:  Source Address  (16 bytes)
+bytes 24-39: Destination Address (16 bytes)  ← ключ для ip6Index
+```
+
+**Тест (1 новый):**
+
+`TestRouteFromTunIPv6` — полный интеграционный тест по образцу `TestRouteFromTun`:
+1. Сервер с `Tun6CIDR = "fc00::1/120"` + dual-stack `handleConn`
+2. Клиент выполняет dual-stack handshake → получает `ctlAssignDual` (43 байта)
+3. Извлекает assigned IPv6 (resp[10:26])
+4. Строит минимальный 40-байтный IPv6 пакет с `dst = assigned IP`
+5. Подаёт в `tun.readCh` → ждёт появления на data stream
+
+**Результат:** `go test . -run TestRouteFromTun -v -count=1` — оба теста PASS.
+`go test . ./api/... ./config/... ./crypto/... ./notify/... ./perf/... ./service/... && go test ./transport/ -run 'Test[^B]' -count=1` — все 8 пакетов зелёные.
+
+**Завершение IPv6 outer tunnel:**
+
+С этим запуском завершена полная поддержка IPv6 внутри туннеля:
+- Сервер: TUN читает IPv6 пакеты → маршрутизирует к правильному клиенту ✓
+- Сервер: `handleControlStream` выделяет IPv6 адрес клиенту (`ctlAssignDual`) ✓
+- Сервер: `markECNCE` проставляет ECN CE в IPv6 inner пакетах (Run 27) ✓
+- Клиент (Go): sub-task для клиентской стороны `ctlAssignDual` — следующий шаг (не в этом запуске)
+
+---
 
 ---
 

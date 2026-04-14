@@ -1118,13 +1118,32 @@ func (s *Server) routeFromTun(ctx context.Context) {
 			continue
 		}
 
-		// Lock-free O(1) lookup via sync.Map (read-optimised for the hot path).
-		dstKey := binary.BigEndian.Uint32(buf[16:20])
-		val, ok := s.ipIndex.Load(dstKey)
-		if !ok {
+		// Determine IP version and look up the destination client session.
+		// IPv4: header ≥ 20 bytes, dst at buf[16:20] (uint32 key in ipIndex).
+		// IPv6: header ≥ 40 bytes, dst at buf[24:40] ([16]byte key in ip6Index).
+		var target *clientSession
+		switch buf[0] >> 4 {
+		case 4:
+			dstKey := binary.BigEndian.Uint32(buf[16:20])
+			val, ok := s.ipIndex.Load(dstKey)
+			if !ok {
+				continue
+			}
+			target = val.(*clientSession)
+		case 6:
+			if n < 40 {
+				continue
+			}
+			var dstKey [16]byte
+			copy(dstKey[:], buf[24:40])
+			val, ok := s.ip6Index.Load(dstKey)
+			if !ok {
+				continue
+			}
+			target = val.(*clientSession)
+		default:
 			continue
 		}
-		target := val.(*clientSession)
 
 		// Double-CC mitigation: if the outer VPN pipe is near-full (UDP+BBR mode),
 		// mark ECN CE in the inner IP header so that the inner TCP sender reduces its
