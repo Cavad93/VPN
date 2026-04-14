@@ -919,6 +919,188 @@ func TestWSReadBufSizeCoversFullBurst(t *testing.T) {
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// wsUnmask unit tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+// referenceUnmask is the canonical byte-by-byte implementation used as the
+// correctness oracle in wsUnmask tests.
+func referenceUnmask(payload []byte, maskKey [4]byte) {
+	for i := range payload {
+		payload[i] ^= maskKey[i%4]
+	}
+}
+
+// TestWSUnmask_Empty verifies wsUnmask handles a zero-length payload safely.
+func TestWSUnmask_Empty(t *testing.T) {
+	var key [4]byte = [4]byte{0xAB, 0xCD, 0xEF, 0x12}
+	wsUnmask(nil, key)         // must not panic
+	wsUnmask([]byte{}, key)    // must not panic
+}
+
+// TestWSUnmask_SingleByte verifies 1-byte payload (only remainder path).
+func TestWSUnmask_SingleByte(t *testing.T) {
+	key := [4]byte{0x37, 0x42, 0x00, 0xFF}
+	got := []byte{0xAA}
+	ref := []byte{0xAA}
+	wsUnmask(got, key)
+	referenceUnmask(ref, key)
+	if !bytes.Equal(got, ref) {
+		t.Fatalf("1-byte: got %v want %v", got, ref)
+	}
+}
+
+// TestWSUnmask_SevenBytes verifies 7-byte payload (only remainder path, max size).
+func TestWSUnmask_SevenBytes(t *testing.T) {
+	key := [4]byte{0x11, 0x22, 0x33, 0x44}
+	orig := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
+	got := append([]byte{}, orig...)
+	ref := append([]byte{}, orig...)
+	wsUnmask(got, key)
+	referenceUnmask(ref, key)
+	if !bytes.Equal(got, ref) {
+		t.Fatalf("7-byte: got %v want %v", got, ref)
+	}
+}
+
+// TestWSUnmask_EightBytes verifies 8-byte payload (exactly one uint64 iteration,
+// no remainder).
+func TestWSUnmask_EightBytes(t *testing.T) {
+	key := [4]byte{0xDE, 0xAD, 0xBE, 0xEF}
+	orig := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+	got := append([]byte{}, orig...)
+	ref := append([]byte{}, orig...)
+	wsUnmask(got, key)
+	referenceUnmask(ref, key)
+	if !bytes.Equal(got, ref) {
+		t.Fatalf("8-byte: got %v want %v", got, ref)
+	}
+}
+
+// TestWSUnmask_NineBytes verifies 9-byte payload (one uint64 + 1 remainder byte).
+func TestWSUnmask_NineBytes(t *testing.T) {
+	key := [4]byte{0x01, 0x02, 0x03, 0x04}
+	orig := make([]byte, 9)
+	for i := range orig {
+		orig[i] = byte(i * 13)
+	}
+	got := append([]byte{}, orig...)
+	ref := append([]byte{}, orig...)
+	wsUnmask(got, key)
+	referenceUnmask(ref, key)
+	if !bytes.Equal(got, ref) {
+		t.Fatalf("9-byte: got %v want %v", got, ref)
+	}
+}
+
+// TestWSUnmask_VPNFrameSize verifies a 1455-byte payload — the exact steady-state
+// size of a VPN frame (tunMTU=1430 + mux=7 + noise=18). This is the common case
+// for upload traffic.
+func TestWSUnmask_VPNFrameSize(t *testing.T) {
+	key := [4]byte{0xCA, 0xFE, 0xBA, 0xBE}
+	orig := make([]byte, 1455)
+	for i := range orig {
+		orig[i] = byte(i*7 + 3)
+	}
+	got := append([]byte{}, orig...)
+	ref := append([]byte{}, orig...)
+	wsUnmask(got, key)
+	referenceUnmask(ref, key)
+	if !bytes.Equal(got, ref) {
+		t.Fatalf("1455-byte VPN frame: output mismatch at first diff index")
+	}
+}
+
+// TestWSUnmask_AllZeroKey verifies that a zero key is a no-op (XOR with 0).
+func TestWSUnmask_AllZeroKey(t *testing.T) {
+	key := [4]byte{0x00, 0x00, 0x00, 0x00}
+	orig := []byte{0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC}
+	got := append([]byte{}, orig...)
+	wsUnmask(got, key)
+	if !bytes.Equal(got, orig) {
+		t.Fatalf("zero key should be no-op: got %v want %v", got, orig)
+	}
+}
+
+// TestWSUnmask_AllOnesKey verifies that a 0xFF key inverts all bits.
+func TestWSUnmask_AllOnesKey(t *testing.T) {
+	key := [4]byte{0xFF, 0xFF, 0xFF, 0xFF}
+	orig := []byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+	got := append([]byte{}, orig...)
+	wsUnmask(got, key)
+	for i, b := range got {
+		if b != orig[i]^0xFF {
+			t.Fatalf("byte %d: got 0x%02x want 0x%02x", i, b, orig[i]^0xFF)
+		}
+	}
+}
+
+// TestWSUnmask_Idempotent verifies that applying wsUnmask twice restores the
+// original data (XOR is its own inverse).
+func TestWSUnmask_Idempotent(t *testing.T) {
+	key := [4]byte{0x55, 0xAA, 0x55, 0xAA}
+	orig := make([]byte, 1455)
+	for i := range orig {
+		orig[i] = byte(i)
+	}
+	got := append([]byte{}, orig...)
+	wsUnmask(got, key) // encrypt
+	wsUnmask(got, key) // decrypt == original
+	if !bytes.Equal(got, orig) {
+		t.Fatalf("double-unmask should restore original")
+	}
+}
+
+// TestWSUnmask_MultipleChunkSizes tests payload lengths that exercise all
+// combinations of full uint64 chunks and remainder bytes (0–7).
+func TestWSUnmask_MultipleChunkSizes(t *testing.T) {
+	key := [4]byte{0x12, 0x34, 0x56, 0x78}
+	for size := 0; size <= 64; size++ {
+		orig := make([]byte, size)
+		for i := range orig {
+			orig[i] = byte(i*17 + 5)
+		}
+		got := append([]byte{}, orig...)
+		ref := append([]byte{}, orig...)
+		wsUnmask(got, key)
+		referenceUnmask(ref, key)
+		if !bytes.Equal(got, ref) {
+			t.Fatalf("size=%d: wsUnmask output differs from reference", size)
+		}
+	}
+}
+
+// BenchmarkWSUnmask_ByteByByte measures the per-byte XOR approach (baseline).
+func BenchmarkWSUnmask_ByteByByte(b *testing.B) {
+	key := [4]byte{0xCA, 0xFE, 0xBA, 0xBE}
+	payload := make([]byte, 1455)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	b.SetBytes(1455)
+	b.ResetTimer()
+	for range b.N {
+		for i := range payload {
+			payload[i] ^= key[i%4]
+		}
+	}
+}
+
+// BenchmarkWSUnmask_Word64 measures the uint64 XOR approach (optimised).
+func BenchmarkWSUnmask_Word64(b *testing.B) {
+	key := [4]byte{0xCA, 0xFE, 0xBA, 0xBE}
+	payload := make([]byte, 1455)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	b.SetBytes(1455)
+	b.ResetTimer()
+	for range b.N {
+		wsUnmask(payload, key)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // readUnmaskedFrame reads a server→client unmasked frame.
 func readUnmaskedFrame(t *testing.T, conn net.Conn) []byte {
 	t.Helper()

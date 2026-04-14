@@ -23,6 +23,46 @@ import (
 	"sync"
 )
 
+// wsUnmask applies the WebSocket per-frame masking transform in-place.
+//
+// RFC 6455 §5.3 mandates that all client→server frames are masked with a
+// 4-byte key applied cyclically: payload[i] ^= maskKey[i%4].
+//
+// This function processes 8 bytes per iteration using uint64 XOR, reducing
+// loop iterations by ~8× compared to a naive byte-by-byte approach.
+// At 30 Mbps upload with ~2630 masked frames/sec (≈1455 bytes each), the
+// byte-by-byte approach executes ~3.83 M XOR ops/sec; the uint64 approach
+// executes ~480 K XOR ops/sec — a measurable reduction in hot-path CPU time.
+//
+// Correctness proof: the 4-byte key repeats with period 4.  Since 8 is a
+// multiple of 4, a two-copy 64-bit key word covers exactly two complete key
+// periods.  LittleEndian encoding ensures that byte j of a uint64 chunk maps
+// to bit-offset 8*j, so byte at absolute index i*8+j is XOR'd with
+// maskKey[(i*8+j)%4] = maskKey[j%4] = maskKey[j&3].
+//
+// The tail loop (0–7 remaining bytes) uses i&3 (equivalent to i%4 for the
+// power-of-two modulus, but avoids a division instruction on older CPUs).
+func wsUnmask(payload []byte, maskKey [4]byte) {
+	if len(payload) == 0 {
+		return
+	}
+	// Build a 64-bit key: two consecutive copies of the 32-bit key.
+	// LittleEndian layout: key64 byte[j] == maskKey[j&3] for j = 0..7.
+	key32 := uint32(maskKey[0]) | uint32(maskKey[1])<<8 |
+		uint32(maskKey[2])<<16 | uint32(maskKey[3])<<24
+	key64 := uint64(key32) | uint64(key32)<<32
+
+	i := 0
+	for ; i+8 <= len(payload); i += 8 {
+		v := binary.LittleEndian.Uint64(payload[i:])
+		binary.LittleEndian.PutUint64(payload[i:], v^key64)
+	}
+	// Handle remaining 0–7 bytes.
+	for ; i < len(payload); i++ {
+		payload[i] ^= maskKey[i&3]
+	}
+}
+
 // wsReadPoolMaxSize is the maximum payload size (bytes) allocated from
 // wsReadPool. VPN frames are ≤1455 bytes; 1500 matches muxReadPoolMaxSize
 // and covers all expected client→server WS frames with room to spare.
@@ -407,9 +447,7 @@ func (ws *WSConn) readFrame() (fin bool, opcode byte, payload []byte, backing *[
 		}
 		// Unmask in-place (safe: pool buffer is ours until we return it).
 		if masked {
-			for i := range payload {
-				payload[i] ^= maskKey[i%4]
-			}
+			wsUnmask(payload, maskKey)
 		}
 		return fin, opcode, payload, pb, nil
 	}
@@ -422,9 +460,7 @@ func (ws *WSConn) readFrame() (fin bool, opcode byte, payload []byte, backing *[
 		}
 	}
 	if masked {
-		for i := range payload {
-			payload[i] ^= maskKey[i%4]
-		}
+		wsUnmask(payload, maskKey)
 	}
 	return fin, opcode, payload, nil, nil
 }
