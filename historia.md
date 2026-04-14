@@ -2277,3 +2277,69 @@ Slow path (payload > 1468 байт): heap alloc (никогда не встре�
 1. **WSConn readFrame pool** — make([]byte, length) в readFrame(): upload path (client→server read). Похож на muxReadPool паттерн, но сложнее из-за masking. Следующий запуск.
 
 2. **WSConn bufio size** — bufio.NewReaderSize(conn, 4096): возможно мало для burst'ов при высокой нагрузке. Анализ нужен.
+
+---
+
+## Запуск 36 — 2026-04-14
+
+### Выполнено: Configurable BBR seed — флаги `-bbr-seed-bw` / `-bbr-seed-rtt`
+
+**Файлы:** `server/main.go`, `server/main_test.go`
+
+**Проблема:**
+
+BBR initial bandwidth seed был жёстко закодирован в `runUDP`:
+```go
+conn.SetInitialBandwidth(6_000_000/8, 78*time.Millisecond)
+```
+
+Это значение оптимально для SPb→Astana (6 Мбит/с, 78мс RTT), но неподходяще для других
+сценариев: domestic VPN (10мс RTT, 50 Мбит/с) → BBR underestimates → медленная конвергенция.
+
+**Решение:**
+
+1. **`Config` struct**: добавлены `BBRSeedBW int` (Мбит/с) и `BBRSeedRTT int` (мс).
+   Оба = 0 → обычный BBR Startup (seed отключён).
+
+2. **`DefaultConfig()`**: backward-compatible defaults: `BBRSeedBW: 6, BBRSeedRTT: 78`.
+
+3. **`runUDP()`**: hardcoded вызов заменён на условный:
+   ```go
+   if s.cfg.BBRSeedBW > 0 && s.cfg.BBRSeedRTT > 0 {
+       bwBytesPerSec := int64(s.cfg.BBRSeedBW) * 1_000_000 / 8
+       rtt := time.Duration(s.cfg.BBRSeedRTT) * time.Millisecond
+       conn.SetInitialBandwidth(bwBytesPerSec, rtt)
+   }
+   ```
+
+4. **`main()`**: два новых флага:
+   - `-bbr-seed-bw N` — bottleneck bandwidth в Мбит/с (default: 6)
+   - `-bbr-seed-rtt N` — expected RTT в мс (default: 78)
+
+**Использование:**
+```bash
+# SPb→Astana (default):
+./vpnserver -addr 0.0.0.0:443
+
+# Domestic (Москва↔Казань, ~20ms, 50 Mbps):
+./vpnserver -addr 0.0.0.0:443 -bbr-seed-bw 50 -bbr-seed-rtt 20
+
+# Disable seed (pure BBR Startup):
+./vpnserver -addr 0.0.0.0:443 -bbr-seed-bw 0 -bbr-seed-rtt 0
+
+# International (150ms, 3 Mbps):
+./vpnserver -addr 0.0.0.0:443 -bbr-seed-bw 3 -bbr-seed-rtt 150
+```
+
+**BBR self-correction:** если seed отличается от реальности, BBR корректируется за 1-2 RTT:
+- seed слишком высокий → ProbeBW probe → потери → cwnd сходится вниз
+- seed слишком низкий → 5/4 gain → BtlBw обнаруживается быстро
+
+**Тесты (5 новых):**
+- `TestBBRSeedDefaults` — default config имеет правильные значения (6 Мбит/с, 78 мс)
+- `TestBBRSeedMbpsConversion` — Мбит/с → байт/с конверсия для 6 типичных значений
+- `TestBBRSeedDisabledWhenZero` — все комбинации нулевых значений отключают seed
+- `TestBBRSeedAppliedOnUDPConn` — SetInitialBandwidth не паникует на реальном UDPNetConn
+- `TestBBRSeedCustomValues` — custom config (50 Мбит/с, 20мс) корректно конвертируется
+
+`cd server && go test ./... -count=1` — все 8 пакетов зелёные.

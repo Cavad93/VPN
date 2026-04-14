@@ -61,6 +61,18 @@ type Config struct {
 	PrivKeyFile     string
 	Transport       string // "tcp" (default) or "udp" (user-space BBR)
 	AllowedKeysFile string // path to persist the allowed-keys list across restarts
+
+	// BBR initial bandwidth seed (UDP transport only).
+	// When both are non-zero, SetInitialBandwidth is called on each new
+	// UDP connection so BBR skips the slow Startup phase and jumps directly
+	// to ProbeBW. Zero values disable seeding (BBR runs its normal Startup).
+	//
+	// Set to the expected bottleneck bandwidth and RTT for your deployment:
+	//   -bbr-seed-bw 6 -bbr-seed-rtt 78   # SPb→Astana (6 Mbps, 78ms)
+	//   -bbr-seed-bw 50 -bbr-seed-rtt 20  # domestic (50 Mbps, 20ms)
+	//   -bbr-seed-bw 0                     # disable — use BBR Startup
+	BBRSeedBW  int // bottleneck bandwidth in Mbps (0 = disabled)
+	BBRSeedRTT int // expected RTT in milliseconds (0 = disabled)
 }
 
 // DefaultConfig returns a Config populated with sensible defaults.
@@ -71,6 +83,11 @@ func DefaultConfig() Config {
 		PrivKeyFile:     "server_privkey.hex",
 		Transport:       "udp",
 		AllowedKeysFile: "allowed_keys.txt",
+		// Seed BBR at the typical international VPN path parameters.
+		// Avoids slow Startup (10+ RTTs) on reconnect for the common case.
+		// Override with -bbr-seed-bw / -bbr-seed-rtt for your deployment.
+		BBRSeedBW:  6,  // 6 Mbps — measured SPb→Astana bottleneck
+		BBRSeedRTT: 78, // 78ms  — measured SPb→Astana RTT
 	}
 }
 
@@ -416,13 +433,18 @@ func (s *Server) runUDP(ctx context.Context) error {
 				continue
 			}
 		}
-		// Seed BBR @ measured RTT 78ms, conservative BW 6 Mbps.
-		// BDP = 6/8 × 0.078 = 58.5 KB → initial cwnd = 2×BDP ≈ 117 KB.
-		// BBR Startup doubles pacing_rate each RTT until it hits BtlBW; starting
-		// from a seed close to actual avoids both:
-		//   • overshooting (fills ISP buffers → loss → inflated RTT measurement)
-		//   • undershooting (slow Startup wastes the first few seconds of speedtest)
-		conn.SetInitialBandwidth(6_000_000/8, 78*time.Millisecond)
+		// Seed BBR with the configured bandwidth/RTT so new connections skip
+		// the slow Startup phase (10+ RTTs of exponential probing) and jump
+		// directly to ProbeBW. Both fields must be non-zero to enable seeding.
+		// If the real bottleneck differs, BBR self-corrects within 1-2 RTTs:
+		//   • seed too high → probe phase → loss → cwnd converges down
+		//   • seed too low  → ProbeBW 5/4 gain → BtlBw discovered quickly
+		// Seeding is disabled when BBRSeedBW==0 or BBRSeedRTT==0.
+		if s.cfg.BBRSeedBW > 0 && s.cfg.BBRSeedRTT > 0 {
+			bwBytesPerSec := int64(s.cfg.BBRSeedBW) * 1_000_000 / 8
+			rtt := time.Duration(s.cfg.BBRSeedRTT) * time.Millisecond
+			conn.SetInitialBandwidth(bwBytesPerSec, rtt)
+		}
 		go s.handleConn(ctx, conn) //nolint:errcheck
 	}
 }
@@ -1813,6 +1835,8 @@ func main() {
 	flag.StringVar(&relayMetricsAddr, "relay-metrics-addr", ":9092", "relay metrics HTTP server address (per-segment throughput for AI diagnostics; empty to disable)")
 	flag.StringVar(&diagnosticsFile, "diagnostics-file", "", "path to append telemetry reports as JSONL (e.g. /var/log/cavadvpn/diagnostics.jsonl)")
 	flag.StringVar(&coverAddr, "cover-addr", "", "listen address for plain HTTP cover website (e.g. :80); serves the cooking blog to censorship scanners checking port 80")
+	flag.IntVar(&cfg.BBRSeedBW, "bbr-seed-bw", cfg.BBRSeedBW, "BBR initial bandwidth seed in Mbps for UDP transport (0 = use BBR Startup phase; set to your bottleneck bandwidth for faster connection ramp-up)")
+	flag.IntVar(&cfg.BBRSeedRTT, "bbr-seed-rtt", cfg.BBRSeedRTT, "BBR initial RTT seed in milliseconds for UDP transport (0 = use BBR Startup phase; set to your path RTT for faster connection ramp-up)")
 	flag.Parse()
 
 	// Anthropic API key: flag takes precedence, then environment variable.

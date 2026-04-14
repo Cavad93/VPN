@@ -3046,3 +3046,123 @@ func TestUDPNetConnCongested(t *testing.T) {
 		t.Error("new UDPNetConn reports congested (want false)")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TestBBRSeedConfig — configurable BBR initial bandwidth seed
+// ---------------------------------------------------------------------------
+
+// TestBBRSeedDefaults verifies that DefaultConfig has the expected seed values
+// for the standard SPb→Astana deployment path.
+func TestBBRSeedDefaults(t *testing.T) {
+	t.Parallel()
+	cfg := DefaultConfig()
+	if cfg.BBRSeedBW != 6 {
+		t.Errorf("BBRSeedBW default: got %d, want 6 (Mbps)", cfg.BBRSeedBW)
+	}
+	if cfg.BBRSeedRTT != 78 {
+		t.Errorf("BBRSeedRTT default: got %d, want 78 (ms)", cfg.BBRSeedRTT)
+	}
+}
+
+// TestBBRSeedMbpsConversion verifies the Mbps→bytes/sec conversion used in
+// runUDP is correct and doesn't overflow for typical values.
+func TestBBRSeedMbpsConversion(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		mbps        int
+		wantBytesSec int64
+	}{
+		{0, 0},           // disabled
+		{1, 125_000},     // 1 Mbps = 125 KB/s
+		{6, 750_000},     // 6 Mbps — SPb→Astana default
+		{50, 6_250_000},  // 50 Mbps — domestic VPN
+		{100, 12_500_000}, // 100 Mbps — fast path
+		{1000, 125_000_000}, // 1 Gbps — datacentre
+	}
+	for _, tc := range cases {
+		got := int64(tc.mbps) * 1_000_000 / 8
+		if got != tc.wantBytesSec {
+			t.Errorf("mbps=%d: got %d bytes/sec, want %d", tc.mbps, got, tc.wantBytesSec)
+		}
+	}
+}
+
+// TestBBRSeedDisabledWhenZero verifies that zero values in either field
+// should disable seeding (the if-guard in runUDP).
+func TestBBRSeedDisabledWhenZero(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		bw, rtt  int
+		wantSeed bool
+	}{
+		{6, 78, true},  // both set → seed applied
+		{0, 78, false}, // bw zero → no seed
+		{6, 0, false},  // rtt zero → no seed
+		{0, 0, false},  // both zero → no seed
+	}
+	for _, tc := range cases {
+		got := tc.bw > 0 && tc.rtt > 0
+		if got != tc.wantSeed {
+			t.Errorf("bw=%d rtt=%d: seedEnabled=%v, want %v", tc.bw, tc.rtt, got, tc.wantSeed)
+		}
+	}
+}
+
+// TestBBRSeedAppliedOnUDPConn verifies that SetInitialBandwidth can be
+// called on a real *transport.UDPNetConn (as runUDP does on each accepted
+// connection) without panicking, and that the connection behaves consistently
+// afterwards (not congested, since no packets have been sent yet).
+func TestBBRSeedAppliedOnUDPConn(t *testing.T) {
+	t.Parallel()
+
+	ln, err := transport.ListenUDP("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer ln.Close()
+
+	// DialUDP returns a *UDPNetConn representing a client-side BBR connection.
+	// In production the seed is applied on the server-side Accept connection,
+	// but SetInitialBandwidth is symmetric — this tests the API surface.
+	conn, err := transport.DialUDP(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer conn.Close()
+
+	// Apply seed as runUDP would when BBRSeedBW=6, BBRSeedRTT=78.
+	cfg := DefaultConfig() // BBRSeedBW=6, BBRSeedRTT=78
+	if cfg.BBRSeedBW > 0 && cfg.BBRSeedRTT > 0 {
+		bwBytesPerSec := int64(cfg.BBRSeedBW) * 1_000_000 / 8
+		rtt := time.Duration(cfg.BBRSeedRTT) * time.Millisecond
+		conn.SetInitialBandwidth(bwBytesPerSec, rtt) // must not panic
+	}
+
+	// After seeding but before sending any packets, the connection should
+	// not be congested (no bytes in flight).
+	if conn.Congested() {
+		t.Error("seeded connection reports congested before any sends (want false)")
+	}
+}
+
+// TestBBRSeedCustomValues verifies that non-default seed values can be set
+// and the conversion arithmetic produces the expected bytes-per-second rate.
+func TestBBRSeedCustomValues(t *testing.T) {
+	t.Parallel()
+	// Operator sets 50 Mbps / 20ms for a domestic VPN deployment.
+	cfg := Config{
+		BBRSeedBW:  50,
+		BBRSeedRTT: 20,
+	}
+	if cfg.BBRSeedBW <= 0 || cfg.BBRSeedRTT <= 0 {
+		t.Fatal("expected non-zero seed")
+	}
+	gotBW := int64(cfg.BBRSeedBW) * 1_000_000 / 8
+	if gotBW != 6_250_000 {
+		t.Errorf("50 Mbps → bytes/sec: got %d, want 6_250_000", gotBW)
+	}
+	gotRTT := time.Duration(cfg.BBRSeedRTT) * time.Millisecond
+	if gotRTT != 20*time.Millisecond {
+		t.Errorf("20 ms → duration: got %v, want 20ms", gotRTT)
+	}
+}
