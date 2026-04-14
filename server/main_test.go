@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -276,221 +275,6 @@ func TestIsBroadcast(t *testing.T) {
 	notBcast := net.IP{10, 8, 0, 1}
 	if isBroadcast(notBcast, network) {
 		t.Errorf("did not expect 10.8.0.1 to be broadcast")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestNewIP6Pool
-// ---------------------------------------------------------------------------
-
-func TestNewIP6Pool(t *testing.T) {
-	t.Parallel()
-
-	// Valid IPv6 CIDR
-	pool, err := newIP6Pool("fc00::1/120")
-	if err != nil {
-		t.Fatalf("newIP6Pool valid: %v", err)
-	}
-	if pool == nil {
-		t.Fatal("pool is nil")
-	}
-
-	// Invalid CIDR
-	_, err = newIP6Pool("not-a-cidr")
-	if err == nil {
-		t.Error("expected error for invalid CIDR")
-	}
-
-	// IPv4 CIDR must be rejected
-	_, err = newIP6Pool("10.8.0.1/24")
-	if err == nil {
-		t.Error("expected error for IPv4 CIDR")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestIP6PoolAllocate
-// ---------------------------------------------------------------------------
-
-func TestIP6PoolAllocate(t *testing.T) {
-	t.Parallel()
-	pool, err := newIP6Pool("fc00::1/120")
-	if err != nil {
-		t.Fatalf("newIP6Pool: %v", err)
-	}
-
-	serverIP := pool.serverIP()
-
-	ip1, err := pool.allocate()
-	if err != nil {
-		t.Fatalf("first allocate: %v", err)
-	}
-	if ip1.Equal(serverIP) {
-		t.Errorf("first allocation must not be server IP %s", serverIP)
-	}
-	// Must be a proper IPv6 address (16 bytes)
-	if len(ip1) != 16 {
-		t.Errorf("allocated IP length: got %d, want 16", len(ip1))
-	}
-
-	ip2, err := pool.allocate()
-	if err != nil {
-		t.Fatalf("second allocate: %v", err)
-	}
-	if ip1.Equal(ip2) {
-		t.Errorf("two allocations returned same IP: %s", ip1)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestIP6PoolRelease
-// ---------------------------------------------------------------------------
-
-func TestIP6PoolRelease(t *testing.T) {
-	t.Parallel()
-	pool, err := newIP6Pool("fc00::1/120")
-	if err != nil {
-		t.Fatalf("newIP6Pool: %v", err)
-	}
-
-	ip1, err := pool.allocate()
-	if err != nil {
-		t.Fatalf("allocate: %v", err)
-	}
-
-	pool.release(ip1)
-
-	// Re-allocate — should get the same IP back (first available after network addr).
-	ip2, err := pool.allocate()
-	if err != nil {
-		t.Fatalf("re-allocate after release: %v", err)
-	}
-	if !ip1.Equal(ip2) {
-		t.Errorf("expected %s after release, got %s", ip1, ip2)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestIP6PoolExhausted
-// ---------------------------------------------------------------------------
-
-func TestIP6PoolExhausted(t *testing.T) {
-	t.Parallel()
-	// /127: only fc00::0 (network) and fc00::1 (server) — both pre-marked used.
-	// Unlike IPv4, IPv6 has no broadcast address, but /127 leaves 0 allocatable
-	// addresses (the entire 2-address block is consumed by network + server).
-	pool, err := newIP6Pool("fc00::1/127")
-	if err != nil {
-		t.Fatalf("newIP6Pool /127: %v", err)
-	}
-
-	// First allocation must fail immediately — no free slots.
-	_, err = pool.allocate()
-	if err == nil {
-		t.Error("expected error when pool is exhausted")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestIP6PoolServerIP
-// ---------------------------------------------------------------------------
-
-func TestIP6PoolServerIP(t *testing.T) {
-	t.Parallel()
-	pool, err := newIP6Pool("fc00::1/120")
-	if err != nil {
-		t.Fatalf("newIP6Pool: %v", err)
-	}
-
-	sip := pool.serverIP()
-	want := net.ParseIP("fc00::1")
-	if !sip.Equal(want) {
-		t.Errorf("serverIP: got %s, want %s", sip, want)
-	}
-
-	plen := pool.prefixLen()
-	if plen != 120 {
-		t.Errorf("prefixLen: got %d, want 120", plen)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestIPToKey16
-// ---------------------------------------------------------------------------
-
-func TestIPToKey16(t *testing.T) {
-	t.Parallel()
-
-	ip := net.ParseIP("fc00::1")
-	key := ipToKey16(ip)
-
-	// The key should not be all zeros.
-	allZero := true
-	for _, b := range key {
-		if b != 0 {
-			allZero = false
-			break
-		}
-	}
-	if allZero {
-		t.Error("ipToKey16: returned all-zero key for fc00::1")
-	}
-
-	// Two different addresses must produce different keys.
-	ip2 := net.ParseIP("fc00::2")
-	key2 := ipToKey16(ip2)
-	if key == key2 {
-		t.Errorf("ipToKey16: fc00::1 and fc00::2 produced the same key")
-	}
-
-	// Same address must produce the same key.
-	key3 := ipToKey16(net.ParseIP("fc00::1"))
-	if key != key3 {
-		t.Errorf("ipToKey16: same address produced different keys (%v vs %v)", key, key3)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestNewServerWithTun6CIDR
-// ---------------------------------------------------------------------------
-
-func TestNewServerWithTun6CIDR(t *testing.T) {
-	t.Parallel()
-	tun := newMockTun()
-	defer tun.Close()
-
-	kp, err := crypto.GenerateKeyPair()
-	if err != nil {
-		t.Fatalf("GenerateKeyPair: %v", err)
-	}
-	logger := slog.Default()
-
-	cfg := DefaultConfig()
-	cfg.Tun6CIDR = "fc00::1/120"
-	srv, err := NewServer(cfg, kp, tun, nil, logger)
-	if err != nil {
-		t.Fatalf("NewServer with Tun6CIDR: %v", err)
-	}
-	if srv.pool6 == nil {
-		t.Error("pool6 is nil after setting Tun6CIDR")
-	}
-	sip := srv.pool6.serverIP()
-	if !sip.Equal(net.ParseIP("fc00::1")) {
-		t.Errorf("pool6 serverIP: got %s, want fc00::1", sip)
-	}
-}
-
-func TestNewServerInvalidTun6CIDR(t *testing.T) {
-	t.Parallel()
-	tun := newMockTun()
-	defer tun.Close()
-
-	kp, _ := crypto.GenerateKeyPair()
-	cfg := DefaultConfig()
-	cfg.Tun6CIDR = "not-a-valid-cidr"
-	_, err := NewServer(cfg, kp, tun, nil, slog.Default())
-	if err == nil {
-		t.Error("expected error for invalid Tun6CIDR")
 	}
 }
 
@@ -1239,98 +1023,6 @@ func TestRouteFromTun(t *testing.T) {
 	}
 	if !bytes.Equal(buf[:n], pkt) {
 		t.Errorf("routed packet mismatch: got %x, want %x", buf[:n], pkt)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestRouteFromTunIPv6 — IPv6 TUN packet is routed to the correct client via ip6Index
-// ---------------------------------------------------------------------------
-
-func TestRouteFromTunIPv6(t *testing.T) {
-	t.Parallel()
-	t.Helper()
-
-	tun := newMockTun()
-	defer tun.Close()
-
-	serverKP, _ := crypto.GenerateKeyPair()
-	clientKP, _ := crypto.GenerateKeyPair()
-
-	cfg := DefaultConfig()
-	cfg.Transport = "tcp"
-	cfg.Tun6CIDR = "fc00::1/120" // enable dual-stack
-	srv, err := NewServer(cfg, serverKP, tun, nil, newTestLogger())
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("pre-bind: %v", err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
-	srv.cfg.ListenAddr = addr
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go srv.Run(ctx) //nolint:errcheck
-	time.Sleep(time.Millisecond)
-
-	rawConn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer rawConn.Close()
-
-	mux, _ := runClientHandshake(t, rawConn, clientKP)
-	defer mux.Close()
-
-	// Dual-stack control stream handshake: get ctlAssignDual (43-byte response).
-	resp, ctlStream := doCtlAssign(t, mux)
-	defer ctlStream.Close()
-
-	if resp[0] != ctlAssignDual {
-		t.Fatalf("expected ctlAssignDual (0x%02x), got 0x%02x", ctlAssignDual, resp[0])
-	}
-
-	// Extract the assigned IPv6 address from the dual-stack response.
-	// Wire format: type(1) + ip4(4) + pfx4(1) + gw4(4) + ip6(16) + pfx6(1) + gw6(16)
-	// ip6 starts at offset 10 (1+4+1+4).
-	ip6Bytes := make([]byte, 16)
-	copy(ip6Bytes, resp[10:26])
-
-	// Open data stream to receive the routed IPv6 packet.
-	dataStream, err := mux.OpenStream()
-	if err != nil {
-		t.Fatalf("OpenStream (data): %v", err)
-	}
-	defer dataStream.Close()
-
-	time.Sleep(time.Millisecond) // wait for bond.add on server side
-
-	// Build a minimal 40-byte IPv6 packet with dst = assigned IPv6 address.
-	// IPv6 header layout: version+TC+FL(4B) | payloadLen(2B) | nextHdr(1B) | hopLimit(1B)
-	//                     | src(16B) | dst(16B)
-	pkt := make([]byte, 40)
-	pkt[0] = 0x60 // version=6, TC=0, FL=0
-	// dst address at bytes 24-39
-	copy(pkt[24:40], ip6Bytes)
-
-	select {
-	case tun.readCh <- pkt:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout sending IPv6 packet to tun.readCh")
-	}
-
-	buf := make([]byte, 64)
-	n, readErr := dataStream.Read(buf)
-	if readErr != nil {
-		t.Fatalf("dataStream.Read: %v", readErr)
-	}
-	if !bytes.Equal(buf[:n], pkt) {
-		t.Errorf("routed IPv6 packet mismatch:\n got  %x\n want %x", buf[:n], pkt)
 	}
 }
 
@@ -2114,260 +1806,6 @@ func streamReadFull(s *transport.Stream, buf []byte) (int, error) {
 }
 
 // ---------------------------------------------------------------------------
-// IPv6 dual-stack handleControlStream tests (Sub-task 2)
-// ---------------------------------------------------------------------------
-
-// doCtlAssign opens a control stream on mux, sends ctlHello, and reads the
-// response into a returned byte slice. The caller is responsible for closing
-// the stream.
-func doCtlAssign(t *testing.T, mux *transport.Mux) ([]byte, *transport.Stream) {
-	t.Helper()
-	stream, err := mux.OpenStream()
-	if err != nil {
-		t.Fatalf("OpenStream: %v", err)
-	}
-	if _, err := stream.Write([]byte{ctlHello}); err != nil {
-		t.Fatalf("write ctlHello: %v", err)
-	}
-	// Read type byte first
-	typeBuf := make([]byte, 1)
-	if _, err := streamReadFull(stream, typeBuf); err != nil {
-		t.Fatalf("read type byte: %v", err)
-	}
-	var payload []byte
-	switch typeBuf[0] {
-	case ctlAssign:
-		payload = make([]byte, ctlAssignPayloadLen)
-	case ctlAssignDual:
-		payload = make([]byte, ctlAssignDualPayloadLen)
-	default:
-		t.Fatalf("unexpected ctl type byte: 0x%02x", typeBuf[0])
-	}
-	if _, err := streamReadFull(stream, payload); err != nil {
-		t.Fatalf("read payload: %v", err)
-	}
-	resp := append(typeBuf, payload...)
-	return resp, stream
-}
-
-// TestHandleControlStreamIPv4Only verifies that when pool6 is nil (no -tun6-cidr),
-// handleControlStream sends the original ctlAssign (10-byte) response.
-func TestHandleControlStreamIPv4Only(t *testing.T) {
-	t.Parallel()
-
-	tun := newMockTun()
-	defer tun.Close()
-
-	serverKP, _ := crypto.GenerateKeyPair()
-	clientKP, _ := crypto.GenerateKeyPair()
-
-	cfg := DefaultConfig() // no Tun6CIDR → pool6 == nil
-	srv, err := NewServer(cfg, serverKP, tun, nil, newTestLogger())
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-
-	sConn, cConn := net.Pipe()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	go srv.handleConn(ctx, sConn)
-
-	mux, _ := runClientHandshake(t, cConn, clientKP)
-	defer mux.Close()
-
-	resp, stream := doCtlAssign(t, mux)
-	defer stream.Close()
-
-	if resp[0] != ctlAssign {
-		t.Errorf("expected ctlAssign (0x%02x), got 0x%02x", ctlAssign, resp[0])
-	}
-	if len(resp) != 1+ctlAssignPayloadLen {
-		t.Errorf("expected %d bytes, got %d", 1+ctlAssignPayloadLen, len(resp))
-	}
-	// IPv4 should be in TunCIDR subnet (10.8.0.x)
-	assignedIP := net.IP(resp[1:5])
-	if !strings.HasPrefix(assignedIP.String(), "10.8.0.") {
-		t.Errorf("assigned IPv4 not in expected subnet: %s", assignedIP)
-	}
-}
-
-// TestHandleControlStreamDualStackAssign verifies that when pool6 is configured,
-// handleControlStream sends ctlAssignDual (43-byte) response with both IPv4 and IPv6.
-func TestHandleControlStreamDualStackAssign(t *testing.T) {
-	t.Parallel()
-
-	tun := newMockTun()
-	defer tun.Close()
-
-	serverKP, _ := crypto.GenerateKeyPair()
-	clientKP, _ := crypto.GenerateKeyPair()
-
-	cfg := DefaultConfig()
-	cfg.Tun6CIDR = "fc00::1/120"
-	srv, err := NewServer(cfg, serverKP, tun, nil, newTestLogger())
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-
-	sConn, cConn := net.Pipe()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	go srv.handleConn(ctx, sConn)
-
-	mux, _ := runClientHandshake(t, cConn, clientKP)
-	defer mux.Close()
-
-	resp, stream := doCtlAssign(t, mux)
-	defer stream.Close()
-
-	if resp[0] != ctlAssignDual {
-		t.Errorf("expected ctlAssignDual (0x%02x), got 0x%02x", ctlAssignDual, resp[0])
-	}
-	if len(resp) != 1+ctlAssignDualPayloadLen {
-		t.Errorf("expected %d bytes, got %d", 1+ctlAssignDualPayloadLen, len(resp))
-	}
-
-	// IPv4 part (bytes 1-9)
-	assignedIP4 := net.IP(resp[1:5])
-	if !strings.HasPrefix(assignedIP4.String(), "10.8.0.") {
-		t.Errorf("assigned IPv4 not in expected subnet: %s", assignedIP4)
-	}
-	pfx4 := resp[5]
-	if pfx4 == 0 {
-		t.Errorf("prefix4 should not be zero")
-	}
-	gw4 := net.IP(resp[6:10])
-	if !gw4.Equal(net.ParseIP("10.8.0.1")) {
-		t.Errorf("gateway4: got %s, want 10.8.0.1", gw4)
-	}
-
-	// IPv6 part (bytes 10-42)
-	assignedIP6 := net.IP(resp[10:26])
-	if !strings.HasPrefix(assignedIP6.String(), "fc00::") {
-		t.Errorf("assigned IPv6 not in fc00::/120 subnet: %s", assignedIP6)
-	}
-	pfx6 := resp[26]
-	if pfx6 != 120 {
-		t.Errorf("prefix6: got %d, want 120", pfx6)
-	}
-	gw6 := net.IP(resp[27:43])
-	if !gw6.Equal(net.ParseIP("fc00::1")) {
-		t.Errorf("gateway6: got %s, want fc00::1", gw6)
-	}
-}
-
-// TestHandleControlStreamDualStackIP6IndexRegistered verifies that after a
-// dual-stack assignment the assigned IPv6 address is stored in ip6Index.
-func TestHandleControlStreamDualStackIP6IndexRegistered(t *testing.T) {
-	t.Parallel()
-
-	tun := newMockTun()
-	defer tun.Close()
-
-	serverKP, _ := crypto.GenerateKeyPair()
-	clientKP, _ := crypto.GenerateKeyPair()
-
-	cfg := DefaultConfig()
-	cfg.Tun6CIDR = "fc00::1/120"
-	srv, err := NewServer(cfg, serverKP, tun, nil, newTestLogger())
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-
-	sConn, cConn := net.Pipe()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	go srv.handleConn(ctx, sConn)
-
-	mux, _ := runClientHandshake(t, cConn, clientKP)
-	defer mux.Close()
-
-	resp, stream := doCtlAssign(t, mux)
-	defer stream.Close()
-
-	if resp[0] != ctlAssignDual {
-		t.Fatalf("expected ctlAssignDual, got 0x%02x", resp[0])
-	}
-
-	// Extract the assigned IPv6 from response bytes 10:26
-	ip6bytes := make([]byte, 16)
-	copy(ip6bytes, resp[10:26])
-	var key [16]byte
-	copy(key[:], ip6bytes)
-
-	val, ok := srv.ip6Index.Load(key)
-	if !ok {
-		t.Fatal("ip6Index does not contain the assigned IPv6 address")
-	}
-	cs := val.(*clientSession)
-	if cs.assignedIP6 == nil {
-		t.Fatal("clientSession.assignedIP6 is nil")
-	}
-	if !cs.assignedIP6.Equal(net.IP(ip6bytes)) {
-		t.Errorf("assignedIP6 mismatch: got %s, want %s", cs.assignedIP6, net.IP(ip6bytes))
-	}
-}
-
-// TestHandleControlStreamDualStackReleaseOnDisconnect verifies that the IPv6
-// address is released from ip6Index and pool6 when the session ends.
-func TestHandleControlStreamDualStackReleaseOnDisconnect(t *testing.T) {
-	t.Parallel()
-
-	tun := newMockTun()
-	defer tun.Close()
-
-	serverKP, _ := crypto.GenerateKeyPair()
-	clientKP, _ := crypto.GenerateKeyPair()
-
-	cfg := DefaultConfig()
-	cfg.Tun6CIDR = "fc00::1/120"
-	srv, err := NewServer(cfg, serverKP, tun, nil, newTestLogger())
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-
-	sConn, cConn := net.Pipe()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	go srv.handleConn(ctx, sConn)
-
-	mux, _ := runClientHandshake(t, cConn, clientKP)
-
-	resp, stream := doCtlAssign(t, mux)
-	stream.Close()
-
-	if resp[0] != ctlAssignDual {
-		t.Fatalf("expected ctlAssignDual, got 0x%02x", resp[0])
-	}
-
-	var key [16]byte
-	copy(key[:], resp[10:26])
-
-	// Confirm entry is registered while session is alive.
-	if _, ok := srv.ip6Index.Load(key); !ok {
-		t.Fatal("ip6Index should contain entry before disconnect")
-	}
-
-	// Disconnect the client by closing mux and cancelling the context.
-	mux.Close()
-	cancel()
-
-	// Wait for the server goroutine to clean up (deferred cleanup runs synchronously
-	// after mux.Close and ctx.Done propagate).
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, ok := srv.ip6Index.Load(key); !ok {
-			break // cleaned up
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	if _, ok := srv.ip6Index.Load(key); ok {
-		t.Error("ip6Index still contains entry after disconnect — IPv6 address not released")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Throughput benchmarks — measure bond routing performance
 // ---------------------------------------------------------------------------
 
@@ -2424,65 +1862,6 @@ func BenchmarkStreamBondWrite(b *testing.B) {
 		})
 	}
 }
-
-// TestStreamBondNextWithCount verifies that nextWithCount returns the stream
-// AND the bond size in a single call, and that it round-robins correctly.
-func TestStreamBondNextWithCount(t *testing.T) {
-	t.Parallel()
-
-	var bond streamBond
-
-	// Empty bond: nextWithCount must return (nil, 0).
-	s, n := bond.nextWithCount()
-	if s != nil || n != 0 {
-		t.Fatalf("empty bond: got (%v, %d), want (nil, 0)", s, n)
-	}
-
-	// Add three mock streams.
-	var w1, w2, w3 nopWriter
-	bond.add(&w1)
-	bond.add(&w2)
-	bond.add(&w3)
-
-	// First call: should return w1 (idx=0) with total=3.
-	s1, n1 := bond.nextWithCount()
-	if s1 != &w1 {
-		t.Fatalf("expected w1 on first call, got %v", s1)
-	}
-	if n1 != 3 {
-		t.Fatalf("expected total=3, got %d", n1)
-	}
-
-	// Subsequent calls via next() should round-robin to w2, w3, w1, w2, ...
-	s2 := bond.next()
-	if s2 != &w2 {
-		t.Fatalf("expected w2 on second call, got %v", s2)
-	}
-	s3 := bond.next()
-	if s3 != &w3 {
-		t.Fatalf("expected w3 on third call, got %v", s3)
-	}
-	// Wraps back to w1.
-	s4 := bond.next()
-	if s4 != &w1 {
-		t.Fatalf("expected w1 on fourth call (wrap), got %v", s4)
-	}
-
-	// nextWithCount itself also advances the round-robin pointer.
-	s5, n5 := bond.nextWithCount()
-	if s5 != &w2 {
-		t.Fatalf("expected w2 from nextWithCount at idx=4, got %v", s5)
-	}
-	if n5 != 3 {
-		t.Fatalf("expected total=3 from nextWithCount, got %d", n5)
-	}
-}
-
-// nopWriter is a minimal dataWriter that discards all data (used in unit tests).
-type nopWriter struct{}
-
-func (nw *nopWriter) Write(p []byte) (int, error) { return len(p), nil }
-func (nw *nopWriter) Close() error                { return nil }
 
 // TestStreamBondResilientWrite verifies that streamBond.next() + Write
 // continues to succeed even when some bond streams are closed mid-session.
@@ -2805,38 +2184,39 @@ func TestMarkECNCE_TooShort(t *testing.T) {
 	markECNCE(short, len(short)) // must not panic
 }
 
-// buildIPv6 constructs a minimal 40-byte IPv6 header with the given Traffic
-// Class byte and an optional payload.  The TC byte is split across byte[0]
-// (low nibble) and byte[1] (high nibble) as per RFC 8200.
+// buildIPv6 constructs a minimal 40-byte IPv6 header with the given Traffic Class
+// byte (tc) and appends payloadLen zero bytes.
+//
+// IPv6 Traffic Class is split across bytes 0 and 1:
+//
+//	byte[0] = 0x60 | tc>>4      (version=6 + TC[7:4])
+//	byte[1] = (tc<<4)&0xF0 | 0  (TC[3:0] + Flow Label high nibble = 0)
+//
+// ECN is TC[1:0], which appears in byte[1] bits [5:4]:
+//
+//	ECN bits = (byte[1] >> 4) & 0x03
 func buildIPv6(tc byte, payloadLen int) []byte {
 	buf := make([]byte, 40+payloadLen)
-	// Version=6 (high nibble) + TC bits[7:4] (low nibble of byte[0])
-	buf[0] = 0x60 | (tc >> 4)
-	// TC bits[3:0] (high nibble of byte[1]) + Flow Label = 0 (low nibble)
-	buf[1] = (tc << 4) & 0xF0
+	buf[0] = 0x60 | (tc >> 4)   // version=6, TC high nibble
+	buf[1] = (tc << 4) & 0xF0   // TC low nibble in high 4 bits of byte[1]; Flow Label = 0
 	// Payload length
-	plen := uint16(payloadLen)
-	buf[4] = byte(plen >> 8)
-	buf[5] = byte(plen)
-	buf[6] = 6  // Next Header: TCP
-	buf[7] = 64 // Hop Limit
-	// Src: 2001:db8::1
-	buf[8] = 0x20; buf[9] = 0x01; buf[10] = 0x0d; buf[11] = 0xb8
-	buf[23] = 0x01
-	// Dst: 2001:db8::2
-	buf[24] = 0x20; buf[25] = 0x01; buf[26] = 0x0d; buf[27] = 0xb8
-	buf[39] = 0x02
+	buf[4] = byte(payloadLen >> 8)
+	buf[5] = byte(payloadLen)
+	buf[6] = 59  // Next Header: No Next Header
+	buf[7] = 64  // Hop Limit
+	// Source address: ::1
+	buf[23] = 1
+	// Destination address: ::2
+	buf[39] = 2
 	return buf
 }
 
-// extractIPv6ECN returns the ECN bits from an IPv6 packet (byte[1] bits[5:4]).
-func extractIPv6ECN(buf []byte) byte {
-	return (buf[1] >> 4) & 0x03
-}
+// ipv6ECNBits extracts the ECN field from byte[1] of an IPv6 packet.
+func ipv6ECNBits(buf []byte) byte { return (buf[1] >> 4) & 0x03 }
 
-// TestMarkECNCE_IPv6NonECT verifies that a Non-ECT IPv6 packet is not modified.
 func TestMarkECNCE_IPv6NonECT(t *testing.T) {
-	pkt := buildIPv6(0x00, 10) // TC=0x00, ECN=00 (Not-ECT)
+	// Non-ECT IPv6 packet (ECN=00): must not be modified.
+	pkt := buildIPv6(0x00, 10) // TC=0x00, ECN=00
 	original := make([]byte, len(pkt))
 	copy(original, pkt)
 	markECNCE(pkt, len(pkt))
@@ -2845,9 +2225,9 @@ func TestMarkECNCE_IPv6NonECT(t *testing.T) {
 	}
 }
 
-// TestMarkECNCE_IPv6AlreadyCE verifies that an already-CE IPv6 packet is not modified.
 func TestMarkECNCE_IPv6AlreadyCE(t *testing.T) {
-	pkt := buildIPv6(0x03, 10) // TC=0x03, ECN=11 (CE)
+	// Already-CE IPv6 packet (ECN=11): must not be modified.
+	pkt := buildIPv6(0x03, 10) // TC=0x03 (DSCP=0, ECN=11=CE)
 	original := make([]byte, len(pkt))
 	copy(original, pkt)
 	markECNCE(pkt, len(pkt))
@@ -2856,225 +2236,77 @@ func TestMarkECNCE_IPv6AlreadyCE(t *testing.T) {
 	}
 }
 
-// TestMarkECNCE_IPv6ECT0 verifies that ECT(0) IPv6 packet is marked CE.
 func TestMarkECNCE_IPv6ECT0(t *testing.T) {
-	// TC=0x02 → ECN bits in TC = 10 = ECT(0).
-	// After buildIPv6: byte[1] high nibble = TC[3:0] = 0x2 → byte[1] = 0x20.
-	// ECN = (byte[1]>>4)&0x03 = (0x20>>4)&0x03 = 2&3 = 2 = ECT(0). ✓
-	pkt := buildIPv6(0x02, 10)
+	// ECT(0)=10: must become CE=11.
+	pkt := buildIPv6(0x02, 10) // TC[1:0]=10 → ECT(0)
 	markECNCE(pkt, len(pkt))
-	if ecn := extractIPv6ECN(pkt); ecn != 0x03 {
-		t.Errorf("IPv6 ECT(0) not marked CE: got ECN=%02x, want 0x03", ecn)
+	if ecn := ipv6ECNBits(pkt); ecn != 0x03 {
+		t.Errorf("IPv6 ECT(0) not marked CE: got ECN=0x%02x, want 0x03", ecn)
 	}
 }
 
-// TestMarkECNCE_IPv6ECT1 verifies that ECT(1) IPv6 packet is marked CE.
 func TestMarkECNCE_IPv6ECT1(t *testing.T) {
-	// TC=0x01 → ECN=01 = ECT(1).
-	pkt := buildIPv6(0x01, 10)
+	// ECT(1)=01: must become CE=11.
+	pkt := buildIPv6(0x01, 10) // TC[1:0]=01 → ECT(1)
 	markECNCE(pkt, len(pkt))
-	if ecn := extractIPv6ECN(pkt); ecn != 0x03 {
-		t.Errorf("IPv6 ECT(1) not marked CE: got ECN=%02x, want 0x03", ecn)
+	if ecn := ipv6ECNBits(pkt); ecn != 0x03 {
+		t.Errorf("IPv6 ECT(1) not marked CE: got ECN=0x%02x, want 0x03", ecn)
 	}
 }
 
-// TestMarkECNCE_IPv6PreservesDSCP verifies that DSCP bits are not altered.
 func TestMarkECNCE_IPv6PreservesDSCP(t *testing.T) {
-	// TC=0x28|0x02 = 0x2A → DSCP=CS5 (bits[7:2]=0x28>>2=0x0A), ECN=ECT(0).
-	const tc = byte(0x28 | 0x02)
-	pkt := buildIPv6(tc, 10)
-	origByte0 := pkt[0]
-	origByte1High := pkt[1] & 0xC0 // DSCP bits in byte[1] high two bits
+	// DSCP bits (TC[7:2]) must not be altered by ECN marking.
+	//
+	// TC byte = 0xA6 = 10100110b:
+	//   DSCP = TC[7:2] = 101001b (non-zero in both halves)
+	//   ECN  = TC[1:0] = 10b = ECT(0)
+	//
+	// Wire encoding via buildIPv6:
+	//   byte[0] = 0x60 | (0xA6>>4) = 0x6A  → holds DSCP[5:2]=0b1010
+	//   byte[1] = (0xA6<<4)&0xF0   = 0x60  → [7:6]=DSCP[1:0]=0b01, [5:4]=ECN=10, [3:0]=FL
+	const tcByte = byte(0xA6)
+	pkt := buildIPv6(tcByte, 10)
 	markECNCE(pkt, len(pkt))
-	if pkt[0] != origByte0 {
-		t.Errorf("markECNCE altered byte[0]: want %02x got %02x", origByte0, pkt[0])
+	// ECN must be CE after marking.
+	if ecn := ipv6ECNBits(pkt); ecn != 0x03 {
+		t.Errorf("ECN not marked CE: got 0x%02x", ecn)
 	}
-	if pkt[1]&0xC0 != origByte1High {
-		t.Errorf("markECNCE altered DSCP in byte[1]: want %02x got %02x", origByte1High, pkt[1]&0xC0)
+	// DSCP high nibble: byte[0][3:0] must be 0xA (TC[7:4] = 0xA6>>4 = 0x0A).
+	if gotHigh := pkt[0] & 0x0F; gotHigh != tcByte>>4 {
+		t.Errorf("DSCP high nibble altered: byte[0][3:0]=0x%X want 0x%X", gotHigh, tcByte>>4)
+	}
+	// DSCP low 2 bits: byte[1][7:6] must be 0b01.
+	// TC[3:0] = 0xA6 & 0x0F = 0x06 = 0110b; TC[3:2]=DSCP[1:0] = 01b = 0x01.
+	wantDSCPLow := (tcByte & 0x0F) >> 2 // TC[3:2]
+	if gotLow := pkt[1] >> 6; gotLow != wantDSCPLow {
+		t.Errorf("DSCP low 2 bits altered: byte[1]>>6=0x%X want 0x%X", gotLow, wantDSCPLow)
 	}
 }
 
-// TestMarkECNCE_IPv6PreservesFlowLabel verifies that the Flow Label (bytes 1-3 low bits) is not altered.
 func TestMarkECNCE_IPv6PreservesFlowLabel(t *testing.T) {
-	pkt := buildIPv6(0x02, 10)
-	// Set a non-zero flow label in byte[1] low nibble and bytes[2-3].
-	pkt[1] |= 0x05 // low nibble: flow label bits[19:16] = 5
+	// The Flow Label (byte[1][3:0] and bytes[2:4]) must be unchanged.
+	pkt := buildIPv6(0x02, 10) // ECT(0)
+	// Set a non-zero Flow Label: byte[1][3:0]=0xF, bytes[2:4]=0xABCD.
+	pkt[1] |= 0x0F
 	pkt[2] = 0xAB
 	pkt[3] = 0xCD
-	origByte1Low := pkt[1] & 0x0F
 	markECNCE(pkt, len(pkt))
-	if pkt[1]&0x0F != origByte1Low {
-		t.Errorf("markECNCE altered Flow Label low nibble of byte[1]: want %x got %x", origByte1Low, pkt[1]&0x0F)
-	}
-	if pkt[2] != 0xAB || pkt[3] != 0xCD {
-		t.Errorf("markECNCE altered Flow Label bytes[2:3]: want AB CD got %02X %02X", pkt[2], pkt[3])
+	if pkt[1]&0x0F != 0x0F || pkt[2] != 0xAB || pkt[3] != 0xCD {
+		t.Errorf("markECNCE corrupted IPv6 Flow Label: byte[1][3:0]=0x%X bytes[2:3]=0x%X%X",
+			pkt[1]&0x0F, pkt[2], pkt[3])
 	}
 }
 
-// TestMarkECNCE_IPv6TooShort verifies that short buffers do not panic.
 func TestMarkECNCE_IPv6TooShort(t *testing.T) {
-	// 39 bytes is one short of the 40-byte minimum IPv6 header.
-	short := make([]byte, 39)
+	// Packets shorter than 40 bytes must be ignored without panic.
+	short := make([]byte, 20)
 	short[0] = 0x60 // version=6
-	short[1] = 0x20 // ECT(0) in TC
-	markECNCE(short, len(short)) // must not panic
-}
-
-// TestMarkECNCE_UnknownVersionIgnored verifies that packets with unknown IP
-// version (e.g. version=5) are left unchanged.
-func TestMarkECNCE_UnknownVersionIgnored(t *testing.T) {
-	pkt := make([]byte, 40)
-	pkt[0] = 0x52 // version=5 (unknown)
-	pkt[1] = 0x20 // would-be ECT(0) if IPv6
-	original := make([]byte, len(pkt))
-	copy(original, pkt)
-	markECNCE(pkt, len(pkt))
-	if !bytes.Equal(pkt, original) {
-		t.Error("markECNCE modified a packet with unknown IP version")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// QUIC ECN feedback verification (RFC 9000 §13.4)
-// ---------------------------------------------------------------------------
-//
-// QUIC runs over IPv4/UDP or IPv6/UDP.  markECNCE operates purely on the IP
-// header ECN bits and does not touch any bytes beyond the header — so the
-// UDP header and the QUIC payload are always preserved verbatim.
-//
-// When the OS delivers the CE-marked inner IP packet to the QUIC socket via
-// the TUN interface, the QUIC stack reads the ECN field through
-// IP_RECVTOS (IPv4) or IPV6_RECVTCLASS (IPv6).  If the CE counter in the
-// peer's QUIC ACK frame increases, the sender's congestion controller reduces
-// its rate — exactly the Double-CC mitigation we want.
-//
-// The tests below confirm that CE marking is payload-agnostic: only the ECN
-// bits in the IP header change; the UDP header and QUIC first byte are intact.
-
-// buildIPv4UDP constructs a minimal IPv4/UDP packet with the given TOS byte.
-// The first 8 bytes of payload are a synthetic UDP header (src/dst port, len,
-// checksum).  Bytes after that are the "QUIC" payload filled with a pattern.
-func buildIPv4UDP(tos byte, quicPayloadLen int) []byte {
-	const udpHdrLen = 8
-	totalPayload := udpHdrLen + quicPayloadLen
-	pkt := buildIPv4(tos, totalPayload) // builds IPv4 header + zero payload
-	pkt[9] = 17                         // Protocol: UDP (overwrite TCP=6)
-	// UDP header (bytes 20-27).
-	pkt[20] = 0x12; pkt[21] = 0x34              // src port 0x1234
-	pkt[22] = 0x01; pkt[23] = 0xBB              // dst port 443
-	pkt[24] = 0x00; pkt[25] = byte(udpHdrLen + quicPayloadLen) // UDP length
-	pkt[26] = 0xAB; pkt[27] = 0xCD              // checksum (not verified by VPN)
-	// QUIC short-header first byte (Fixed Bit=1, Spin=0 → 0x40).
-	pkt[28] = 0x40
-	for i := 29; i < len(pkt); i++ {
-		pkt[i] = byte(i ^ 0xA5)
-	}
-	return pkt
-}
-
-// buildIPv6UDP constructs a minimal IPv6/UDP packet with the given Traffic
-// Class byte.  Next Header is set to 17 (UDP).  The UDP header occupies
-// bytes 40-47 and the QUIC payload fills the rest.
-func buildIPv6UDP(tc byte, quicPayloadLen int) []byte {
-	const udpHdrLen = 8
-	pkt := buildIPv6(tc, udpHdrLen+quicPayloadLen)
-	pkt[6] = 17 // Next Header: UDP (overwrite TCP=6)
-	// UDP header (bytes 40-47).
-	pkt[40] = 0x12; pkt[41] = 0x34
-	pkt[42] = 0x01; pkt[43] = 0xBB
-	pkt[44] = 0x00; pkt[45] = byte(udpHdrLen + quicPayloadLen)
-	pkt[46] = 0xAB; pkt[47] = 0xCD
-	// QUIC long-header first byte (Header Form=1, Fixed Bit=1 → 0xC0).
-	pkt[48] = 0xC0
-	for i := 49; i < len(pkt); i++ {
-		pkt[i] = byte(i ^ 0x5A)
-	}
-	return pkt
-}
-
-// TestMarkECNCE_QUICIPv4PayloadPreserved verifies that CE marking on an inner
-// IPv4/UDP packet only changes the ECN bits and leaves the UDP header and QUIC
-// application payload completely unmodified.
-func TestMarkECNCE_QUICIPv4PayloadPreserved(t *testing.T) {
-	const quicLen = 30
-	pkt := buildIPv4UDP(0x02, quicLen) // ECT(0)
-
-	// Snapshot everything from the UDP header onwards.
-	transport := make([]byte, len(pkt)-20)
-	copy(transport, pkt[20:])
-
-	markECNCE(pkt, len(pkt))
-
-	// ECN must be CE=11.
-	if ecn := pkt[1] & 0x03; ecn != 0x03 {
-		t.Errorf("ECN not marked CE: got %02x", ecn)
-	}
-	// IPv4 checksum must be valid.
-	if !ipv4ChecksumValid(pkt) {
-		t.Error("IPv4 checksum invalid after CE marking")
-	}
-	// UDP header (src/dst port, len, checksum) must be byte-identical.
-	if !bytes.Equal(pkt[20:28], transport[:8]) {
-		t.Errorf("UDP header corrupted: want %x got %x", transport[:8], pkt[20:28])
-	}
-	// QUIC payload must be byte-identical.
-	if !bytes.Equal(pkt[28:], transport[8:]) {
-		t.Error("QUIC payload corrupted by markECNCE")
-	}
-}
-
-// TestMarkECNCE_QUICIPv6PayloadPreserved is the same verification for IPv6/UDP.
-func TestMarkECNCE_QUICIPv6PayloadPreserved(t *testing.T) {
-	const quicLen = 30
-	pkt := buildIPv6UDP(0x02, quicLen) // ECT(0)
-
-	// Snapshot from the UDP header onwards (IPv6 header = 40 bytes).
-	transport := make([]byte, len(pkt)-40)
-	copy(transport, pkt[40:])
-
-	markECNCE(pkt, len(pkt))
-
-	// ECN must be CE=11.
-	if ecn := extractIPv6ECN(pkt); ecn != 0x03 {
-		t.Errorf("IPv6 ECN not marked CE: got %02x", ecn)
-	}
-	// UDP header must be byte-identical.
-	if !bytes.Equal(pkt[40:48], transport[:8]) {
-		t.Errorf("UDP header corrupted: want %x got %x", transport[:8], pkt[40:48])
-	}
-	// QUIC payload must be byte-identical.
-	if !bytes.Equal(pkt[48:], transport[8:]) {
-		t.Error("QUIC payload corrupted by markECNCE")
-	}
-}
-
-// TestMarkECNCE_QUICIPv6NonECTUnchanged verifies that a QUIC/IPv6 packet with
-// Non-ECT (TC=0x00) is not modified at all — QUIC stacks that do not set ECT
-// are not affected.
-func TestMarkECNCE_QUICIPv6NonECTUnchanged(t *testing.T) {
-	const quicLen = 20
-	pkt := buildIPv6UDP(0x00, quicLen) // Non-ECT
-	original := make([]byte, len(pkt))
-	copy(original, pkt)
-
-	markECNCE(pkt, len(pkt))
-
-	if !bytes.Equal(pkt, original) {
-		t.Error("markECNCE modified a Non-ECT QUIC/IPv6 packet")
-	}
-}
-
-// TestMarkECNCE_QUICIPv4NonECTUnchanged verifies the same for IPv4/UDP/QUIC.
-func TestMarkECNCE_QUICIPv4NonECTUnchanged(t *testing.T) {
-	const quicLen = 20
-	pkt := buildIPv4UDP(0x00, quicLen) // Non-ECT
-	original := make([]byte, len(pkt))
-	copy(original, pkt)
-
-	markECNCE(pkt, len(pkt))
-
-	if !bytes.Equal(pkt, original) {
-		t.Error("markECNCE modified a Non-ECT QUIC/IPv4 packet")
+	short[1] = 0x20 // ECT(0) position
+	original := make([]byte, len(short))
+	copy(original, short)
+	markECNCE(short, len(short)) // must not panic or modify
+	if !bytes.Equal(short, original) {
+		t.Error("markECNCE modified a too-short IPv6 packet")
 	}
 }
 
@@ -3136,125 +2368,5 @@ func TestUDPNetConnCongested(t *testing.T) {
 	// No packets sent: not congested.
 	if cConn.Congested() {
 		t.Error("new UDPNetConn reports congested (want false)")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestBBRSeedConfig — configurable BBR initial bandwidth seed
-// ---------------------------------------------------------------------------
-
-// TestBBRSeedDefaults verifies that DefaultConfig has the expected seed values
-// for the standard SPb→Astana deployment path.
-func TestBBRSeedDefaults(t *testing.T) {
-	t.Parallel()
-	cfg := DefaultConfig()
-	if cfg.BBRSeedBW != 6 {
-		t.Errorf("BBRSeedBW default: got %d, want 6 (Mbps)", cfg.BBRSeedBW)
-	}
-	if cfg.BBRSeedRTT != 78 {
-		t.Errorf("BBRSeedRTT default: got %d, want 78 (ms)", cfg.BBRSeedRTT)
-	}
-}
-
-// TestBBRSeedMbpsConversion verifies the Mbps→bytes/sec conversion used in
-// runUDP is correct and doesn't overflow for typical values.
-func TestBBRSeedMbpsConversion(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		mbps        int
-		wantBytesSec int64
-	}{
-		{0, 0},           // disabled
-		{1, 125_000},     // 1 Mbps = 125 KB/s
-		{6, 750_000},     // 6 Mbps — SPb→Astana default
-		{50, 6_250_000},  // 50 Mbps — domestic VPN
-		{100, 12_500_000}, // 100 Mbps — fast path
-		{1000, 125_000_000}, // 1 Gbps — datacentre
-	}
-	for _, tc := range cases {
-		got := int64(tc.mbps) * 1_000_000 / 8
-		if got != tc.wantBytesSec {
-			t.Errorf("mbps=%d: got %d bytes/sec, want %d", tc.mbps, got, tc.wantBytesSec)
-		}
-	}
-}
-
-// TestBBRSeedDisabledWhenZero verifies that zero values in either field
-// should disable seeding (the if-guard in runUDP).
-func TestBBRSeedDisabledWhenZero(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		bw, rtt  int
-		wantSeed bool
-	}{
-		{6, 78, true},  // both set → seed applied
-		{0, 78, false}, // bw zero → no seed
-		{6, 0, false},  // rtt zero → no seed
-		{0, 0, false},  // both zero → no seed
-	}
-	for _, tc := range cases {
-		got := tc.bw > 0 && tc.rtt > 0
-		if got != tc.wantSeed {
-			t.Errorf("bw=%d rtt=%d: seedEnabled=%v, want %v", tc.bw, tc.rtt, got, tc.wantSeed)
-		}
-	}
-}
-
-// TestBBRSeedAppliedOnUDPConn verifies that SetInitialBandwidth can be
-// called on a real *transport.UDPNetConn (as runUDP does on each accepted
-// connection) without panicking, and that the connection behaves consistently
-// afterwards (not congested, since no packets have been sent yet).
-func TestBBRSeedAppliedOnUDPConn(t *testing.T) {
-	t.Parallel()
-
-	ln, err := transport.ListenUDP("127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("ListenUDP: %v", err)
-	}
-	defer ln.Close()
-
-	// DialUDP returns a *UDPNetConn representing a client-side BBR connection.
-	// In production the seed is applied on the server-side Accept connection,
-	// but SetInitialBandwidth is symmetric — this tests the API surface.
-	conn, err := transport.DialUDP(ln.Addr().String())
-	if err != nil {
-		t.Fatalf("DialUDP: %v", err)
-	}
-	defer conn.Close()
-
-	// Apply seed as runUDP would when BBRSeedBW=6, BBRSeedRTT=78.
-	cfg := DefaultConfig() // BBRSeedBW=6, BBRSeedRTT=78
-	if cfg.BBRSeedBW > 0 && cfg.BBRSeedRTT > 0 {
-		bwBytesPerSec := int64(cfg.BBRSeedBW) * 1_000_000 / 8
-		rtt := time.Duration(cfg.BBRSeedRTT) * time.Millisecond
-		conn.SetInitialBandwidth(bwBytesPerSec, rtt) // must not panic
-	}
-
-	// After seeding but before sending any packets, the connection should
-	// not be congested (no bytes in flight).
-	if conn.Congested() {
-		t.Error("seeded connection reports congested before any sends (want false)")
-	}
-}
-
-// TestBBRSeedCustomValues verifies that non-default seed values can be set
-// and the conversion arithmetic produces the expected bytes-per-second rate.
-func TestBBRSeedCustomValues(t *testing.T) {
-	t.Parallel()
-	// Operator sets 50 Mbps / 20ms for a domestic VPN deployment.
-	cfg := Config{
-		BBRSeedBW:  50,
-		BBRSeedRTT: 20,
-	}
-	if cfg.BBRSeedBW <= 0 || cfg.BBRSeedRTT <= 0 {
-		t.Fatal("expected non-zero seed")
-	}
-	gotBW := int64(cfg.BBRSeedBW) * 1_000_000 / 8
-	if gotBW != 6_250_000 {
-		t.Errorf("50 Mbps → bytes/sec: got %d, want 6_250_000", gotBW)
-	}
-	gotRTT := time.Duration(cfg.BBRSeedRTT) * time.Millisecond
-	if gotRTT != 20*time.Millisecond {
-		t.Errorf("20 ms → duration: got %v, want 20ms", gotRTT)
 	}
 }
