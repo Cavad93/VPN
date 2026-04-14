@@ -20,7 +20,23 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 )
+
+// wsReadPoolMaxSize is the maximum payload size (bytes) allocated from
+// wsReadPool. VPN frames are ≤1455 bytes; 1500 matches muxReadPoolMaxSize
+// and covers all expected client→server WS frames with room to spare.
+const wsReadPoolMaxSize = 1500
+
+// wsReadPool recycles masked-frame payload buffers in readFrame, eliminating
+// the make([]byte, length) allocation that otherwise occurs on every upload-
+// direction VPN packet (~2630/sec at 30 Mbps = ~3.75 MB/sec heap pressure).
+var wsReadPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, wsReadPoolMaxSize)
+		return &buf
+	},
+}
 
 // WebSocket opcodes (RFC 6455 §5.2).
 const (
@@ -56,7 +72,11 @@ type WSConn struct {
 	path      string // requested URL path (e.g. "/tunnel")
 	closed    bool
 	earlyData []byte // V2Ray 0-RTT data from Sec-WebSocket-Protocol
-	readBuf   []byte // leftover from partially consumed frame
+
+	// readBuf holds leftover bytes from a partially consumed frame payload.
+	// It is a sub-slice of the wsReadPool buffer tracked by readBufBacking.
+	readBuf        []byte
+	readBufBacking *[]byte // non-nil iff readBuf is a sub-slice of wsReadPool buf
 
 	// writeBuf is a pre-allocated scratch buffer for assembling outgoing data
 	// frames (binary/text/continuation). Data writes are serialised by the
@@ -232,35 +252,60 @@ func (ws *WSConn) Read(p []byte) (int, error) {
 		ws.readBuf = ws.readBuf[n:]
 		if len(ws.readBuf) == 0 {
 			ws.readBuf = nil
+			if ws.readBufBacking != nil {
+				wsReadPool.Put(ws.readBufBacking)
+				ws.readBufBacking = nil
+			}
 		}
 		return n, nil
 	}
 
 	// 3. Read the next frame
 	for {
-		_, opcode, payload, err := ws.readFrame()
+		_, opcode, payload, backing, err := ws.readFrame()
 		if err != nil {
 			return 0, err
 		}
 
 		switch opcode {
 		case wsOpClose:
+			// Return pool buffer (close payload typically nil/empty).
+			if backing != nil {
+				wsReadPool.Put(backing)
+			}
 			ws.closed = true
 			ws.writeFrame(wsOpClose, nil)
 			return 0, io.EOF
 		case wsOpPing:
+			// writeFrame reads payload but does not retain it; safe to return
+			// the pool buffer immediately after writeFrame returns.
 			ws.writeFrame(wsOpPong, payload)
+			if backing != nil {
+				wsReadPool.Put(backing)
+			}
 			continue
 		case wsOpPong:
+			if backing != nil {
+				wsReadPool.Put(backing)
+			}
 			continue
 		case wsOpBinary, wsOpText, wsOpContinuation:
 			n := copy(p, payload)
-			// Buffer any leftover bytes for subsequent Read calls
 			if n < len(payload) {
+				// Partial read: keep sub-slice + pool backing until fully drained.
 				ws.readBuf = payload[n:]
+				ws.readBufBacking = backing // may be nil for oversized frames
+			} else {
+				// All bytes consumed: return backing immediately (zero-copy hot path).
+				if backing != nil {
+					wsReadPool.Put(backing)
+				}
 			}
 			return n, nil
 		default:
+			if backing != nil {
+				wsReadPool.Put(backing)
+			}
 			return 0, fmt.Errorf("ws: unknown opcode 0x%x", opcode)
 		}
 	}
@@ -287,11 +332,17 @@ func (ws *WSConn) Close() error {
 func (ws *WSConn) Underlying() net.Conn { return ws.conn }
 
 // readFrame reads a single WebSocket frame. Client→server frames are masked.
-func (ws *WSConn) readFrame() (fin bool, opcode byte, payload []byte, err error) {
+//
+// For frames whose payload fits in wsReadPoolMaxSize (all steady-state VPN
+// frames), the payload buffer is borrowed from wsReadPool and returned via the
+// backing pointer. The caller MUST call wsReadPool.Put(backing) once the
+// payload is fully consumed. For oversized frames backing is nil and the
+// payload is heap-allocated normally.
+func (ws *WSConn) readFrame() (fin bool, opcode byte, payload []byte, backing *[]byte, err error) {
 	// Read first 2 bytes: FIN + opcode + MASK + payload length
 	var hdr [2]byte
 	if _, err := io.ReadFull(ws.br, hdr[:]); err != nil {
-		return false, 0, nil, err
+		return false, 0, nil, nil, err
 	}
 
 	fin = hdr[0]&0x80 != 0
@@ -304,13 +355,13 @@ func (ws *WSConn) readFrame() (fin bool, opcode byte, payload []byte, err error)
 	case 126:
 		var ext [2]byte
 		if _, err := io.ReadFull(ws.br, ext[:]); err != nil {
-			return false, 0, nil, err
+			return false, 0, nil, nil, err
 		}
 		length = uint64(binary.BigEndian.Uint16(ext[:]))
 	case 127:
 		var ext [8]byte
 		if _, err := io.ReadFull(ws.br, ext[:]); err != nil {
-			return false, 0, nil, err
+			return false, 0, nil, nil, err
 		}
 		length = binary.BigEndian.Uint64(ext[:])
 	}
@@ -319,29 +370,46 @@ func (ws *WSConn) readFrame() (fin bool, opcode byte, payload []byte, err error)
 	var maskKey [4]byte
 	if masked {
 		if _, err := io.ReadFull(ws.br, maskKey[:]); err != nil {
-			return false, 0, nil, err
+			return false, 0, nil, nil, err
 		}
 	}
 
 	// Read payload
 	if length > 16*1024*1024 { // 16 MB sanity limit
-		return false, 0, nil, errors.New("ws: frame too large")
+		return false, 0, nil, nil, errors.New("ws: frame too large")
 	}
+	if length <= wsReadPoolMaxSize {
+		// Hot path: borrow a buffer from the pool.
+		pb := wsReadPool.Get().(*[]byte)
+		payload = (*pb)[:length]
+		if length > 0 {
+			if _, err := io.ReadFull(ws.br, payload); err != nil {
+				wsReadPool.Put(pb) // return on read error
+				return false, 0, nil, nil, err
+			}
+		}
+		// Unmask in-place (safe: pool buffer is ours until we return it).
+		if masked {
+			for i := range payload {
+				payload[i] ^= maskKey[i%4]
+			}
+		}
+		return fin, opcode, payload, pb, nil
+	}
+
+	// Slow path: frame too large for pool (never happens for VPN frames).
 	payload = make([]byte, length)
 	if length > 0 {
 		if _, err := io.ReadFull(ws.br, payload); err != nil {
-			return false, 0, nil, err
+			return false, 0, nil, nil, err
 		}
 	}
-
-	// Unmask
 	if masked {
 		for i := range payload {
 			payload[i] ^= maskKey[i%4]
 		}
 	}
-
-	return fin, opcode, payload, nil
+	return fin, opcode, payload, nil, nil
 }
 
 // writeFrame writes a single WebSocket frame. Server→client frames are NOT masked.

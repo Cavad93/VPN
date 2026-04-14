@@ -2343,3 +2343,74 @@ conn.SetInitialBandwidth(6_000_000/8, 78*time.Millisecond)
 - `TestBBRSeedCustomValues` — custom config (50 Мбит/с, 20мс) корректно конвертируется
 
 `cd server && go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Запуск 37 — 2026-04-14
+
+### Выполнено: wsReadPool — устранение make() в readFrame (upload path)
+
+**Файлы:** `server/transport/ws.go`, `server/transport/ws_test.go`
+
+**Проблема:**
+
+`readFrame()` содержала `payload = make([]byte, length)` на каждый входящий WS-фрейм. На upload-пути (client→server):
+- VPN-пакеты: ≤ 1455 байт, ~2630 фреймов/сек при 30 Mbps
+- Итого: ~2630 аллокаций/сек ≈ 3.75 MB/сек heap pressure → GC pressure на upload-пути.
+
+До этого запуска writeFrame (download) был уже оптимизирован (Запуск 35: wsWriteBufSize + embedded buffer). readFrame оставался единственной незакрытой аллокацией на WS hot path.
+
+**Решение (зеркально паттерну muxReadPool):**
+
+1. **`wsReadPoolMaxSize = 1500`** — все VPN WS-фреймы ≤ 1455 байт < 1500.
+
+2. **`wsReadPool sync.Pool`** — пул `*[]byte` буферов размером 1500 байт (=muxReadPoolMaxSize).
+
+3. **`readFrame()` — новая сигнатура:** `(fin, opcode, payload, backing *[]byte, err error)`
+   - `length ≤ 1500`: `wsReadPool.Get()` → read into pool buf → unmask in-place → return backing
+   - `length > 1500`: прежний `make()`, `backing = nil`
+   - Ошибка чтения: `wsReadPool.Put(pb)` перед return (нет утечки пул-буфера)
+
+4. **`WSConn.readBufBacking *[]byte`** — хранит backing когда payload читается частично (readBuf).
+
+5. **`Read()` — полный lifecycle:**
+
+   | Путь | Действие |
+   |---|---|
+   | data frame, n == len(payload) (hot path) | `wsReadPool.Put(backing)` немедленно |
+   | data frame, n < len(payload) | `ws.readBufBacking = backing` |
+   | readBuf полностью дренирован | `wsReadPool.Put(readBufBacking)` + `readBufBacking = nil` |
+   | wsOpPing | `writeFrame(pong)` → `wsReadPool.Put(backing)` |
+   | wsOpClose / wsOpPong / unknown | `wsReadPool.Put(backing)` |
+
+**Unmask через пул:** XOR in-place — безопасно, т.к. пул-буфер принадлежит вызывающему между `Get()` и `Put()`.
+
+**В VPN-режиме hot path:** `handleDataStream` вызывает `stream.Read(buf)` с buf=65536 байт. Mux payload ≤ 1430 байт → n == len(payload) всегда → backing возвращается в пул немедленно после каждого вызова Read. **Нулевых аллокаций в steady-state.**
+
+**Тесты (6 новых):**
+
+| Тест | Что проверяет |
+|---|---|
+| `TestWSReadFrameVPNSizeDataIntegrity` | 1430-байтный фрейм: byte-for-byte корректность после unmask + pool |
+| `TestWSReadFramePoolMaxSizeDataIntegrity` | Точно wsReadPoolMaxSize байт: граница hot path |
+| `TestWSReadFrameOversizedDataIntegrity` | wsReadPoolMaxSize+1: slow-path make() корректен |
+| `TestWSReadFramePartialReadDrainsCorrectly` | Частичное чтение 3×20 из 60 байт: данные корректны, `readBufBacking = nil` после drain |
+| `TestWSReadFrameSequentialFramesCorrect` | 10 фреймов × 1430 байт: pool-буферы рециклируются правильно |
+| `TestWSReadFrameZeroLengthPayload` | Нулевой фрейм → (0, nil) + следующий 4-байтный: нет паники, данные корректны |
+
+**Вспомогательная функция:** `upgradeServerSide(t, client, server)` — helper для новых WS-тестов (DRY).
+
+**Эффект:**
+- Устранена `make([]byte, ~1430)` аллокация ~2630 раз/сек → **0 аллокаций** на upload hot path.
+- Экономия: ~3.75 MB/сек heap pressure → снижение GC cycles.
+- Симметрично download-пути (Запуск 35): теперь весь WS I/O path (read + write) имеет нулевых аллокаций в steady-state.
+
+`go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Следующие задачи (приоритетный бэклог)
+
+1. **WSConn readFrame pool** — ~~РЕШЕНО~~ (Запуск 37): `wsReadPool` устраняет аллокацию на upload.
+
+2. **WSConn bufio size** — `bufio.NewReaderSize(conn, 4096)`: 4096 байт покрывает 2–3 VPN-фрейма (≤1455 байт). При burst (несколько фреймов за один syscall) возможен额外 syscall overhead. Размер 8192 или 16384 может снизить количество `conn.Read()` syscall на burst-нагрузке. Требует профилирования под реальной нагрузкой.
