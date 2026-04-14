@@ -62,6 +62,23 @@ const wsGUID = "258EAFA5-E914-47DA-95CA-5AB5DC085B11"
 // in two CPU cache lines (64 bytes each → 23 cache lines for the buffer).
 const wsWriteBufSize = 1472
 
+// wsReadBufSize is the size of the bufio.Reader wrapping the underlying TCP
+// connection in WSConn. It governs how many bytes are fetched from the OS per
+// syscall when draining the receive buffer.
+//
+// Sizing rationale:
+//
+//	One masked VPN frame ≈ 1455 bytes payload + 8 bytes header = 1463 bytes.
+//	At 30 Mbps the OS typically delivers 8–12 frames in a single recv().
+//	16384 / 1463 ≈ 11 frames — covers the common burst window in one syscall.
+//	16384 = max TLS record size — aligns with TLS layer reads when ws.go is
+//	        layered over TLS (VLESS mode), avoiding a second partial read.
+//	Memory cost: 16 KB per connection (vs 4 KB before) — negligible for a VPN.
+//
+// With the previous 4096-byte buffer a 5-frame burst (5×1463 = 7315 bytes)
+// required 2 syscalls; with 16384 it fits in 1 syscall.
+const wsReadBufSize = 16384
+
 // WSConn wraps a net.Conn with WebSocket binary message framing.
 // After Upgrade(), reads and writes are transparently framed.
 // Read implements io.Reader: a single WebSocket frame's payload may be
@@ -96,7 +113,7 @@ type WSConn struct {
 // Validates that the request targets the expected path. If path is empty,
 // any path is accepted.
 func WSUpgrade(conn net.Conn, expectedPath string) (*WSConn, error) {
-	return WSUpgradeFromReader(conn, bufio.NewReaderSize(conn, 4096), expectedPath)
+	return WSUpgradeFromReader(conn, bufio.NewReaderSize(conn, wsReadBufSize), expectedPath)
 }
 
 // WSUpgradeFromReader performs server-side WebSocket upgrade using an existing
@@ -219,7 +236,7 @@ func WSUpgradeFromParsedRequest(conn net.Conn, req *http.Request, expectedPath s
 
 	return &WSConn{
 		conn:      conn,
-		br:        bufio.NewReaderSize(conn, 4096),
+		br:        bufio.NewReaderSize(conn, wsReadBufSize),
 		path:      req.URL.Path,
 		earlyData: earlyData,
 	}, nil

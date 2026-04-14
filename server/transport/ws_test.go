@@ -900,6 +900,25 @@ func sendMaskedFrame(t *testing.T, conn net.Conn, opcode byte, payload []byte) {
 	conn.Write(buf.Bytes())
 }
 
+// TestWSReadBufSizeCoversFullBurst verifies that wsReadBufSize is large enough
+// to hold an 11-frame burst (the burst window at 30 Mbps) in one syscall, and
+// that it equals the canonical TLS max-record size (16 384 bytes).
+func TestWSReadBufSizeCoversFullBurst(t *testing.T) {
+	// Largest VPN frame: tunMTU(1430) + mux(7) + noise(18) = 1455 bytes payload
+	// + WS header 4 bytes (2-byte extended length) = 1459 bytes on wire.
+	const maxFrameOnWire = 1459
+	const burstFrames = 11 // 11 × 1459 = 16 049 < 16 384
+	if wsReadBufSize < maxFrameOnWire*burstFrames {
+		t.Errorf("wsReadBufSize=%d too small for %d-frame burst (%d bytes needed)",
+			wsReadBufSize, burstFrames, maxFrameOnWire*burstFrames)
+	}
+	// Must equal max TLS record size for layer alignment.
+	const tlsMaxRecord = 16384
+	if wsReadBufSize != tlsMaxRecord {
+		t.Errorf("wsReadBufSize=%d should equal TLS max record size %d", wsReadBufSize, tlsMaxRecord)
+	}
+}
+
 // readUnmaskedFrame reads a server→client unmasked frame.
 func readUnmaskedFrame(t *testing.T, conn net.Conn) []byte {
 	t.Helper()

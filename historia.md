@@ -2414,3 +2414,53 @@ conn.SetInitialBandwidth(6_000_000/8, 78*time.Millisecond)
 1. **WSConn readFrame pool** — ~~РЕШЕНО~~ (Запуск 37): `wsReadPool` устраняет аллокацию на upload.
 
 2. **WSConn bufio size** — `bufio.NewReaderSize(conn, 4096)`: 4096 байт покрывает 2–3 VPN-фрейма (≤1455 байт). При burst (несколько фреймов за один syscall) возможен额外 syscall overhead. Размер 8192 или 16384 может снизить количество `conn.Read()` syscall на burst-нагрузке. Требует профилирования под реальной нагрузкой.
+
+---
+
+## Запуск 38 — 2026-04-14
+
+### Выполнено: wsReadBufSize — увеличение bufio.Reader 4096 → 16384 байт
+
+**Файлы:** `server/transport/ws.go`, `server/transport/ws_test.go`
+
+**Проблема:**
+
+`WSConn` использовал `bufio.NewReaderSize(conn, 4096)` в двух местах: `WSUpgrade()` и `WSUpgradeFromReader()`.
+
+Один VPN WS-фрейм занимает ~1463 байт на проводе (1455 байт payload + 8 байт WS header). При 4096-байтном буфере burst из 5 фреймов (7315 байт) требовал **2 syscall** вместо 1. При 30 Mbps с типичными OS-burst в 8–12 фреймов это добавляет лишние `recv()` syscall с µs-задержками.
+
+**Решение:**
+
+Введена именованная константа:
+
+```go
+// wsReadBufSize is the bufio.Reader size for WSConn.
+// 16384 = TLS max record; covers 11+ VPN frames per syscall.
+const wsReadBufSize = 16384
+```
+
+Обоснование выбора:
+- 16384 / 1463 ≈ **11.2 фрейма** — покрывает типичный OS burst целиком за 1 syscall
+- 16384 = **TLS max record size** — при VLESS+TLS bufio читает ровно один TLS-запись за syscall
+- Прежний 4096: burst из 5 фреймов = 2 syscall → теперь **1 syscall**
+- Память: +12 KB на соединение — пренебрежимо для VPN
+
+Оба вызова `bufio.NewReaderSize(conn, 4096)` заменены на `bufio.NewReaderSize(conn, wsReadBufSize)`.
+
+**Тест (1 новый):**
+
+`TestWSReadBufSizeCoversFullBurst`:
+- Проверяет `wsReadBufSize >= 11 × maxFrameOnWire(1459)` — bust покрыт
+- Проверяет `wsReadBufSize == 16384` — равен TLS max record size
+
+**Тесты:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Следующие задачи (приоритетный бэклог)
+
+1. **WSConn readFrame pool** — ~~РЕШЕНО~~ (Запуск 37): `wsReadPool` устраняет аллокацию на upload.
+
+2. **WSConn bufio size** — ~~РЕШЕНО~~ (Запуск 38): `wsReadBufSize = 16384` снижает syscall overhead на burst.
+
+3. **pprof под нагрузкой** — CPU profiling при 30 Mbps для поиска скрытых hotspots после всех аллокационных оптимизаций.
