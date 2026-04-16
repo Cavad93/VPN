@@ -51,3 +51,43 @@ func ConfigureTun(name, cidr string) error {
 	_ = ip
 	return nil
 }
+
+// ConfigureTun6 assigns an IPv6 address from cidr6 to the TUN interface and
+// enables IPv6 forwarding so VPN clients with IPv6 addresses can reach the
+// internet.
+//
+// cidr6 must be in the form "xxxx::x/prefix" (e.g. "fc00::1/120").
+// The TUN interface must already be up (ConfigureTun brings it up).
+// Requires: iproute2 (`ip` command) installed on the host.
+func ConfigureTun6(name, cidr6 string) error {
+	ip6, ip6Net, err := net.ParseCIDR(cidr6)
+	if err != nil {
+		return fmt.Errorf("ConfigureTun6: parse CIDR %q: %w", cidr6, err)
+	}
+	if ip6.To4() != nil {
+		return fmt.Errorf("ConfigureTun6: %q is an IPv4 address, not IPv6", cidr6)
+	}
+
+	// ip -6 addr add fc00::1/120 dev vpn0
+	if out, err := exec.Command("ip", "-6", "addr", "add", cidr6, "dev", name).CombinedOutput(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 2 {
+			// RTNETLINK: File exists — already configured, not an error
+		} else {
+			return fmt.Errorf("ConfigureTun6: ip -6 addr add: %w\nOutput: %s", err, out)
+		}
+	}
+
+	// Enable IPv6 forwarding (best-effort; may already be set via sysctl.conf).
+	exec.Command("sysctl", "-w", "net.ipv6.conf.all.forwarding=1").Run() //nolint:errcheck
+
+	// Add ip6tables MASQUERADE so IPv6 VPN clients can reach the internet.
+	// Best-effort: ip6tables may not be installed or the rule may already exist.
+	subnet6 := ip6Net.String()
+	exec.Command("ip6tables", "-t", "nat", "-C", "POSTROUTING", "-s", subnet6, "-j", "MASQUERADE"). //nolint:errcheck
+		Run()
+	exec.Command("ip6tables", "-t", "nat", "-A", "POSTROUTING", "-s", subnet6, "-j", "MASQUERADE"). //nolint:errcheck
+		Run()
+
+	_ = ip6Net
+	return nil
+}

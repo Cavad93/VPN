@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -76,6 +77,56 @@ func ConfigureTun(name, cidr string) error {
 	).Run()
 
 	return nil
+}
+
+// ConfigureTun6 assigns an IPv6 address from cidr6 to the Wintun adapter and
+// enables IPv6 forwarding on Windows.
+//
+// cidr6 must be in the form "xxxx::x/prefix" (e.g. "fc00::1/120").
+// Requires: administrator privileges.
+func ConfigureTun6(name, cidr6 string) error {
+	ip6, _, err := net.ParseCIDR(cidr6)
+	if err != nil {
+		return fmt.Errorf("ConfigureTun6: parse CIDR %q: %w", cidr6, err)
+	}
+	if ip6.To4() != nil {
+		return fmt.Errorf("ConfigureTun6: %q is an IPv4 address, not IPv6", cidr6)
+	}
+
+	// Derive prefix length from CIDR.
+	_, ipNet6, _ := net.ParseCIDR(cidr6)
+	ones, _ := ipNet6.Mask.Size()
+
+	// netsh interface ipv6 add address name="<name>" address=<ip6>/<prefixlen>
+	out, err := exec.Command(
+		"netsh", "interface", "ipv6", "add", "address",
+		"interface="+name,
+		fmt.Sprintf("address=%s/%d", ip6.String(), ones),
+	).CombinedOutput()
+	if err != nil {
+		// Exit code 1 with "duplicate" error means already configured — OK.
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 &&
+			containsIgnoreCase(string(out), "duplicate") {
+			// Already configured — not an error.
+		} else {
+			return fmt.Errorf("ConfigureTun6: netsh ipv6 add address: %w\nOutput: %s", err, out)
+		}
+	}
+
+	// Enable IPv6 forwarding in the registry (best-effort).
+	exec.Command( //nolint:errcheck
+		"reg", "add",
+		`HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters`,
+		"/v", "IPEnableRouter", "/t", "REG_DWORD", "/d", "1", "/f",
+	).Run()
+
+	return nil
+}
+
+// containsIgnoreCase reports whether s contains substr, case-insensitively.
+func containsIgnoreCase(s, substr string) bool {
+	return len(s) >= len(substr) &&
+		strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }
 
 // ipv4MaskString converts a net.IPMask to dotted-decimal notation (e.g. "255.255.255.0").

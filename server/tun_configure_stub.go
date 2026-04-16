@@ -9,3 +9,9 @@ import "fmt"
 func ConfigureTun(name, cidr string) error {
 	return fmt.Errorf("ConfigureTun: platform not supported — configure %s with %s manually", name, cidr)
 }
+
+// ConfigureTun6 is a no-op stub for unsupported platforms.
+// IPv6 TUN configuration must be performed manually on this OS.
+func ConfigureTun6(name, cidr6 string) error {
+	return fmt.Errorf("ConfigureTun6: platform not supported — configure %s with %s manually", name, cidr6)
+}

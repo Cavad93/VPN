@@ -35,10 +35,13 @@ import (
 // Control message type constants.
 const (
 	ctlHello            = uint8(0x01) // client→server: request IP assignment
-	ctlAssign           = uint8(0x02) // server→client: IP assignment response
+	ctlAssign           = uint8(0x02) // server→client: IPv4-only IP assignment response
 	ctlError            = uint8(0xFF) // server→client: error
 	ctlSecondary        = uint8(0x03) // client→server: attach secondary download connection
+	ctlAssignDual       = uint8(0x05) // server→client: dual-stack (IPv4+IPv6) assignment
 	ctlAssignPayloadLen = 9           // 4(ip) + 1(prefix_len) + 4(gateway)
+	// ctlAssignDualPayloadLen: ip4(4)+pfx4(1)+gw4(4)+ip6(16)+pfx6(1)+gw6(16) = 42 bytes.
+	ctlAssignDualPayloadLen = 42
 
 	noiseHandshakeMsgMaxSize = 4096
 )
@@ -54,9 +57,22 @@ type TunDevice interface {
 type Config struct {
 	ListenAddr      string
 	TunCIDR         string
+	Tun6CIDR        string // optional IPv6 CIDR for dual-stack, e.g. "fc00::1/120"; empty = disabled
 	PrivKeyFile     string
 	Transport       string // "tcp" (default) or "udp" (user-space BBR)
 	AllowedKeysFile string // path to persist the allowed-keys list across restarts
+
+	// BBR initial bandwidth seed (UDP transport only).
+	// When both are non-zero, SetInitialBandwidth is called on each new
+	// UDP connection so BBR skips the slow Startup phase and jumps directly
+	// to ProbeBW. Zero values disable seeding (BBR runs its normal Startup).
+	//
+	// Set to the expected bottleneck bandwidth and RTT for your deployment:
+	//   -bbr-seed-bw 6 -bbr-seed-rtt 78   # SPb→Astana (6 Mbps, 78ms)
+	//   -bbr-seed-bw 50 -bbr-seed-rtt 20  # domestic (50 Mbps, 20ms)
+	//   -bbr-seed-bw 0                     # disable — use BBR Startup
+	BBRSeedBW  int // bottleneck bandwidth in Mbps (0 = disabled)
+	BBRSeedRTT int // expected RTT in milliseconds (0 = disabled)
 }
 
 // DefaultConfig returns a Config populated with sensible defaults.
@@ -67,6 +83,11 @@ func DefaultConfig() Config {
 		PrivKeyFile:     "server_privkey.hex",
 		Transport:       "udp",
 		AllowedKeysFile: "allowed_keys.txt",
+		// Seed BBR at the typical international VPN path parameters.
+		// Avoids slow Startup (10+ RTTs) on reconnect for the common case.
+		// Override with -bbr-seed-bw / -bbr-seed-rtt for your deployment.
+		BBRSeedBW:  6,  // 6 Mbps — measured SPb→Astana bottleneck
+		BBRSeedRTT: 78, // 78ms  — measured SPb→Astana RTT
 	}
 }
 
@@ -121,6 +142,30 @@ func (sb *streamBond) next() dataWriter {
 	return s
 }
 
+// nextWithCount returns the next stream in round-robin order together with the
+// current bond size in a single mutex acquisition.
+//
+// Hot-path optimisation for routeFromTun: the naive approach calls count() to
+// bound the retry loop and then next() for each attempt — 2 lock/unlock cycles
+// per packet in the common case (single bonded stream, write succeeds).
+// nextWithCount collapses both into one critical section so the common path
+// pays exactly 1 lock/unlock per IP packet routed from TUN to client.
+//
+// Thread safety: the returned total may be stale if streams are added or
+// removed concurrently between calls. This is the same race that existed with
+// the separate count()+next() pattern; the caller already handles it by
+// checking ds == nil before each write.
+func (sb *streamBond) nextWithCount() (s dataWriter, total int) {
+	sb.mu.Lock()
+	total = len(sb.list)
+	if total > 0 {
+		s = sb.list[sb.idx%total]
+		sb.idx++
+	}
+	sb.mu.Unlock()
+	return s, total
+}
+
 // count returns the number of bonded streams.
 func (sb *streamBond) count() int {
 	sb.mu.Lock()
@@ -142,9 +187,10 @@ type clientSession struct {
 	remoteKey    [32]byte
 	noiseSession *crypto.Session
 	mux          *transport.Mux
-	rawConn      net.Conn       // underlying TCP/UDP connection
+	rawConn      net.Conn         // underlying TCP/UDP connection
 	congestion   congestionProber // non-nil in UDP+BBR mode only
 	assignedIP   net.IP
+	assignedIP6  net.IP // nil when server is IPv4-only (no -tun6-cidr)
 	bond         streamBond // round-robin across parallel download connections
 	bytesIn      atomic.Uint64
 	bytesOut     atomic.Uint64
@@ -182,9 +228,14 @@ type Server struct {
 	// happen only on connect/disconnect (rare).  sync.Map avoids any lock
 	// in the steady-state read path via an atomic pointer swap.
 	ipIndex     sync.Map
+	// ip6Index maps [16]byte IPv6 destination address → *clientSession.
+	// Only populated when pool6 != nil (Tun6CIDR is configured).
+	// Same read-heavy access pattern as ipIndex — sync.Map is optimal.
+	ip6Index    sync.Map
 	allowedKeys map[[32]byte]struct{}
 	tun         TunDevice
 	pool        *ipPool
+	pool6       *ip6Pool // nil when Tun6CIDR is not configured
 	nextIDMu    sync.Mutex
 	nextID      uint64
 	// notifSvc is optional; when set, push notifications are fired on
@@ -217,6 +268,14 @@ func NewServer(cfg Config, kp *crypto.KeyPair, tun TunDevice, allowedKeys [][cry
 		tun:      tun,
 		pool:     pool,
 		nextID:   1,
+	}
+
+	if cfg.Tun6CIDR != "" {
+		p6, err := newIP6Pool(cfg.Tun6CIDR)
+		if err != nil {
+			return nil, fmt.Errorf("server: invalid Tun6CIDR: %w", err)
+		}
+		s.pool6 = p6
 	}
 
 	if len(allowedKeys) > 0 {
@@ -281,13 +340,10 @@ func (s *Server) runTCP(ctx context.Context) error {
 		// to spike (80ms → 321ms due to bufferbloat); 4 MB is the safe ceiling.
 		// setForcedSocketBuffers uses SO_RCVBUFFORCE/SO_SNDBUFFORCE on Linux
 		// (requires CAP_NET_ADMIN) to bypass net.core.rmem_max.
+		setConnTTL64(conn) // Anti-fingerprint: TTL=64 (Linux) instead of 128 (Windows)
 		if tc, ok := conn.(*net.TCPConn); ok {
 			setForcedSocketBuffers(tc, 4<<20) // 4 MB per bond connection
 			tc.SetNoDelay(true)               // disable Nagle — VPN packets must not be coalesced
-			// TCP keepalive: probe idle connections every 15 s with 3 retries.
-			// Detects dead connections in 30 s (15+3×5) — 2× faster than before.
-			// Prevents ISP NAT/firewall from silently dropping "idle" VPN connections
-			// after a few minutes (common with Rostelecom / MTS stateful firewalls).
 			tc.SetKeepAlive(true)
 			tc.SetKeepAlivePeriod(15 * time.Second)
 		}
@@ -340,6 +396,7 @@ func (s *Server) runUDP(ctx context.Context) error {
 						continue
 					}
 				}
+				setConnTTL64(conn)
 				if tc, ok := conn.(*net.TCPConn); ok {
 					setForcedSocketBuffers(tc, 4<<20)
 					tc.SetNoDelay(true)
@@ -376,13 +433,18 @@ func (s *Server) runUDP(ctx context.Context) error {
 				continue
 			}
 		}
-		// Seed BBR @ measured RTT 78ms, conservative BW 6 Mbps.
-		// BDP = 6/8 × 0.078 = 58.5 KB → initial cwnd = 2×BDP ≈ 117 KB.
-		// BBR Startup doubles pacing_rate each RTT until it hits BtlBW; starting
-		// from a seed close to actual avoids both:
-		//   • overshooting (fills ISP buffers → loss → inflated RTT measurement)
-		//   • undershooting (slow Startup wastes the first few seconds of speedtest)
-		conn.SetInitialBandwidth(6_000_000/8, 78*time.Millisecond)
+		// Seed BBR with the configured bandwidth/RTT so new connections skip
+		// the slow Startup phase (10+ RTTs of exponential probing) and jump
+		// directly to ProbeBW. Both fields must be non-zero to enable seeding.
+		// If the real bottleneck differs, BBR self-corrects within 1-2 RTTs:
+		//   • seed too high → probe phase → loss → cwnd converges down
+		//   • seed too low  → ProbeBW 5/4 gain → BtlBw discovered quickly
+		// Seeding is disabled when BBRSeedBW==0 or BBRSeedRTT==0.
+		if s.cfg.BBRSeedBW > 0 && s.cfg.BBRSeedRTT > 0 {
+			bwBytesPerSec := int64(s.cfg.BBRSeedBW) * 1_000_000 / 8
+			rtt := time.Duration(s.cfg.BBRSeedRTT) * time.Millisecond
+			conn.SetInitialBandwidth(bwBytesPerSec, rtt)
+		}
 		go s.handleConn(ctx, conn) //nolint:errcheck
 	}
 }
@@ -676,6 +738,10 @@ func (s *Server) runPrimaryConn(ctx context.Context, rawConn net.Conn, session *
 			s.ipIndex.Delete(packed)
 			s.pool.release(cs.assignedIP)
 		}
+		if cs.assignedIP6 != nil {
+			s.ip6Index.Delete(ipToKey16(cs.assignedIP6))
+			s.pool6.release(cs.assignedIP6)
+		}
 		s.logger.Info("session closed", "id", cs.id, "bonds", cs.bond.count())
 		if s.notifSvc != nil && assignedIP != "" {
 			s.notifSvc.NotifySessionDisconnected(cs.id, assignedIP)
@@ -761,33 +827,60 @@ func (s *Server) runSecondaryConn(ctx context.Context, clientKey [32]byte, ctlSt
 func (s *Server) handleControlStream(ctx context.Context, cs *clientSession, stream *transport.Stream) error {
 	defer stream.Close()
 
-	// Allocate IP
+	// Allocate IPv4 address.
 	ip, err := s.pool.allocate()
 	if err != nil {
 		stream.Write([]byte{ctlError}) //nolint:errcheck
 		return fmt.Errorf("ip allocation failed: %w", err)
 	}
-
 	cs.assignedIP = ip
 
 	// Register in O(1) reverse IP index so routeFromTun avoids O(n) scan.
 	packed := binary.BigEndian.Uint32(ip.To4())
 	s.ipIndex.Store(packed, cs)
 
-	// Build 10-byte response: ctlAssign + ip[4] + prefixLen[1] + gw[4]
-	resp := make([]byte, 1+ctlAssignPayloadLen)
-	resp[0] = ctlAssign
-	ip4 := ip.To4()
-	copy(resp[1:5], ip4)
-	resp[5] = byte(s.pool.prefixLen())
-	gw := s.pool.serverIP().To4()
-	copy(resp[6:10], gw)
+	// Optionally allocate an IPv6 address when dual-stack is configured.
+	// A failure here is non-fatal: the client falls back to IPv4-only.
+	var ip6 net.IP
+	if s.pool6 != nil {
+		if a, err2 := s.pool6.allocate(); err2 == nil {
+			ip6 = a
+			cs.assignedIP6 = ip6
+			s.ip6Index.Store(ipToKey16(ip6), cs)
+		} else {
+			s.logger.Warn("IPv6 address allocation failed, falling back to IPv4-only", "err", err2)
+		}
+	}
+
+	var resp []byte
+	if ip6 != nil {
+		// Dual-stack response: ctlAssignDual(1) + ip4(4) + pfx4(1) + gw4(4) + ip6(16) + pfx6(1) + gw6(16)
+		resp = make([]byte, 1+ctlAssignDualPayloadLen)
+		resp[0] = ctlAssignDual
+		copy(resp[1:5], ip.To4())
+		resp[5] = byte(s.pool.prefixLen())
+		copy(resp[6:10], s.pool.serverIP().To4())
+		copy(resp[10:26], ip6.To16())
+		resp[26] = byte(s.pool6.prefixLen())
+		copy(resp[27:43], s.pool6.serverIP().To16())
+	} else {
+		// IPv4-only response: ctlAssign(1) + ip4(4) + pfx4(1) + gw4(4)
+		resp = make([]byte, 1+ctlAssignPayloadLen)
+		resp[0] = ctlAssign
+		copy(resp[1:5], ip.To4())
+		resp[5] = byte(s.pool.prefixLen())
+		copy(resp[6:10], s.pool.serverIP().To4())
+	}
 
 	if _, err := stream.Write(resp); err != nil {
 		return fmt.Errorf("write assign response: %w", err)
 	}
 
-	s.logger.Info("assigned IP", "id", cs.id, "ip", ip.String())
+	if ip6 != nil {
+		s.logger.Info("assigned IP", "id", cs.id, "ip4", ip.String(), "ip6", ip6.String())
+	} else {
+		s.logger.Info("assigned IP", "id", cs.id, "ip", ip.String())
+	}
 
 	// Fire push notification for new connection (non-blocking).
 	if s.notifSvc != nil {
@@ -870,17 +963,43 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 	}
 }
 
-// markECNCE marks the ECN field of an inner IPv4 or IPv6 packet as Congestion
-// Experienced (CE=11).  It only modifies ECN-capable packets (ECT(0)=10 or
-// ECT(1)=01); Non-ECT (00) and already-CE (11) packets are left unchanged.
+// markECNCE marks the ECN field of an inner IP packet (IPv4 or IPv6) as
+// Congestion Experienced (CE=11).
+//
+// It only modifies packets that advertise ECN-capable transport (ECT(0)=10 or
+// ECT(1)=01); Non-ECT packets (00) and already-CE packets (11) are left
+// unchanged.
 //
 // Purpose: Double-CC mitigation — when our BBR pipe is near-full
-// (Congested()==true), marking CE in the inner IP header signals the inner TCP
-// sender to reduce its rate through RFC 3168 ECN-Echo, synchronising it with
-// our BBR instead of reacting independently.
+// (Congested()==true), marking CE in the inner IP header signals inner senders
+// to reduce their rate, synchronising them with our BBR:
 //
-// For IPv4 the header checksum is recomputed after the ECN byte changes.
-// For IPv6 no checksum update is needed (IPv6 has no header checksum).
+//   - Inner TCP senders: CE triggers RFC 3168 ECN-Echo in the next TCP ACK;
+//     the TCP sender halves cwnd (just like a loss event) without actual loss.
+//
+//   - Inner QUIC senders (RFC 9000 §13.4): QUIC reads ECN bits from the IP
+//     header via IP_RECVTOS / IPV6_RECVTCLASS.  When the CE counter in QUIC
+//     ACK frames increases, the QUIC sender's congestion controller reduces its
+//     rate.  This covers all QUIC/HTTP-3 traffic (YouTube, Google, Cloudflare)
+//     running over both IPv4/UDP and IPv6/UDP without any additional handling —
+//     markECNCE only touches the IP-layer ECN bits and leaves the UDP header
+//     and QUIC payload completely unmodified.
+//
+// Implementation is transport-protocol-agnostic: only the two ECN bits in the
+// IP header are changed; all bytes beyond the IP header are untouched.
+//
+// IPv4 header byte layout:
+//
+//	byte[0]   — version(4b) + IHL(4b)
+//	byte[1]   — DSCP(6b) + ECN(2b): ECN bits 1-0; CE = 11
+//	bytes[10-11] — header checksum (ones-complement, recomputed after marking)
+//
+// IPv6 header byte layout (RFC 8200 §3):
+//
+//	byte[0]   — version(4b, =6) + Traffic Class bits[7:4]
+//	byte[1]   — Traffic Class bits[3:0] + Flow Label bits[19:16]
+//	             TC = DSCP(6b) + ECN(2b); ECN bits are byte[1] bits[5:4]
+//	             No header checksum → no recomputation needed.
 func markECNCE(buf []byte, n int) {
 	if n < 1 {
 		return
@@ -893,16 +1012,10 @@ func markECNCE(buf []byte, n int) {
 	}
 }
 
-// markECNCEv4 marks ECN CE in an IPv4 packet and recomputes the header checksum.
-//
-// IPv4 header byte layout (RFC 791):
-//
-//	byte[0]     — version(4b) + IHL(4b)
-//	byte[1]     — DSCP(6b) + ECN(2b): ECN in bits [1:0]; CE = 0x03
-//	bytes[10:12] — header checksum (ones-complement)
+// markECNCEv4 is the IPv4-specific helper for markECNCE.
 func markECNCEv4(buf []byte, n int) {
 	if n < 20 {
-		return
+		return // too short for IPv4 header
 	}
 	ecn := buf[1] & 0x03
 	if ecn == 0x00 || ecn == 0x03 {
@@ -932,33 +1045,26 @@ func markECNCEv4(buf []byte, n int) {
 	buf[11] = byte(csum)
 }
 
-// markECNCEv6 marks ECN CE in an IPv6 packet.
+// markECNCEv6 is the IPv6-specific helper for markECNCE.
 //
-// IPv6 header byte layout (RFC 2460 §3):
+// IPv6 Traffic Class layout within the first two header bytes:
 //
-//	byte[0] — version(4b) + Traffic Class[7:4](4b)
-//	byte[1] — Traffic Class[3:0](4b) + Flow Label[19:16](4b)
+//	byte[0] bits[3:0] = TC bits[7:4]  (DSCP high nibble)
+//	byte[1] bits[7:4] = TC bits[3:0]  (DSCP low 2b + ECN 2b)
+//	byte[1] bits[5:4] = ECN bits[1:0]
 //
-// Traffic Class = DSCP(6b) + ECN(2b), LSB-first within Traffic Class:
-//
-//	TC[7:2] = DSCP; TC[1:0] = ECN
-//
-// In the wire encoding, ECN occupies byte[1] bits [5:4]:
-//
-//	byte[1][7:6] = TC[3:2] = DSCP[1:0]
-//	byte[1][5:4] = TC[1:0] = ECN       ← these two bits are updated
-//	byte[1][3:0]            = Flow Label high nibble (preserved)
-//
-// IPv6 has no header checksum, so no recomputation is needed after the update.
+// Marking CE sets those two bits to 11 and leaves all other bits untouched.
+// IPv6 has no header checksum, so no recalculation is required.
 func markECNCEv6(buf []byte, n int) {
-	if n < 40 { // IPv6 fixed header is 40 bytes
-		return
+	if n < 40 {
+		return // minimum IPv6 header is 40 bytes
 	}
+	// ECN occupies bits[5:4] of byte[1] (= TC bits[1:0]).
 	ecn := (buf[1] >> 4) & 0x03
 	if ecn == 0x00 || ecn == 0x03 {
 		return // Not-ECT or already CE: nothing to do
 	}
-	// ECT(0)=0x02 or ECT(1)=0x01 → set CE=0x03 in bits [5:4]
+	// Set ECN=CE=11 by setting bits[5:4] of byte[1]; preserve DSCP and Flow Label.
 	buf[1] = (buf[1] &^ 0x30) | 0x30
 }
 
@@ -1012,13 +1118,32 @@ func (s *Server) routeFromTun(ctx context.Context) {
 			continue
 		}
 
-		// Lock-free O(1) lookup via sync.Map (read-optimised for the hot path).
-		dstKey := binary.BigEndian.Uint32(buf[16:20])
-		val, ok := s.ipIndex.Load(dstKey)
-		if !ok {
+		// Determine IP version and look up the destination client session.
+		// IPv4: header ≥ 20 bytes, dst at buf[16:20] (uint32 key in ipIndex).
+		// IPv6: header ≥ 40 bytes, dst at buf[24:40] ([16]byte key in ip6Index).
+		var target *clientSession
+		switch buf[0] >> 4 {
+		case 4:
+			dstKey := binary.BigEndian.Uint32(buf[16:20])
+			val, ok := s.ipIndex.Load(dstKey)
+			if !ok {
+				continue
+			}
+			target = val.(*clientSession)
+		case 6:
+			if n < 40 {
+				continue
+			}
+			var dstKey [16]byte
+			copy(dstKey[:], buf[24:40])
+			val, ok := s.ip6Index.Load(dstKey)
+			if !ok {
+				continue
+			}
+			target = val.(*clientSession)
+		default:
 			continue
 		}
-		target := val.(*clientSession)
 
 		// Double-CC mitigation: if the outer VPN pipe is near-full (UDP+BBR mode),
 		// mark ECN CE in the inner IP header so that the inner TCP sender reduces its
@@ -1029,11 +1154,13 @@ func (s *Server) routeFromTun(ctx context.Context) {
 		}
 
 		// Round-robin across bonded streams (multiple TCP connections).
+		// nextWithCount is used for the first attempt: it returns the next stream
+		// AND the current bond size in a single mutex acquisition, saving one
+		// lock/unlock cycle per packet vs the previous count()+next() pattern.
 		bond := &target.bond
-		tried := bond.count()
+		ds, tried := bond.nextWithCount()
 		sent := false
-		for i := 0; i < tried; i++ {
-			ds := bond.next()
+		for i := 0; ; i++ {
 			if ds == nil {
 				break
 			}
@@ -1050,6 +1177,11 @@ func (s *Server) routeFromTun(ctx context.Context) {
 				sent = true
 				break
 			}
+			// Write failed — try the next bonded stream (up to tried−1 more times).
+			if i+1 >= tried {
+				break
+			}
+			ds = bond.next()
 		}
 		if pc != nil {
 			pc.TrackLatency(perf.StageFullEgress, time.Since(t0))
@@ -1301,13 +1433,13 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 	// (inner) starts SECOND. This prevents the timer inversion bug where
 	// the subtimer could exceed its container.
 	//
-	// Read deadline: cap the maximum blocking time at 60 seconds.
+	// Read deadline: cap the maximum blocking time at 120 seconds.
 	// The mux keepalive (transport.muxKeepaliveInterval = 15s) sends a
 	// FramePing every 15s, resetting this deadline on each receive.
-	// 60s = 4× keepalive interval → tolerates up to 3 dropped/delayed pings
-	// before declaring the connection dead. Without keepalives a 30s cap would
-	// disconnect idle but valid connections (e.g. user not browsing for 30s).
-	nc.conn.SetReadDeadline(time.Now().Add(60 * time.Second)) //nolint:errcheck
+	// 120s = 8× keepalive interval → tolerates up to 7 dropped/delayed pings
+	// before declaring the connection dead. Generous to handle macOS WiFi
+	// power saving which can pause UDP for 30-60s during idle.
+	nc.conn.SetReadDeadline(time.Now().Add(120 * time.Second)) //nolint:errcheck
 	var obfsReadStart, afterRead time.Time
 	if nc.perf != nil {
 		obfsReadStart = time.Now()
@@ -1523,6 +1655,108 @@ func isBroadcast(ip net.IP, network *net.IPNet) bool {
 }
 
 // ---------------------------------------------------------------------------
+// ip6Pool — IPv6 address allocator
+// ---------------------------------------------------------------------------
+
+// ip6Pool allocates client IPv6 addresses from a ULA CIDR subnet.
+// The host address in the CIDR is the server address and is pre-marked as used.
+// Only pure IPv6 CIDRs are accepted; use newIPPool for IPv4.
+type ip6Pool struct {
+	mu      sync.Mutex
+	network *net.IPNet
+	server  net.IP          // 16-byte IPv6
+	used    map[[16]byte]bool
+}
+
+// newIP6Pool parses cidr (must be an IPv6 CIDR, e.g. "fc00::1/120") and
+// returns an ip6Pool. The host address in cidr becomes the server address and
+// is pre-marked as used along with the network address.
+func newIP6Pool(cidr string) (*ip6Pool, error) {
+	ip, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, fmt.Errorf("ip6Pool: parse CIDR %q: %w", cidr, err)
+	}
+	// Reject IPv4 addresses (including IPv4-mapped IPv6).
+	if ip.To4() != nil {
+		return nil, errors.New("ip6Pool: only IPv6 CIDRs are supported")
+	}
+	serverIP := ip.To16()
+	if serverIP == nil {
+		return nil, errors.New("ip6Pool: invalid IPv6 address")
+	}
+	p := &ip6Pool{
+		network: network,
+		server:  cloneIP6(serverIP),
+		used:    make(map[[16]byte]bool),
+	}
+	// Pre-mark network address and server address as used.
+	p.used[ipToKey16(network.IP)] = true
+	p.used[ipToKey16(serverIP)] = true
+	return p, nil
+}
+
+// allocate returns the next available IPv6 address in the subnet.
+func (p *ip6Pool) allocate() (net.IP, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Start from network address + 1.
+	current := cloneIP6(p.network.IP)
+	incrementIP(current) // incrementIP works for any slice length
+
+	for p.network.Contains(current) {
+		key := ipToKey16(current)
+		if !p.used[key] {
+			p.used[key] = true
+			return cloneIP6(current), nil
+		}
+		incrementIP(current)
+	}
+	return nil, errors.New("ip6Pool: address space exhausted")
+}
+
+// release marks ip as available again.
+func (p *ip6Pool) release(ip net.IP) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Guard: only release genuine IPv6 (not IPv4-mapped).
+	if ip.To4() == nil {
+		if ip6 := ip.To16(); ip6 != nil {
+			delete(p.used, ipToKey16(ip6))
+		}
+	}
+}
+
+// serverIP returns the server's IPv6 address in the subnet.
+func (p *ip6Pool) serverIP() net.IP { return cloneIP6(p.server) }
+
+// prefixLen returns the network prefix length.
+func (p *ip6Pool) prefixLen() int {
+	ones, _ := p.network.Mask.Size()
+	return ones
+}
+
+// ipToKey16 converts an IPv6 address to a comparable [16]byte map key.
+func ipToKey16(ip net.IP) [16]byte {
+	var key [16]byte
+	if ip6 := ip.To16(); ip6 != nil {
+		copy(key[:], ip6)
+	}
+	return key
+}
+
+// cloneIP6 returns a 16-byte copy of an IPv6 address.
+func cloneIP6(ip net.IP) net.IP {
+	ip6 := ip.To16()
+	if ip6 == nil {
+		return nil
+	}
+	out := make(net.IP, 16)
+	copy(out, ip6)
+	return out
+}
+
+// ---------------------------------------------------------------------------
 // Key pair loading / generation
 // ---------------------------------------------------------------------------
 
@@ -1592,7 +1826,7 @@ func main() {
 	cfg := DefaultConfig()
 	apiCfg := api.DefaultConfig()
 
-	var vlessAddr, vlessCert, vlessKey, vlessPath string
+	var vlessAddr, vlessCert, vlessKey, vlessPath, vlessSNI string
 	var anthropicKey string
 	var relayTo string
 	var knockKeyHex string
@@ -1602,6 +1836,7 @@ func main() {
 	var openAccess bool
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "listen address")
 	flag.StringVar(&cfg.TunCIDR, "tun-cidr", cfg.TunCIDR, "TUN CIDR (e.g. 10.8.0.1/24)")
+	flag.StringVar(&cfg.Tun6CIDR, "tun6-cidr", cfg.Tun6CIDR, "TUN IPv6 CIDR for dual-stack clients (e.g. fc00::1/120; empty to disable)")
 	flag.StringVar(&cfg.PrivKeyFile, "privkey", cfg.PrivKeyFile, "path to hex-encoded private key file")
 	flag.StringVar(&cfg.Transport, "transport", cfg.Transport, "transport protocol: tcp (kernel CC) or udp (user-space BBR)")
 	flag.StringVar(&cfg.AllowedKeysFile, "allowed-keys-file", cfg.AllowedKeysFile, "path to file with allowed client public keys (one hex key per line); persists across restarts")
@@ -1612,12 +1847,15 @@ func main() {
 	flag.StringVar(&vlessCert, "vless-cert", "cert.pem", "TLS certificate file for VLESS")
 	flag.StringVar(&vlessKey, "vless-key", "key.pem", "TLS private key file for VLESS")
 	flag.StringVar(&vlessPath, "vless-path", "/tunnel", "WebSocket path for VLESS")
+	flag.StringVar(&vlessSNI, "vless-sni", "", "hostname for the auto-generated TLS cert CN/SAN (empty = random CDN domain for anti-fingerprinting)")
 	flag.StringVar(&anthropicKey, "anthropic-key", "", "Anthropic API key for telemetry analysis (or ANTHROPIC_API_KEY env)")
 	flag.StringVar(&relayTo, "relay-to", "", "relay VPN traffic to this upstream address (e.g. 193.124.93.240:38947); disables local VPN termination")
 	flag.StringVar(&knockKeyHex, "knock-key", "", "hex-encoded 32-byte PSK for relay port knocking (Reality-style HMAC in session_id); client must use the same key")
 	flag.StringVar(&relayMetricsAddr, "relay-metrics-addr", ":9092", "relay metrics HTTP server address (per-segment throughput for AI diagnostics; empty to disable)")
 	flag.StringVar(&diagnosticsFile, "diagnostics-file", "", "path to append telemetry reports as JSONL (e.g. /var/log/cavadvpn/diagnostics.jsonl)")
 	flag.StringVar(&coverAddr, "cover-addr", "", "listen address for plain HTTP cover website (e.g. :80); serves the cooking blog to censorship scanners checking port 80")
+	flag.IntVar(&cfg.BBRSeedBW, "bbr-seed-bw", cfg.BBRSeedBW, "BBR initial bandwidth seed in Mbps for UDP transport (0 = use BBR Startup phase; set to your bottleneck bandwidth for faster connection ramp-up)")
+	flag.IntVar(&cfg.BBRSeedRTT, "bbr-seed-rtt", cfg.BBRSeedRTT, "BBR initial RTT seed in milliseconds for UDP transport (0 = use BBR Startup phase; set to your path RTT for faster connection ramp-up)")
 	flag.Parse()
 
 	// Anthropic API key: flag takes precedence, then environment variable.
@@ -1711,6 +1949,14 @@ func main() {
 		logger.Warn("TUN configuration failed — interface may need manual setup", "err", err)
 	}
 
+	if cfg.Tun6CIDR != "" {
+		if err := ConfigureTun6("vpn0", cfg.Tun6CIDR); err != nil {
+			logger.Warn("TUN IPv6 configuration failed — dual-stack clients will not route IPv6", "err", err)
+		} else {
+			logger.Info("TUN IPv6 configured", "cidr6", cfg.Tun6CIDR)
+		}
+	}
+
 	// Load the persisted allowed-keys list (if any).
 	// -open flag bypasses the file entirely (allow any client key).
 	var persistedKeys [][32]byte
@@ -1760,11 +2006,12 @@ func main() {
 			os.Exit(1)
 		}
 		vlessCfg := VLESSConfig{
-			ListenAddr: vlessAddr,
-			UUID:       uuid,
-			WSPath:     vlessPath,
-			TLSCert:    vlessCert,
-			TLSKey:     vlessKey,
+			ListenAddr:  vlessAddr,
+			UUID:        uuid,
+			WSPath:      vlessPath,
+			TLSCert:     vlessCert,
+			TLSKey:      vlessKey,
+			TLSHostname: vlessSNI,
 		}
 		// Print VLESS links for easy import into V2Ray clients.
 		host, port := splitVLESSHostPort(vlessAddr)
