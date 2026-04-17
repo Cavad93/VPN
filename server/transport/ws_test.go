@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -493,6 +494,58 @@ func TestWSWriteFrameOversizedPayload(t *testing.T) {
 
 	client.Close()
 	ws.Close()
+}
+
+// TestWSWriteFrameLargePooled verifies that frames in the wsLargeWritePool range
+// (> wsWriteBufSize, ≤ wsLargeWriteBufSize) are correctly written — exercising
+// the VLESS TCP proxy download path where io.Copy delivers large chunks.
+func TestWSWriteFrameLargePooled(t *testing.T) {
+	// Test representative sizes: 4 KiB (typical TLS record), 16 KiB, and
+	// exactly wsLargeWriteBufSize-10 (the largest pooled payload).
+	sizes := []int{4 * 1024, 16 * 1024, wsLargeWriteBufSize - 10}
+	for _, sz := range sizes {
+		sz := sz
+		t.Run(fmt.Sprintf("payload_%d", sz), func(t *testing.T) {
+			client, server := testPipe()
+
+			done := make(chan *WSConn, 1)
+			go func() {
+				ws, err := WSUpgrade(server, "")
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				done <- ws
+			}()
+
+			wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
+			req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
+			client.Write([]byte(req))
+			respBuf := make([]byte, 4096)
+			client.Read(respBuf)
+
+			ws := <-done
+
+			payload := bytes.Repeat([]byte{0xEF}, sz)
+
+			gotCh := make(chan []byte, 1)
+			go func() {
+				gotCh <- readUnmaskedFrame(t, client)
+			}()
+
+			if _, err := ws.Write(payload); err != nil {
+				t.Fatalf("Write large pooled (%d bytes): %v", sz, err)
+			}
+
+			got := <-gotCh
+			if !bytes.Equal(got, payload) {
+				t.Errorf("large pooled write %d bytes: payload mismatch (got %d bytes)", sz, len(got))
+			}
+
+			client.Close()
+			ws.Close()
+		})
+	}
 }
 
 // TestWSWriteFrameDataIntegrity verifies that the embedded writeBuf produces

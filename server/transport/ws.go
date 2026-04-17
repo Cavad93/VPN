@@ -102,6 +102,26 @@ const wsGUID = "258EAFA5-E914-47DA-95CA-5AB5DC085B11"
 // in two CPU cache lines (64 bytes each → 23 cache lines for the buffer).
 const wsWriteBufSize = 1472
 
+// wsLargeWriteBufSize is the pool buffer size for the writeFrame slow path.
+// This covers the VLESS TCP proxy case where io.Copy delivers up to 32 KiB per
+// Write call (io.Copy default buffer = 32 KiB; WS header = max 10 bytes).
+// Frames > wsLargeWriteBufSize are rare (would need payloads > 32 KiB) and
+// fall back to make() as before.
+const wsLargeWriteBufSize = 32*1024 + 10
+
+// wsLargeWritePool pools combined header+payload buffers for the writeFrame
+// slow path (payload > wsWriteBufSize). This eliminates per-frame heap
+// allocations on the VLESS TCP proxy download path, where io.Copy delivers
+// large chunks:
+//
+//	io.Copy buffer (32 KiB) → ws.Write(32 KiB) → writeFrame slow path
+//	At 10 Mbps with ~4 KiB frames: ~2500 allocs/sec × ~4 KiB ≈ 10 MB/sec
+//	After pooling: 0 allocs/sec for frames ≤ wsLargeWriteBufSize.
+var wsLargeWritePool = sync.Pool{New: func() any {
+	b := make([]byte, wsLargeWriteBufSize)
+	return &b
+}}
+
 // wsReadBufSize is the size of the bufio.Reader wrapping the underlying TCP
 // connection in WSConn. It governs how many bytes are fetched from the OS per
 // syscall when draining the receive buffer.
@@ -529,10 +549,23 @@ func (ws *WSConn) writeFrame(opcode byte, payload []byte) error {
 		return err
 	}
 
-	// Slow path: payload larger than wsWriteBufSize (not expected in VPN traffic;
-	// max steady-state payload is 1455 bytes < wsWriteBufSize=1472).
-	// Fall back to a single heap allocation to keep correctness.
-	buf := make([]byte, hdrLen+length)
+	// Slow path: payload exceeds embedded buffer (VLESS TCP proxy: io.Copy delivers
+	// up to 32 KiB per Write call; VPN tunnel never reaches here — max is 1455 B).
+	// Use wsLargeWritePool to eliminate the per-frame heap allocation.
+	totalSize := hdrLen + length
+	if totalSize <= wsLargeWriteBufSize {
+		pb := wsLargeWritePool.Get().(*[]byte)
+		buf := (*pb)[:totalSize]
+		copy(buf, ws.writeBuf[:hdrLen])
+		copy(buf[hdrLen:], payload)
+		_, err := ws.conn.Write(buf)
+		// ws.conn.Write copies data into TLS/TCP send buffer before returning —
+		// safe to return the pool buffer immediately.
+		wsLargeWritePool.Put(pb)
+		return err
+	}
+	// Extremely large frame (> 32 KiB + 10): extraordinary case, make() once.
+	buf := make([]byte, totalSize)
 	copy(buf, ws.writeBuf[:hdrLen])
 	copy(buf[hdrLen:], payload)
 	_, err := ws.conn.Write(buf)

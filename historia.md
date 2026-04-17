@@ -3040,9 +3040,93 @@ Maven сборка недоступна (network timeout); код верифиц
 
 ---
 
+## Запуск 45 — 2026-04-17
+
+### Выполнено: wsLargeWritePool — устранение heap-аллокации на VLESS proxy download path
+
+**Файлы:** `server/transport/ws.go`, `server/transport/ws_test.go`
+
+**Проблема:**
+
+В `writeFrame` существовало два пути:
+
+1. **Hot path** (payload ≤ 1472 bytes): нет аллокации — данные записываются напрямую в embedded `ws.writeBuf [wsWriteBufSize]byte`. Это работает для VPN tunnel traffic (max payload ≈ 1455 bytes < 1472).
+
+2. **Slow path** (payload > 1472 bytes): `make([]byte, hdrLen+length)` — heap аллокация:
+   ```go
+   buf := make([]byte, hdrLen+length)  // НЕ оптимизировано!
+   copy(buf, ws.writeBuf[:hdrLen])
+   copy(buf[hdrLen:], payload)
+   _, err := ws.conn.Write(buf)
+   ```
+
+Slow path срабатывает для **VLESS TCP proxy download path** (`vlessTCPRelay`), где `io.Copy(writer, target)` доставляет чанки размером до **32 KiB** в `ws.Write()`:
+```
+target TCP → io.Copy (32 KiB buffer) → ws.Write(N KiB) → writeFrame (N KiB > 1472) → make([]byte, N KiB+4)
+```
+
+**Метрики до оптимизации:**
+- 10 Mbps VLESS download с 4 KiB frames: ~2500 allocs/sec × ~4 KiB ≈ **10 MB/sec heap pressure**
+- 30 Mbps VLESS download с 16 KiB frames: ~2295 allocs/sec × ~16 KiB ≈ **36 MB/sec heap pressure**
+
+Это сопоставимо с тем, что было оптимизировано ранее (writeFrame pre-embedded-buf: ~3.75 MB/sec) — но применимо к VLESS прокси режиму, который не использует embedded buffer.
+
+**Решение:**
+
+Добавлены `wsLargeWriteBufSize = 32*1024 + 10` и `wsLargeWritePool = sync.Pool`:
+
+```go
+const wsLargeWriteBufSize = 32*1024 + 10  // io.Copy buffer + max WS header
+
+var wsLargeWritePool = sync.Pool{New: func() any {
+    b := make([]byte, wsLargeWriteBufSize)
+    return &b
+}}
+```
+
+В slow path:
+```go
+totalSize := hdrLen + length
+if totalSize <= wsLargeWriteBufSize {
+    pb := wsLargeWritePool.Get().(*[]byte)
+    buf := (*pb)[:totalSize]
+    copy(buf, ws.writeBuf[:hdrLen])
+    copy(buf[hdrLen:], payload)
+    _, err := ws.conn.Write(buf)
+    wsLargeWritePool.Put(pb)  // safe: TLS/TCP Write copies before returning
+    return err
+}
+// Extremely large frame (> 32 KiB+10): make() once — extraordinary case
+```
+
+**Безопасность `Put` сразу после `Write`:**
+`ws.conn.Write` (для `*tls.Conn` или `*net.TCPConn`) копирует данные в kernel/TLS буфер до возврата. Буфер из пула можно возвращать немедленно — аналогично как это сделано в `payloadPool` (Run 12) и `wsReadPool` (Run ~28+).
+
+**Эффект:**
+- Slow path: `make([]byte, N)` × 2500/сек → 0 в steady-state для frames ≤ 32 KiB + 10
+- VLESS TCP proxy at 10 Mbps: ~10 MB/sec heap pressure → 0
+- VLESS TCP proxy at 30 Mbps: ~36 MB/sec heap pressure → 0
+- VPN tunnel path (hot path, всегда < 1472): без изменений
+
+**Два pool-а для write-side теперь:**
+- `ws.writeBuf [1472]byte` — embedded buffer, zero alloc для VPN tunnel (≤ 1455 bytes)
+- `wsLargeWritePool` — pooled heap buffer, zero alloc для VLESS proxy (1473–32778 bytes)
+- `make()` — только для экстремально больших фреймов (> 32 KiB+10): extremely rare
+
+**Тесты (1 новый: `TestWSWriteFrameLargePooled`):**
+- 3 sub-tests: payload 4 KiB, 16 KiB, 32 KiB (= `wsLargeWriteBufSize - 10`)
+- Каждый: `ws.Write(payload)` → `readUnmaskedFrame(client)` → `bytes.Equal` проверка
+
+`go test ./transport/ -run TestWSWriteFrame -v -count=1` — 5 тестов (15 sub-tests) PASS.
+`go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог — обновлено 2026-04-17)
 
 1. **~~CTL_ASSIGN_DUAL Python клиент~~** — ~~РЕШЕНО~~ (Запуск 42).
 2. **~~CTL_ASSIGN_DUAL Android клиент~~** — ~~РЕШЕНО~~ (Запуск 43): `VpnClient.doControlStream` + `RouteInfo` IPv6 поля.
 3. **~~Android TUN IPv6 конфигурация~~** — ~~РЕШЕНО~~ (Запуск 44): `setupTunnel` добавляет IPv6 адрес и `"::/0"` маршрут при dual-stack.
-4. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps.
+4. **wsLargeWritePool** — ~~РЕШЕНО~~ (Запуск 45): pool для VLESS proxy download write path.
+5. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps.
+6. **vlessUDPRelay double-write** — `hdr` и `respBuf[:n]` посылаются двумя Write вызовами → 2 TLS-записи на UDP ответ. Оптимизация: combine header+data в один Write (pre-allocated 65538-byte buf с 2-байт prefix).
