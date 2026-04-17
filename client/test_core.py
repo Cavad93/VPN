@@ -27,6 +27,8 @@ from core import (
     MUX_HEADER_SIZE,
     CTL_HELLO,
     CTL_ASSIGN,
+    CTL_ASSIGN_DUAL,
+    CTL_ASSIGN_DUAL_PAYLOAD_LEN,
     CTL_ERROR,
     CTL_ASSIGN_PAYLOAD_LEN,
     TLS_HELLO_CLIENT,
@@ -2070,6 +2072,197 @@ class TestUploadBonding(unittest.TestCase):
         client._connected.clear()
         client_mux.close()
         server_mux.close()
+
+
+# ===========================================================================
+# TestDualStackControl — CTL_ASSIGN_DUAL (0x05) parsing
+# ===========================================================================
+
+class TestDualStackControl(unittest.TestCase):
+    """Tests for CTL_ASSIGN_DUAL constant and _do_control_stream dual-stack parsing."""
+
+    # --- Constant sanity checks ---
+
+    def test_ctl_assign_dual_value(self) -> None:
+        """CTL_ASSIGN_DUAL must be 0x05 (matches ctlAssignDual in main.go)."""
+        self.assertEqual(CTL_ASSIGN_DUAL, 0x05)
+
+    def test_ctl_assign_dual_payload_len(self) -> None:
+        """CTL_ASSIGN_DUAL_PAYLOAD_LEN must be 42 (matches ctlAssignDualPayloadLen in main.go)."""
+        self.assertEqual(CTL_ASSIGN_DUAL_PAYLOAD_LEN, 42)
+
+    def test_ctl_constants_distinct_including_dual(self) -> None:
+        """All control constants must be unique to avoid protocol ambiguity."""
+        values = [CTL_HELLO, CTL_ASSIGN, CTL_ASSIGN_DUAL, CTL_SECONDARY, CTL_ERROR]
+        self.assertEqual(len(values), len(set(values)))
+
+    # --- RouteInfo dual-stack fields ---
+
+    def test_route_info_ipv4_only_is_not_dual_stack(self) -> None:
+        route = RouteInfo(
+            assigned_ip="10.8.0.2",
+            prefix_len=24,
+            gateway="10.8.0.1",
+            server_public_key=b"\x00" * 32,
+        )
+        self.assertFalse(route.is_dual_stack)
+        self.assertIsNone(route.assigned_ip6)
+        self.assertIsNone(route.prefix_len6)
+        self.assertIsNone(route.gateway6)
+
+    def test_route_info_dual_stack_fields(self) -> None:
+        route = RouteInfo(
+            assigned_ip="10.8.0.2",
+            prefix_len=24,
+            gateway="10.8.0.1",
+            server_public_key=b"\x00" * 32,
+            assigned_ip6="fc00::2",
+            prefix_len6=120,
+            gateway6="fc00::1",
+        )
+        self.assertTrue(route.is_dual_stack)
+        self.assertEqual(route.assigned_ip6, "fc00::2")
+        self.assertEqual(route.prefix_len6, 120)
+        self.assertEqual(route.gateway6, "fc00::1")
+
+    def test_route_info_ipv4_fields_unchanged_in_dual_stack(self) -> None:
+        route = RouteInfo(
+            assigned_ip="10.8.0.7",
+            prefix_len=24,
+            gateway="10.8.0.1",
+            server_public_key=b"\xAB" * 32,
+            assigned_ip6="fc00::7",
+            prefix_len6=120,
+            gateway6="fc00::1",
+        )
+        self.assertEqual(route.assigned_ip, "10.8.0.7")
+        self.assertEqual(route.prefix_len, 24)
+        self.assertEqual(route.gateway, "10.8.0.1")
+        self.assertEqual(route.cidr, "10.8.0.7/24")
+
+    # --- _do_control_stream parsing ---
+
+    def _build_ctl_stream(self, payload_bytes: bytes) -> "MuxStream":
+        """Build a fake MuxStream that returns payload_bytes on read_exactly calls."""
+
+        class FakeStream:
+            def __init__(self, data: bytes) -> None:
+                self._buf = bytearray(data)
+                self._pos = 0
+
+            def write(self, data: bytes) -> None:
+                pass  # discard ctlHello
+
+            def read_exactly(self, n: int) -> bytes:
+                chunk = bytes(self._buf[self._pos:self._pos + n])
+                if len(chunk) < n:
+                    raise EOFError("not enough data")
+                self._pos += n
+                return chunk
+
+            def close(self) -> None:
+                pass
+
+        return FakeStream(payload_bytes)
+
+    def _make_client_with_fake_mux(self, stream) -> "VPNClient":
+        """Create a VPNClient whose _mux.open_stream() returns stream."""
+
+        class FakeMux:
+            def __init__(self, s) -> None:
+                self._s = s
+
+            def open_stream(self):
+                return self._s
+
+        client = VPNClient.__new__(VPNClient)
+        import structlog
+        client._log = structlog.get_logger()
+        client._mux = FakeMux(stream)
+        return client
+
+    def test_do_control_stream_ipv4_only(self) -> None:
+        """_do_control_stream parses CTL_ASSIGN (IPv4-only) correctly."""
+        ip4 = socket.inet_aton("10.8.0.3")
+        gw4 = socket.inet_aton("10.8.0.1")
+        payload = bytes([CTL_ASSIGN]) + ip4 + bytes([24]) + gw4
+        stream = self._build_ctl_stream(payload)
+        client = self._make_client_with_fake_mux(stream)
+
+        route = client._do_control_stream()
+
+        self.assertEqual(route.assigned_ip, "10.8.0.3")
+        self.assertEqual(route.prefix_len, 24)
+        self.assertEqual(route.gateway, "10.8.0.1")
+        self.assertFalse(route.is_dual_stack)
+        self.assertIsNone(route.assigned_ip6)
+
+    def test_do_control_stream_dual_stack(self) -> None:
+        """_do_control_stream parses CTL_ASSIGN_DUAL (dual-stack) correctly."""
+        ip4 = socket.inet_aton("10.8.0.5")
+        gw4 = socket.inet_aton("10.8.0.1")
+        ip6 = ipaddress.IPv6Address("fc00::5").packed  # 16 bytes
+        gw6 = ipaddress.IPv6Address("fc00::1").packed  # 16 bytes
+        payload = (
+            bytes([CTL_ASSIGN_DUAL])
+            + ip4 + bytes([24]) + gw4
+            + ip6 + bytes([120]) + gw6
+        )
+        stream = self._build_ctl_stream(payload)
+        client = self._make_client_with_fake_mux(stream)
+
+        route = client._do_control_stream()
+
+        self.assertEqual(route.assigned_ip, "10.8.0.5")
+        self.assertEqual(route.prefix_len, 24)
+        self.assertEqual(route.gateway, "10.8.0.1")
+        self.assertTrue(route.is_dual_stack)
+        self.assertEqual(route.assigned_ip6, "fc00::5")
+        self.assertEqual(route.prefix_len6, 120)
+        self.assertEqual(route.gateway6, "fc00::1")
+
+    def test_do_control_stream_dual_payload_length(self) -> None:
+        """Dual-stack payload must be exactly CTL_ASSIGN_DUAL_PAYLOAD_LEN=42 bytes."""
+        ip4 = socket.inet_aton("10.8.0.2")
+        gw4 = socket.inet_aton("10.8.0.1")
+        ip6 = b"\xfc\x00" + b"\x00" * 13 + b"\x02"  # fc00::2
+        gw6 = b"\xfc\x00" + b"\x00" * 13 + b"\x01"  # fc00::1
+        dual_payload = ip4 + bytes([24]) + gw4 + ip6 + bytes([120]) + gw6
+        self.assertEqual(len(dual_payload), CTL_ASSIGN_DUAL_PAYLOAD_LEN)
+
+    def test_do_control_stream_ctl_error_raises(self) -> None:
+        """CTL_ERROR response raises IOError."""
+        payload = bytes([CTL_ERROR])
+        stream = self._build_ctl_stream(payload)
+        client = self._make_client_with_fake_mux(stream)
+        with self.assertRaises(IOError):
+            client._do_control_stream()
+
+    def test_do_control_stream_unknown_type_raises(self) -> None:
+        """Unknown response type raises IOError."""
+        payload = bytes([0xAB])
+        stream = self._build_ctl_stream(payload)
+        client = self._make_client_with_fake_mux(stream)
+        with self.assertRaises(IOError):
+            client._do_control_stream()
+
+    def test_do_control_stream_dual_stack_various_prefixes(self) -> None:
+        """Dual-stack correctly handles various IPv6 prefix lengths."""
+        for pfx6 in (64, 96, 112, 120, 126):
+            with self.subTest(pfx6=pfx6):
+                ip4 = socket.inet_aton("10.8.0.2")
+                gw4 = socket.inet_aton("10.8.0.1")
+                ip6 = ipaddress.IPv6Address(f"fc00::{pfx6}").packed
+                gw6 = ipaddress.IPv6Address("fc00::1").packed
+                payload = (
+                    bytes([CTL_ASSIGN_DUAL])
+                    + ip4 + bytes([24]) + gw4
+                    + ip6 + bytes([pfx6]) + gw6
+                )
+                stream = self._build_ctl_stream(payload)
+                client = self._make_client_with_fake_mux(stream)
+                route = client._do_control_stream()
+                self.assertEqual(route.prefix_len6, pfx6)
 
 
 if __name__ == "__main__":

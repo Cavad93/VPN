@@ -68,8 +68,12 @@ CTL_ASSIGN     = 0x02
 # The server responds with CTL_ASSIGN (0x02) on success.
 # Wire: open stream → write CTL_SECONDARY(1) + assigned_ip(4) → read CTL_ASSIGN(1)
 CTL_SECONDARY  = 0x03
+# CTL_ASSIGN_DUAL is sent by the server when -tun6-cidr is configured.
+# Wire (server→client): 0x05 + ip4(4) + pfx4(1) + gw4(4) + ip6(16) + pfx6(1) + gw6(16)
+CTL_ASSIGN_DUAL = 0x05
 CTL_ERROR      = 0xFF  # server→client error (e.g. IP pool exhaustion)
-CTL_ASSIGN_PAYLOAD_LEN = 9  # ip(4) + prefixLen(1) + gateway(4)
+CTL_ASSIGN_PAYLOAD_LEN      = 9   # ip4(4) + prefixLen4(1) + gw4(4)
+CTL_ASSIGN_DUAL_PAYLOAD_LEN = 42  # ip4(4)+pfx4(1)+gw4(4)+ip6(16)+pfx6(1)+gw6(16)
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +891,10 @@ class RouteInfo:
     prefix_len: int         # e.g. 24
     gateway: str            # e.g. "10.8.0.1"
     server_public_key: bytes  # 32-byte server static public key
+    # IPv6 fields — populated only when server sends CTL_ASSIGN_DUAL (0x05).
+    assigned_ip6: Optional[str] = None  # e.g. "fc00::2"
+    prefix_len6: Optional[int] = None   # e.g. 120
+    gateway6: Optional[str] = None      # e.g. "fc00::1"
 
     @property
     def cidr(self) -> str:
@@ -897,6 +905,11 @@ class RouteInfo:
     def network(self) -> ipaddress.IPv4Network:
         """Return the IPv4Network for the assigned subnet."""
         return ipaddress.IPv4Network(f"{self.assigned_ip}/{self.prefix_len}", strict=False)
+
+    @property
+    def is_dual_stack(self) -> bool:
+        """True when the server assigned both IPv4 and IPv6 addresses."""
+        return self.assigned_ip6 is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1017,9 +1030,13 @@ class VPNClient:
             prefix_len=route.prefix_len,
             gateway=route.gateway,
             server_public_key=session.remote_static,
+            assigned_ip6=route.assigned_ip6,
+            prefix_len6=route.prefix_len6,
+            gateway6=route.gateway6,
         )
         self._route_info = route
-        self._log.info("vpn_connected", cidr=route.cidr, gateway=route.gateway)
+        self._log.info("vpn_connected", cidr=route.cidr, gateway=route.gateway,
+                       dual_stack=route.is_dual_stack)
 
         # 7. Open data stream
         self._data_stream = self._mux.open_stream()
@@ -1413,35 +1430,56 @@ class VPNClient:
         return self._obfs.read(length)
 
     def _do_control_stream(self) -> RouteInfo:
-        """Open control stream, send ctlHello, parse ctlAssign response."""
+        """Open control stream, send ctlHello, parse ctlAssign/ctlAssignDual response."""
         ctl = self._mux.open_stream()
         try:
             # Send ctlHello
             ctl.write(bytes([CTL_HELLO]))
 
-            # Read response: ctlAssign(1) + ip(4) + prefixLen(1) + gateway(4) = 10 bytes
-            resp = ctl.read_exactly(1 + CTL_ASSIGN_PAYLOAD_LEN)
+            # Read the 1-byte type tag first, then the appropriate payload.
+            type_byte = ctl.read_exactly(1)[0]
 
-            if resp[0] == CTL_ERROR:
+            if type_byte == CTL_ERROR:
                 raise IOError("server returned ctlError on control stream")
-            if resp[0] != CTL_ASSIGN:
-                raise IOError(f"unexpected control response 0x{resp[0]:02x}")
 
-            ip_bytes = resp[1:5]
-            prefix_len = resp[5]
-            gw_bytes = resp[6:10]
+            if type_byte == CTL_ASSIGN:
+                # IPv4-only response: ip(4) + prefixLen(1) + gateway(4) = 9 bytes
+                payload = ctl.read_exactly(CTL_ASSIGN_PAYLOAD_LEN)
+                assigned_ip = socket.inet_ntoa(payload[0:4])
+                prefix_len = payload[4]
+                gateway = socket.inet_ntoa(payload[5:9])
+                self._log.info("ip_assigned",
+                               ip=assigned_ip, prefix_len=prefix_len, gateway=gateway)
+                return RouteInfo(
+                    assigned_ip=assigned_ip,
+                    prefix_len=prefix_len,
+                    gateway=gateway,
+                    server_public_key=b"",  # filled in connect()
+                )
 
-            assigned_ip = socket.inet_ntoa(ip_bytes)
-            gateway = socket.inet_ntoa(gw_bytes)
+            if type_byte == CTL_ASSIGN_DUAL:
+                # Dual-stack response: ip4(4)+pfx4(1)+gw4(4)+ip6(16)+pfx6(1)+gw6(16)=42 bytes
+                payload = ctl.read_exactly(CTL_ASSIGN_DUAL_PAYLOAD_LEN)
+                assigned_ip = socket.inet_ntoa(payload[0:4])
+                prefix_len = payload[4]
+                gateway = socket.inet_ntoa(payload[5:9])
+                assigned_ip6 = str(ipaddress.IPv6Address(payload[9:25]))
+                prefix_len6 = payload[25]
+                gateway6 = str(ipaddress.IPv6Address(payload[26:42]))
+                self._log.info("ip_assigned_dual",
+                               ip=assigned_ip, prefix_len=prefix_len, gateway=gateway,
+                               ip6=assigned_ip6, prefix_len6=prefix_len6, gateway6=gateway6)
+                return RouteInfo(
+                    assigned_ip=assigned_ip,
+                    prefix_len=prefix_len,
+                    gateway=gateway,
+                    server_public_key=b"",  # filled in connect()
+                    assigned_ip6=assigned_ip6,
+                    prefix_len6=prefix_len6,
+                    gateway6=gateway6,
+                )
 
-            self._log.info("ip_assigned",
-                           ip=assigned_ip, prefix_len=prefix_len, gateway=gateway)
-            return RouteInfo(
-                assigned_ip=assigned_ip,
-                prefix_len=prefix_len,
-                gateway=gateway,
-                server_public_key=b"",  # filled in connect()
-            )
+            raise IOError(f"unexpected control response 0x{type_byte:02x}")
         finally:
             ctl.close()
 

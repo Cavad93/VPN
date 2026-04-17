@@ -2705,9 +2705,10 @@ IPv6 ECN функции (`markECNCEv4`, `markECNCEv6`), добавленные �
 5. ~~BBR seed flags~~ — ВЫПОЛНЕНО (Запуск 36).
 6. **pprof под нагрузкой** — endpoint добавлен (Запуск 24). Требует живого сервера.
 7. **cover.go diagnostics** — `relay_metrics.go` + `/relay-metrics` endpoint для AI-диагностики боттленека.
-8. **knock.go порт-кнокинг** — HMAC-based Reality-style session_id knock для relay-режима.
+8. ~~**knock.go порт-кнокинг**~~ — ВЫПОЛНЕНО (transport/knock.go + relay.go + decoy.go + -knock-key флаг).
 9. ~~**IPv6 TUN configure**~~ — ВЫПОЛНЕНО (Запуск 41): `ConfigureTun6` реализован на Linux/Windows/stub; `main.go` вызывает его при `Tun6CIDR != ""`.
 10. **Potential optimization**: `noiseConn.Write` allocates `make([]byte, 2+plaintext+16)` на каждый пакет — можно poolить. (Проверка: уже есть `noiseWritePoolSmall/Large` — DONE)
+11. ~~**Python client CTL_ASSIGN_DUAL parsing**~~ — ВЫПОЛНЕНО (Запуск 42): `_do_control_stream` обрабатывает 0x05; `RouteInfo` получил IPv6-поля.
 
 ---
 
@@ -2784,3 +2785,104 @@ ping6 -c 4 fc00::2   # от сервера к клиенту
 - `TestConfigureTunIPv6FromMain` — `DefaultConfig().Tun6CIDR == ""`, assignment работает
 
 **Результат:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Запуск 42 — 2026-04-17
+
+### Выполнено: Python клиент — поддержка CTL_ASSIGN_DUAL (0x05) dual-stack сервера
+
+**Файлы:** `client/core.py`, `client/test_core.py`
+
+**Проблема:**
+
+При включении IPv6 на сервере (`-tun6-cidr fc00::1/120`) сервер начинает отправлять
+`CTL_ASSIGN_DUAL` (0x05) вместо `CTL_ASSIGN` (0x02). Python-клиент читал 10 байт
+(`1 + CTL_ASSIGN_PAYLOAD_LEN`), видел тип 0x05 (не 0x02 и не 0xFF) и бросал:
+
+```
+IOError: unexpected control response 0x05
+```
+
+Это означало, что **все** Python-клиенты не могли подключиться к серверу с `-tun6-cidr`.
+
+**Исправления:**
+
+1. **Добавлены константы:**
+   ```python
+   CTL_ASSIGN_DUAL = 0x05                  # matches ctlAssignDual in main.go
+   CTL_ASSIGN_DUAL_PAYLOAD_LEN = 42        # ip4(4)+pfx4(1)+gw4(4)+ip6(16)+pfx6(1)+gw6(16)
+   ```
+
+2. **`RouteInfo` получил опциональные IPv6-поля:**
+   ```python
+   assigned_ip6: Optional[str] = None   # e.g. "fc00::2"
+   prefix_len6: Optional[int] = None    # e.g. 120
+   gateway6: Optional[str] = None       # e.g. "fc00::1"
+   ```
+   Добавлено свойство `is_dual_stack: bool` (True когда assigned_ip6 не None).
+   Старый API неизменен: default None = backward-compatible с IPv4-only кодом.
+
+3. **`_do_control_stream()` рефакторинг:**
+
+   До (читает фиксированные 10 байт):
+   ```python
+   resp = ctl.read_exactly(1 + CTL_ASSIGN_PAYLOAD_LEN)
+   if resp[0] != CTL_ASSIGN: raise IOError(...)
+   ```
+
+   После (читает тип-байт первым, затем адаптивный payload):
+   ```python
+   type_byte = ctl.read_exactly(1)[0]
+   if type_byte == CTL_ERROR: raise IOError(...)
+   if type_byte == CTL_ASSIGN:
+       payload = ctl.read_exactly(CTL_ASSIGN_PAYLOAD_LEN)   # 9 bytes
+       ... # parse IPv4
+   if type_byte == CTL_ASSIGN_DUAL:
+       payload = ctl.read_exactly(CTL_ASSIGN_DUAL_PAYLOAD_LEN)   # 42 bytes
+       ... # parse IPv4 + IPv6
+   raise IOError(f"unexpected 0x{type_byte:02x}")
+   ```
+
+   Wire format CTL_ASSIGN_DUAL payload (42 байта):
+   ```
+   payload[0:4]  — IPv4 (big-endian)
+   payload[4]    — IPv4 prefix length
+   payload[5:9]  — IPv4 gateway
+   payload[9:25] — IPv6 address (16 bytes)
+   payload[25]   — IPv6 prefix length
+   payload[26:42]— IPv6 gateway (16 bytes)
+   ```
+
+4. **`connect()` — сохранение IPv6-полей** при rebuild RouteInfo с session.remote_static:
+   ```python
+   route = RouteInfo(
+       ...
+       assigned_ip6=route.assigned_ip6,
+       prefix_len6=route.prefix_len6,
+       gateway6=route.gateway6,
+   )
+   ```
+
+**Тесты (класс `TestDualStackControl`, 12 новых тестов):**
+
+| Тест | Проверяет |
+|---|---|
+| `test_ctl_assign_dual_value` | CTL_ASSIGN_DUAL == 0x05 |
+| `test_ctl_assign_dual_payload_len` | CTL_ASSIGN_DUAL_PAYLOAD_LEN == 42 |
+| `test_ctl_constants_distinct_including_dual` | все 5 констант уникальны |
+| `test_route_info_ipv4_only_is_not_dual_stack` | IPv4-only: is_dual_stack=False, все ip6-поля None |
+| `test_route_info_dual_stack_fields` | IPv6-поля корректно сохраняются в RouteInfo |
+| `test_route_info_ipv4_fields_unchanged_in_dual_stack` | IPv4-поля + cidr не меняются при dual-stack |
+| `test_do_control_stream_ipv4_only` | CTL_ASSIGN → RouteInfo без IPv6 |
+| `test_do_control_stream_dual_stack` | CTL_ASSIGN_DUAL → RouteInfo с IPv4+IPv6 |
+| `test_do_control_stream_dual_payload_length` | Payload = ровно 42 байта |
+| `test_do_control_stream_ctl_error_raises` | CTL_ERROR → IOError |
+| `test_do_control_stream_unknown_type_raises` | 0xAB → IOError |
+| `test_do_control_stream_dual_stack_various_prefixes` | pfx6 ∈ {64,96,112,120,126} — все корректны |
+
+Все 5 логических тестов (`test_do_control_stream_*`) верифицированы вручную через изолированный Python-скрипт (без зависимости от cryptography).
+
+**Эффект:** Python-клиент теперь корректно подключается к dual-stack серверу (`-tun6-cidr`). При IPv4-only сервере поведение идентично старому — нулевых изменений в hot-path.
+
+**Go тесты:** `go test ./... -count=1` — все 8 пакетов зелёные (Python-изменения не затрагивают Go-код).
