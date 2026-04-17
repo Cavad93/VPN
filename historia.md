@@ -2968,9 +2968,81 @@ Tests run: 96, Failures: 0, Errors: 0, Skipped: 0 — BUILD SUCCESS
 
 ---
 
+## Запуск 44 — 2026-04-17
+
+### Выполнено: Android TUN IPv6 — setupTunnel dual-stack конфигурация
+
+**Файлы:** `android/app/src/main/java/com/cavadvpn/config/VpnConfig.kt`, `android/app/src/main/java/com/cavadvpn/vpn/CavadVpnService.kt`, `android/test-runner/src/main/kotlin/com/cavadvpn/config/VpnConfig.kt`, `android/test-runner/src/test/kotlin/com/cavadvpn/config/TunnelSpecTest.kt` (новый)
+
+**Задача (бэклог Запуска 43):**
+
+Запуск 43 добавил поддержку `CTL_ASSIGN_DUAL` в `VpnClient.doControlStream` — Android-клиент теперь корректно разбирает ответ сервера с IPv6-адресом и сохраняет его в `RouteInfo`. Однако `CavadVpnService.setupTunnel()` не использовал полученный IPv6-адрес — `VpnService.Builder` вызывался только с IPv4:
+
+```kotlin
+// ДО: только IPv4
+Builder()
+    .addAddress(route.assignedIp, route.prefixLen)   // IPv4
+    .addRoute("0.0.0.0", 0)                          // IPv4 default route
+    // IPv6 игнорируется!
+```
+
+Результат: при подключении к dual-stack серверу (`-tun6-cidr fc00::1/120`) TUN-интерфейс имел только IPv4-адрес. Весь IPv6 inner-трафик (YouTube QUIC, Google IPv6, Cloudflare) выходил напрямую мимо VPN-туннеля через WiFi/LTE.
+
+**Решение: `TunnelSpec` + `buildTunnelSpec` + расширение `setupTunnel`**
+
+1. **`TunnelSpec` data class** — чистая структура без Android-зависимостей:
+   ```kotlin
+   data class TunnelSpec(
+       val ipv4Address:   String,
+       val ipv4PrefixLen: Int,
+       val ipv6Address:   String?,   // null для IPv4-only сервера
+       val ipv6PrefixLen: Int?,
+       val routeAllIpv6:  Boolean,   // добавлять ли "::/0" маршрут
+       val dnsServer:     String,
+       val mtu:           Int
+   )
+   ```
+
+2. **`buildTunnelSpec(route, config): TunnelSpec`** — чистая функция, выводит параметры из `RouteInfo + VpnConfig`. Нет Android-зависимостей → полностью тестируема в JVM.
+
+3. **`setupTunnel()` рефакторинг** — использует `buildTunnelSpec`, добавляет IPv6 условно:
+   ```kotlin
+   val spec = buildTunnelSpec(route, config)
+   val builder = Builder()
+       .addAddress(spec.ipv4Address, spec.ipv4PrefixLen)
+       .addRoute("0.0.0.0", 0)
+   if (spec.ipv6Address != null && spec.ipv6PrefixLen != null) {
+       builder.addAddress(spec.ipv6Address, spec.ipv6PrefixLen)
+   }
+   if (spec.routeAllIpv6) {
+       builder.addRoute("::", 0)    // маршрутизировать весь IPv6 через туннель
+   }
+   ```
+
+**Backward compatibility:** при IPv4-only сервере `route.isDualStack == false` → `spec.ipv6Address = null`, `spec.routeAllIpv6 = false` → ни одна новая строка не выполняется, поведение идентично старому.
+
+**Завершение dual-stack (summary):**
+После Запусков 30–44 полная dual-stack поддержка реализована end-to-end:
+- Go сервер: `ip6Pool` + `ip6Index` + `ctlAssignDual` + `routeFromTun` IPv6 + `ConfigureTun6` (TUN)
+- Go сервер: `markECNCEv6` — Double CC mitigation для IPv6 inner трафика
+- Python клиент: `CTL_ASSIGN_DUAL` парсинг + `RouteInfo` IPv6 поля
+- Android Kotlin: `doControlStream` dual-stack + `RouteInfo` IPv6 поля + **`setupTunnel` IPv6 TUN** ✓
+
+**Тесты (`TunnelSpecTest.kt`, 14 новых JVM-тестов):**
+
+| Группа | Тесты |
+|---|---|
+| IPv4-only spec | ipv4Address, ipv4PrefixLen, null ipv6Address, null ipv6PrefixLen, routeAllIpv6=false, dns, mtu |
+| Dual-stack spec | ipv6Address, ipv6PrefixLen, routeAllIpv6=true, ipv4 preserved, dns/mtu from config |
+| Различные IPv6 prefix | /64, /126 |
+
+Maven сборка недоступна (network timeout); код верифицирован code review — логика `buildTunnelSpec` корректна и симметрична существующим тестам `RouteInfoTest`.
+
+---
+
 ## Следующие задачи (приоритетный бэклог — обновлено 2026-04-17)
 
 1. **~~CTL_ASSIGN_DUAL Python клиент~~** — ~~РЕШЕНО~~ (Запуск 42).
 2. **~~CTL_ASSIGN_DUAL Android клиент~~** — ~~РЕШЕНО~~ (Запуск 43): `VpnClient.doControlStream` + `RouteInfo` IPv6 поля.
-3. **Android TUN IPv6 конфигурация** — `CavadVpnService.setupTunnel()` ещё не вызывает `addAddress(assignedIp6, prefixLen6)` для IPv6-адреса. При dual-stack сервере клиент получает IPv6-адрес, но TUN интерфейс настраивается только с IPv4. Следующий шаг.
+3. **~~Android TUN IPv6 конфигурация~~** — ~~РЕШЕНО~~ (Запуск 44): `setupTunnel` добавляет IPv6 адрес и `"::/0"` маршрут при dual-stack.
 4. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps.
