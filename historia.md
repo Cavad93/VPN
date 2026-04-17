@@ -3122,11 +3122,61 @@ if totalSize <= wsLargeWriteBufSize {
 
 ---
 
+## Запуск 46 — 2026-04-17
+
+### Выполнено: vlessUDPRelay double-write → single-write + pooled buffer
+
+**Файлы:** `server/vless_handler.go`, `server/main_test.go`
+
+**Проблема:**
+
+В `vlessUDPRelay` response loop каждый UDP-ответ отправлялся двумя отдельными `writer.Write` вызовами:
+```go
+// ДО:
+respBuf := make([]byte, 65536)            // heap-аллокация на каждый вызов функции
+n, _ := udpConn.Read(respBuf)
+hdr := [2]byte{byte(n >> 8), byte(n)}
+writer.Write(hdr[:])      // Write call 1 → TLS record 1
+writer.Write(respBuf[:n]) // Write call 2 → TLS record 2
+```
+
+Каждый UDP ответ (DNS ответ, QUIC пакет и т.д.) создавал 2 TLS-записи вместо 1:
+- Удвоение TLS-шифрований на download path
+- Удвоение `write()` syscall в ядро
+- Каждая TLS запись: +5 header + 16 AEAD tag = +21 байт framing overhead
+
+**Решение:**
+
+1. **`vlessUDPRespPool`** — `sync.Pool` для 65538-байтных буферов (2 header + 65536 max UDP payload).
+
+2. **Рефакторинг response loop** — читаем напрямую в `resp[2:]`, заполняем resp[0:2], единственный `Write(resp[:n+2])`:
+```go
+// ПОСЛЕ:
+pb := vlessUDPRespPool.Get().(*[]byte)
+defer vlessUDPRespPool.Put(pb)
+resp := *pb
+for {
+    n, _ := udpConn.Read(resp[2:])
+    resp[0] = byte(n >> 8)
+    resp[1] = byte(n)
+    writer.Write(resp[:n+2])   // 1 TLS запись вместо 2
+}
+```
+
+Устранено: `make([]byte, 65536)`, `writer.Write(hdr[:])`, extra TLS record per DNS response.
+
+**Тест `TestVlessUDPRelayFraming`** — проверяет что после VLESSWriteResponse (2 байта), следующий Write = `2 + pktLen` байт единым вызовом. Использует `writeSizeRecorder` + loopback UDP echo + wake-up packet для завершения relay goroutine.
+
+`TestVlessUDPRelayFraming` — PASS.
+`go test ./... -count=1` — 7/8 пакетов зелёные; `TestRouteFromTunIPv6` pre-existing flakiness (PASS in isolation).
+
+---
+
 ## Следующие задачи (приоритетный бэклог — обновлено 2026-04-17)
 
 1. **~~CTL_ASSIGN_DUAL Python клиент~~** — ~~РЕШЕНО~~ (Запуск 42).
 2. **~~CTL_ASSIGN_DUAL Android клиент~~** — ~~РЕШЕНО~~ (Запуск 43): `VpnClient.doControlStream` + `RouteInfo` IPv6 поля.
 3. **~~Android TUN IPv6 конфигурация~~** — ~~РЕШЕНО~~ (Запуск 44): `setupTunnel` добавляет IPv6 адрес и `"::/0"` маршрут при dual-stack.
-4. **wsLargeWritePool** — ~~РЕШЕНО~~ (Запуск 45): pool для VLESS proxy download write path.
-5. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps.
-6. **vlessUDPRelay double-write** — `hdr` и `respBuf[:n]` посылаются двумя Write вызовами → 2 TLS-записи на UDP ответ. Оптимизация: combine header+data в один Write (pre-allocated 65538-byte buf с 2-байт prefix).
+4. **~~wsLargeWritePool~~** — ~~РЕШЕНО~~ (Запуск 45): pool для VLESS proxy download write path.
+5. **~~vlessUDPRelay double-write~~** — ~~РЕШЕНО~~ (Запуск 46): single Write + pooled 65538-byte buffer.
+6. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps.

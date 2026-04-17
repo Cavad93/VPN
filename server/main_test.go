@@ -3258,3 +3258,133 @@ func TestBBRSeedCustomValues(t *testing.T) {
 		t.Errorf("20 ms → duration: got %v, want 20ms", gotRTT)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// vlessUDPRelay framing test
+// ---------------------------------------------------------------------------
+
+// writeSizeRecorder records the byte-count of every Write call so we can verify
+// that header and payload are sent as a single Write rather than two.
+type writeSizeRecorder struct {
+	mu    sync.Mutex
+	sizes []int
+	buf   bytes.Buffer
+}
+
+func (r *writeSizeRecorder) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sizes = append(r.sizes, len(p))
+	r.buf.Write(p)
+	return len(p), nil
+}
+
+// TestVlessUDPRelayFraming verifies that the optimised response path sends
+// the 2-byte length prefix and UDP payload as a single Write call (one TLS
+// record) instead of two separate calls.
+func TestVlessUDPRelayFraming(t *testing.T) {
+	t.Parallel()
+
+	// UDP echo server: echoes the first datagram and records the sender address
+	// so we can send a wake-up packet later to unblock udpConn.Read in the relay.
+	echoConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	defer echoConn.Close()
+	destAddr := echoConn.LocalAddr().String()
+
+	const payload = "hello vpn"
+	var senderAddr net.Addr
+	echoDone := make(chan struct{})
+	go func() {
+		defer close(echoDone)
+		buf := make([]byte, 256)
+		echoConn.SetDeadline(time.Now().Add(2 * time.Second))
+		n, addr, err2 := echoConn.ReadFrom(buf)
+		if err2 != nil {
+			return
+		}
+		senderAddr = addr
+		echoConn.WriteTo(buf[:n], addr) //nolint:errcheck
+	}()
+
+	// Build VLESS Payload: one length-prefixed UDP datagram.
+	pktLen := len(payload)
+	vlessPayload := make([]byte, 2+pktLen)
+	vlessPayload[0] = byte(pktLen >> 8)
+	vlessPayload[1] = byte(pktLen)
+	copy(vlessPayload[2:], payload)
+	req := &transport.VLESSRequest{Payload: vlessPayload}
+
+	rec := &writeSizeRecorder{}
+	srv := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		// strings.NewReader("") returns EOF immediately — no extra client→UDP data.
+		srv.vlessUDPRelay(ctx, strings.NewReader(""), rec, req, destAddr, "test")
+	}()
+
+	// Wait for the echo server to reply.
+	select {
+	case <-echoDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("UDP echo server did not receive a packet")
+	}
+
+	// Cancel the context, then send a small wake-up packet to unblock
+	// udpConn.Read so the relay can check ctx.Done() on the next iteration.
+	cancel()
+	if senderAddr != nil {
+		echoConn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+		echoConn.WriteTo([]byte("stop"), senderAddr) //nolint:errcheck
+	}
+
+	select {
+	case <-relayDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("vlessUDPRelay goroutine did not exit")
+	}
+
+	rec.mu.Lock()
+	sizes := rec.sizes
+	data := rec.buf.Bytes()
+	rec.mu.Unlock()
+
+	if len(sizes) < 2 {
+		t.Fatalf("expected at least 2 Write calls, got %d (sizes=%v)", len(sizes), sizes)
+	}
+
+	// Write 0: VLESSWriteResponse — always 2 bytes {0x00, 0x00}.
+	if sizes[0] != 2 {
+		t.Errorf("VLESSWriteResponse Write: want 2 bytes, got %d", sizes[0])
+	}
+
+	// Write 1: combined 2-byte length prefix + UDP payload — must be a single call.
+	// (Old double-write: sizes[1]==2, sizes[2]==pktLen.
+	//  New single-write: sizes[1]==2+pktLen.)
+	wantSize := 2 + pktLen
+	if sizes[1] != wantSize {
+		t.Errorf("framed UDP response: want single Write of %d bytes (2+%d), got %d — "+
+			"double-write regression: header and payload sent separately",
+			wantSize, pktLen, sizes[1])
+	}
+
+	// Verify framing content: length prefix must equal pktLen.
+	frame := data[2:] // skip VLESSWriteResponse
+	if len(frame) < 2+pktLen {
+		t.Fatalf("response data too short: %d bytes", len(frame))
+	}
+	gotLen := int(frame[0])<<8 | int(frame[1])
+	if gotLen != pktLen {
+		t.Errorf("length prefix: want %d, got %d", pktLen, gotLen)
+	}
+	if string(frame[2:2+pktLen]) != payload {
+		t.Errorf("payload mismatch: want %q, got %q", payload, frame[2:2+pktLen])
+	}
+}

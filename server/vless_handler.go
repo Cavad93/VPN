@@ -18,11 +18,22 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cavad93/vpn/server/transport"
 )
+
+// vlessUDPRespPool pools 65538-byte buffers used in vlessUDPRelay to combine
+// the 2-byte length prefix with the UDP payload into a single Write call,
+// avoiding the 2-TLS-record overhead of separate header and data writes.
+var vlessUDPRespPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 2+65536) // 2-byte BE length + max UDP payload
+		return &b
+	},
+}
 
 // VLESSConfig holds VLESS+WS+TLS listener configuration.
 type VLESSConfig struct {
@@ -419,24 +430,25 @@ func (s *Server) vlessUDPRelay(ctx context.Context, reader io.Reader, writer io.
 		}
 	}()
 
-	// UDP destination → client
-	respBuf := make([]byte, 65536)
+	// UDP destination → client.
+	// Use a pooled buffer to combine the 2-byte BE length prefix with the UDP
+	// payload into a single Write call, producing one TLS record instead of two.
+	pb := vlessUDPRespPool.Get().(*[]byte)
+	defer vlessUDPRespPool.Put(pb)
+	resp := *pb
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		n, err := udpConn.Read(respBuf)
+		n, err := udpConn.Read(resp[2:])
 		if err != nil {
 			return
 		}
-		// 2-byte BE length prefix + packet
-		hdr := [2]byte{byte(n >> 8), byte(n)}
-		if _, err := writer.Write(hdr[:]); err != nil {
-			return
-		}
-		if _, err := writer.Write(respBuf[:n]); err != nil {
+		resp[0] = byte(n >> 8)
+		resp[1] = byte(n)
+		if _, err := writer.Write(resp[:n+2]); err != nil {
 			return
 		}
 	}
