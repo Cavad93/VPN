@@ -11,6 +11,7 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.cavadvpn.config.RouteInfo
 import com.cavadvpn.config.VpnConfig
+import com.cavadvpn.config.buildTunnelSpec
 import com.cavadvpn.ui.MainActivity
 import kotlinx.coroutines.*
 import java.io.FileInputStream
@@ -252,14 +253,28 @@ class CavadVpnService : VpnService() {
     /**
      * Builds the VPN interface using [VpnService.Builder] and returns the
      * [ParcelFileDescriptor] for reading/writing raw IP packets.
+     *
+     * When the server returns a dual-stack assignment (CTL_ASSIGN_DUAL), the
+     * builder also adds the IPv6 address and a default IPv6 route ("::/0"),
+     * enabling full IPv6 traffic tunnelling.
      */
     fun setupTunnel(route: RouteInfo, config: VpnConfig): ParcelFileDescriptor {
+        val spec = buildTunnelSpec(route, config)
+
         val builder = Builder()
             .setSession("CavadVPN")
-            .addAddress(route.assignedIp, route.prefixLen)
+            .addAddress(spec.ipv4Address, spec.ipv4PrefixLen)
             .addRoute("0.0.0.0", 0)           // route all IPv4 traffic
-            .addDnsServer(config.dnsServer)
-            .setMtu(config.mtu)
+
+        if (spec.ipv6Address != null && spec.ipv6PrefixLen != null) {
+            builder.addAddress(spec.ipv6Address, spec.ipv6PrefixLen)
+        }
+        if (spec.routeAllIpv6) {
+            builder.addRoute("::", 0)          // route all IPv6 traffic
+        }
+
+        builder.addDnsServer(spec.dnsServer)
+            .setMtu(spec.mtu)
             .setBlocking(true)
 
         return builder.establish()

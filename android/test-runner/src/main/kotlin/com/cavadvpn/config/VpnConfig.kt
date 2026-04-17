@@ -73,3 +73,32 @@ data class RouteInfo(
         return "%d.%d.%d.%d".format(net shr 24 and 0xFF, net shr 16 and 0xFF, net shr 8 and 0xFF, net and 0xFF)
     }
 }
+
+/**
+ * Parameters for configuring the Android TUN (VpnService.Builder), extracted
+ * as a pure data class so the configuration logic can be unit-tested without
+ * an Android runtime.
+ */
+data class TunnelSpec(
+    val ipv4Address:   String,
+    val ipv4PrefixLen: Int,
+    val ipv6Address:   String?,
+    val ipv6PrefixLen: Int?,
+    val routeAllIpv6:  Boolean,
+    val dnsServer:     String,
+    val mtu:           Int
+)
+
+/**
+ * Derives a [TunnelSpec] from [RouteInfo] + [VpnConfig]. Pure function; no Android
+ * dependencies. This separation allows the configuration logic to be unit-tested.
+ */
+fun buildTunnelSpec(route: RouteInfo, config: VpnConfig): TunnelSpec = TunnelSpec(
+    ipv4Address   = route.assignedIp,
+    ipv4PrefixLen = route.prefixLen,
+    ipv6Address   = if (route.isDualStack) route.assignedIp6 else null,
+    ipv6PrefixLen = if (route.isDualStack) route.prefixLen6  else null,
+    routeAllIpv6  = route.isDualStack,
+    dnsServer     = config.dnsServer,
+    mtu           = config.mtu
+)
