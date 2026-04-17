@@ -3172,11 +3172,66 @@ for {
 
 ---
 
+## Запуск 47 — 2026-04-17
+
+### Выполнено: vlessUDPReadPool + dialRetry (flakiness fix)
+
+**Файлы:** `server/vless_handler.go`, `server/main_test.go`
+
+#### Часть A: vlessUDPReadPool — устранение make([]byte, pktLen) в upload direction
+
+Run 46 оптимизировал download direction. Upload direction (client→UDP) оставался с per-packet аллокацией:
+
+**ДО:**
+```go
+lenBuf := make([]byte, 2)    // 1 аллокация при старте горутины
+pkt := make([]byte, pktLen)  // 1 аллокация PER PACKET ← проблема
+io.ReadFull(reader, pkt)
+udpConn.Write(pkt)
+```
+
+**ПОСЛЕ:**
+```go
+pb := vlessUDPReadPool.Get().(*[]byte)
+defer vlessUDPReadPool.Put(pb)
+buf := *pb
+// len header → buf[:2]; payload → buf[:pktLen] (overwrite header, уже извлечён)
+udpConn.Write(buf[:pktLen])  // UDP syscall копирует до возврата → безопасно
+```
+
+`vlessUDPReadPool` — `sync.Pool` 65535-байтных буферов (max VLESS UDP payload).
+
+Эффект: устранены `make([]byte, 2)` + `make([]byte, pktLen)` per-packet → 0 аллокаций в steady-state upload direction.
+
+**Новый тест `TestVlessUDPRelayUploadPooled`:**
+- UDP echo server получает → echoes back для wakeup relay
+- `bytes.Reader` с VLESS-framed datagram → reader в relay
+- Проверяет echo server получил корректный payload
+- cancel() + wakeup пакет → relay выходит
+
+#### Часть B: dialRetry — устранение pre-existing flakiness TestRouteFromTun*
+
+`TestServerRun`, `TestRouteFromTun`, `TestRouteFromTunIPv6` использовали паттерн:
+```
+ln.Close() → time.Sleep(1ms) → DialTimeout(3s)
+```
+Есть race window между `ln.Close()` и `srv.Run` повторно занимая порт. `1ms` sleep часто недостаточно.
+
+**Исправление:** helper `dialRetry(t, addr, timeout)` — ретраи с 5ms паузами до `timeout` (до 600 попыток за 3 секунды).
+
+Убраны `t.Helper()` из тест-функций (некорректное использование).
+
+`go test . -run 'TestServerRun|TestRouteFromTun' -count=3` — 9/9 PASS.
+`go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог — обновлено 2026-04-17)
 
 1. **~~CTL_ASSIGN_DUAL Python клиент~~** — ~~РЕШЕНО~~ (Запуск 42).
-2. **~~CTL_ASSIGN_DUAL Android клиент~~** — ~~РЕШЕНО~~ (Запуск 43): `VpnClient.doControlStream` + `RouteInfo` IPv6 поля.
-3. **~~Android TUN IPv6 конфигурация~~** — ~~РЕШЕНО~~ (Запуск 44): `setupTunnel` добавляет IPv6 адрес и `"::/0"` маршрут при dual-stack.
-4. **~~wsLargeWritePool~~** — ~~РЕШЕНО~~ (Запуск 45): pool для VLESS proxy download write path.
-5. **~~vlessUDPRelay double-write~~** — ~~РЕШЕНО~~ (Запуск 46): single Write + pooled 65538-byte buffer.
-6. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps.
+2. **~~CTL_ASSIGN_DUAL Android клиент~~** — ~~РЕШЕНО~~ (Запуск 43).
+3. **~~Android TUN IPv6 конфигурация~~** — ~~РЕШЕНО~~ (Запуск 44).
+4. **~~wsLargeWritePool~~** — ~~РЕШЕНО~~ (Запуск 45).
+5. **~~vlessUDPRelay double-write~~** — ~~РЕШЕНО~~ (Запуск 46).
+6. **~~vlessUDPRelay upload pool + dialRetry~~** — ~~РЕШЕНО~~ (Запуск 47).
+7. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps.

@@ -35,6 +35,18 @@ var vlessUDPRespPool = sync.Pool{
 	},
 }
 
+// vlessUDPReadPool pools 65535-byte buffers for the upload direction of
+// vlessUDPRelay.  Each incoming UDP datagram (up to 65535 bytes per the
+// 2-byte BE length prefix) is read into this buffer and forwarded to the
+// UDP socket; the UDP Write syscall copies before returning so the buffer
+// is safe to reuse immediately.  Eliminates make([]byte, pktLen) per packet.
+var vlessUDPReadPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 65535) // max VLESS UDP payload (2-byte length → 0xFFFF)
+		return &b
+	},
+}
+
 // VLESSConfig holds VLESS+WS+TLS listener configuration.
 type VLESSConfig struct {
 	// ListenAddr is the TLS listen address (e.g. "0.0.0.0:443").
@@ -409,22 +421,26 @@ func (s *Server) vlessUDPRelay(ctx context.Context, reader io.Reader, writer io.
 		forwardUDPFromStream(req.Payload, udpConn)
 	}
 
-	// Client → UDP destination
+	// Client → UDP destination.
+	// Use a pooled buffer to avoid make([]byte, pktLen) per incoming datagram.
+	// The 2-byte length header is read into buf[:2]; the payload into buf[:pktLen].
+	// net.UDPConn.Write copies to kernel before returning — buffer reuse is safe.
 	go func() {
-		lenBuf := make([]byte, 2)
+		pb := vlessUDPReadPool.Get().(*[]byte)
+		defer vlessUDPReadPool.Put(pb)
+		buf := *pb
 		for {
-			if _, err := io.ReadFull(reader, lenBuf); err != nil {
+			if _, err := io.ReadFull(reader, buf[:2]); err != nil {
 				return
 			}
-			pktLen := int(lenBuf[0])<<8 | int(lenBuf[1])
+			pktLen := int(buf[0])<<8 | int(buf[1])
 			if pktLen <= 0 || pktLen > 65535 {
 				return
 			}
-			pkt := make([]byte, pktLen)
-			if _, err := io.ReadFull(reader, pkt); err != nil {
+			if _, err := io.ReadFull(reader, buf[:pktLen]); err != nil {
 				return
 			}
-			udpConn.Write(pkt) //nolint:errcheck
+			udpConn.Write(buf[:pktLen]) //nolint:errcheck
 			// Refresh deadline on activity
 			udpConn.SetDeadline(time.Now().Add(120 * time.Second))
 		}

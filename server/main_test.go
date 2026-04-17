@@ -1097,14 +1097,11 @@ func TestServerRun(t *testing.T) {
 		runErrCh <- srv.Run(ctx)
 	}()
 
-	// Wait briefly for server to start
-	time.Sleep(time.Millisecond)
-
-	// Connect a client
-	rawConn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-	if err != nil {
+	// Use retry dial instead of a fixed sleep to avoid race with srv.Run startup.
+	rawConn := dialRetry(t, addr, 3*time.Second)
+	if rawConn == nil {
 		cancel()
-		t.Fatalf("dial: %v", err)
+		return
 	}
 	defer rawConn.Close()
 
@@ -1144,13 +1141,35 @@ func TestServerRun(t *testing.T) {
 	}
 }
 
+// dialRetry dials addr retrying every 5 ms until success or timeout.
+// Needed because tests pre-bind a port, close it, then pass it to srv.Run —
+// there is a brief window where the port is unbound and a dial would get
+// "connection refused".  Retrying eliminates the flakiness without adding
+// long fixed sleeps.
+func dialRetry(t *testing.T, addr string, timeout time.Duration) net.Conn {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var (
+		conn net.Conn
+		err  error
+	)
+	for time.Now().Before(deadline) {
+		conn, err = net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err == nil {
+			return conn
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("dial %s: %v", addr, err)
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // TestRouteFromTun (exercises routeFromTun via full Run integration)
 // ---------------------------------------------------------------------------
 
 func TestRouteFromTun(t *testing.T) {
 	t.Parallel()
-	t.Helper()
 
 	tun := newMockTun()
 	defer tun.Close()
@@ -1178,12 +1197,11 @@ func TestRouteFromTun(t *testing.T) {
 	defer cancel()
 
 	go srv.Run(ctx) //nolint:errcheck
-	time.Sleep(time.Millisecond)
 
-	// Connect client
-	rawConn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
+	// Use retry dial: srv.Run may not have started listening yet (race window).
+	rawConn := dialRetry(t, addr, 3*time.Second)
+	if rawConn == nil {
+		return
 	}
 	defer rawConn.Close()
 
@@ -1248,7 +1266,6 @@ func TestRouteFromTun(t *testing.T) {
 
 func TestRouteFromTunIPv6(t *testing.T) {
 	t.Parallel()
-	t.Helper()
 
 	tun := newMockTun()
 	defer tun.Close()
@@ -1276,11 +1293,11 @@ func TestRouteFromTunIPv6(t *testing.T) {
 	defer cancel()
 
 	go srv.Run(ctx) //nolint:errcheck
-	time.Sleep(time.Millisecond)
 
-	rawConn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
+	// Use retry dial: srv.Run may not have started listening yet (race window).
+	rawConn := dialRetry(t, addr, 3*time.Second)
+	if rawConn == nil {
+		return
 	}
 	defer rawConn.Close()
 
@@ -3386,5 +3403,96 @@ func TestVlessUDPRelayFraming(t *testing.T) {
 	}
 	if string(frame[2:2+pktLen]) != payload {
 		t.Errorf("payload mismatch: want %q, got %q", payload, frame[2:2+pktLen])
+	}
+}
+
+// TestVlessUDPRelayUploadPooled verifies that the upload goroutine inside
+// vlessUDPRelay correctly reads length-prefixed VLESS UDP datagrams from the
+// reader and forwards the raw UDP payload to the destination — using the
+// pooled buffer (vlessUDPReadPool) instead of make([]byte, pktLen).
+func TestVlessUDPRelayUploadPooled(t *testing.T) {
+	t.Parallel()
+
+	// UDP echo server: receives the forwarded datagram, records it, and echoes
+	// back so the relay's udpConn.Read can wake up and check ctx.Done().
+	echoConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	defer echoConn.Close()
+	destAddr := echoConn.LocalAddr().String()
+
+	const payload = "upload-pool-test"
+	type echoResult struct {
+		data []byte
+		from net.Addr
+	}
+	echoDone := make(chan echoResult, 1)
+	go func() {
+		buf := make([]byte, 256)
+		echoConn.SetDeadline(time.Now().Add(3 * time.Second))
+		n, addr, err2 := echoConn.ReadFrom(buf)
+		if err2 != nil {
+			echoDone <- echoResult{}
+			return
+		}
+		cp := make([]byte, n)
+		copy(cp, buf[:n])
+		// Echo back so the relay's udpConn.Read unblocks.
+		echoConn.WriteTo(cp, addr) //nolint:errcheck
+		echoDone <- echoResult{data: cp, from: addr}
+	}()
+
+	// Build a VLESS-framed UDP datagram: 2-byte BE length + payload.
+	// This is what the upload goroutine reads from the client stream.
+	pktLen := len(payload)
+	vlessFrame := make([]byte, 2+pktLen)
+	vlessFrame[0] = byte(pktLen >> 8)
+	vlessFrame[1] = byte(pktLen)
+	copy(vlessFrame[2:], payload)
+
+	// The reader delivers one datagram then EOF → upload goroutine exits cleanly.
+	reader := bytes.NewReader(vlessFrame)
+
+	// writeSizeRecorder as writer (absorbs VLESSWriteResponse + response frames).
+	rec := &writeSizeRecorder{}
+	srv := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		// No req.Payload — upload comes entirely from reader.
+		srv.vlessUDPRelay(ctx, reader, rec, &transport.VLESSRequest{}, destAddr, "test")
+	}()
+
+	// Wait for the UDP echo server to receive and echo the datagram.
+	var result echoResult
+	select {
+	case result = <-echoDone:
+		if result.data == nil {
+			t.Fatal("UDP echo server did not receive a packet within timeout")
+		}
+		if string(result.data) != payload {
+			t.Errorf("upload payload mismatch: want %q, got %q", payload, string(result.data))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for UDP echo server to receive upload packet")
+	}
+
+	// Cancel context and send a wakeup packet so udpConn.Read in the relay
+	// unblocks and the next loop iteration checks ctx.Done().
+	cancel()
+	if result.from != nil {
+		echoConn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+		echoConn.WriteTo([]byte("stop"), result.from) //nolint:errcheck
+	}
+
+	select {
+	case <-relayDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("vlessUDPRelay did not exit after context cancel + wakeup packet")
 	}
 }
