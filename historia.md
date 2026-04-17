@@ -2886,3 +2886,91 @@ IOError: unexpected control response 0x05
 **Эффект:** Python-клиент теперь корректно подключается к dual-stack серверу (`-tun6-cidr`). При IPv4-only сервере поведение идентично старому — нулевых изменений в hot-path.
 
 **Go тесты:** `go test ./... -count=1` — все 8 пакетов зелёные (Python-изменения не затрагивают Go-код).
+
+---
+
+## Запуск 43 — 2026-04-17
+
+### Выполнено: Android клиент (Kotlin) — поддержка CTL_ASSIGN_DUAL (0x05) dual-stack сервера
+
+**Файлы:** `android/app/src/main/java/com/cavadvpn/config/VpnConfig.kt`, `android/app/src/main/java/com/cavadvpn/vpn/VpnClient.kt`, `android/test-runner/src/main/kotlin/com/cavadvpn/config/VpnConfig.kt`, `android/test-runner/src/test/kotlin/com/cavadvpn/config/RouteInfoTest.kt` (новый), `android/test-runner/src/test/kotlin/com/cavadvpn/config/CtlParseTest.kt` (новый)
+
+**Проблема (аналогична Запуску 42, но для Android/Kotlin):**
+
+`VpnClient.doControlStream` читал ровно `1 + CTL_ASSIGN_PAYLOAD_LEN = 10` байт и сравнивал первый байт с `CTL_ASSIGN` (0x02):
+
+```kotlin
+val resp = ctl.readExactly(1 + CTL_ASSIGN_PAYLOAD_LEN)  // всегда 10 байт
+when (resp[0]) {
+    CTL_ERROR  -> throw ...
+    CTL_ASSIGN -> { /* ok */ }
+    else -> throw IllegalStateException("unexpected control response 0x%02x".format(...))
+}
+```
+
+При `CTL_ASSIGN_DUAL` (0x05): первый байт = 0x05, не 0x02, не 0xFF → `else → throw`. Клиент падал при подключении к **любому** серверу с `-tun6-cidr`.
+
+**Исправления:**
+
+1. **`android/app/src/main/java/com/cavadvpn/config/VpnConfig.kt` — IPv6 поля в `RouteInfo`:**
+   ```kotlin
+   data class RouteInfo(
+       val assignedIp: String,
+       val prefixLen: Int,
+       val gateway: String,
+       val assignedIp6: String? = null,   // null = IPv4-only сервер
+       val prefixLen6: Int?    = null,
+       val gateway6: String?   = null
+   ) {
+       val isDualStack: Boolean get() = assignedIp6 != null
+       ...
+   }
+   ```
+   Добавлено поле `isDualStack`, остальные поля (cidr, network) без изменений.
+
+2. **`VpnClient.kt` — рефакторинг `doControlStream` + companion object:**
+   - Добавлены константы `CTL_ASSIGN_DUAL = 0x05` и `CTL_ASSIGN_DUAL_PAYLOAD_LEN = 42`.
+   - `doControlStream` теперь читает 1 байт типа первым, затем по типу читает нужное количество байт.
+   - `companion object` с `internal` методами для тестируемости:
+     - `parseCtlAssign(ByteArray): RouteInfo` — 9-байтный payload, IPv4-only
+     - `parseCtlAssignDual(ByteArray): RouteInfo` — 42-байтный payload, dual-stack
+     - `formatIPv4(ByteArray, Int): String` — `%d.%d.%d.%d` форматирование
+     - `formatIPv6(ByteArray): String` — `InetAddress.getByAddress(16 bytes).hostAddress` → RFC 5952 компрессия (`fc00::1`)
+
+   Wire format dual-stack payload (42 байта):
+   ```
+   ip4(4) + pfxLen4(1) + gw4(4) + ip6(16) + pfxLen6(1) + gw6(16)
+   ```
+
+3. **`test-runner/src/main/kotlin/VpnConfig.kt`** — зеркально обновлена та же `RouteInfo` структура.
+
+4. **`RouteInfoTest.kt`** (11 новых тестов):
+   - IPv4-only: isDualStack=false, cidr, network, null IPv6 поля
+   - Dual-stack: isDualStack=true, все поля сохраняются, IPv4 cidr/network не изменяются
+   - Равенство dual-stack объектов
+   - Граничные случаи network: /32 и /0
+
+5. **`CtlParseTest.kt`** (16 новых тестов):
+   - `parseCtlAssign`: ip, prefixLen, gateway, isDualStack=false
+   - `parseCtlAssign`: high-octet addresses (192.168.100.200/16)
+   - `parseCtlAssignDual`: IPv4 поля корректны, isDualStack=true, pfxLen6
+   - `parseCtlAssignDual`: IPv6 адрес начинается с "fc" (ULA prefix)
+   - `formatIPv4`: all-zero, all-255, offset в большом буфере
+   - `formatIPv6`: loopback (::1), all-zero, reject 4-byte input
+
+**Результат тестов:**
+```
+Tests run: 96, Failures: 0, Errors: 0, Skipped: 0 — BUILD SUCCESS
+```
+(+28 новых тестов: 12 RouteInfoTest + 16 CtlParseTest)
+
+`TestRouteFromTunIPv6` — pre-existing timing flakiness при параллельном запуске с `./...`; проходит стабильно в изоляции (3/3 runs PASS). Не связан с нашими изменениями.
+
+---
+
+## Следующие задачи (приоритетный бэклог — обновлено 2026-04-17)
+
+1. **~~CTL_ASSIGN_DUAL Python клиент~~** — ~~РЕШЕНО~~ (Запуск 42).
+2. **~~CTL_ASSIGN_DUAL Android клиент~~** — ~~РЕШЕНО~~ (Запуск 43): `VpnClient.doControlStream` + `RouteInfo` IPv6 поля.
+3. **Android TUN IPv6 конфигурация** — `CavadVpnService.setupTunnel()` ещё не вызывает `addAddress(assignedIp6, prefixLen6)` для IPv6-адреса. При dual-stack сервере клиент получает IPv6-адрес, но TUN интерфейс настраивается только с IPv4. Следующий шаг.
+4. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps.

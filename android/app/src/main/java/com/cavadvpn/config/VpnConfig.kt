@@ -61,14 +61,20 @@ data class VpnConfig(
 
 /** IP routing information assigned by the VPN server. */
 data class RouteInfo(
-    val assignedIp: String,   // e.g. "10.8.0.2"
-    val prefixLen: Int,       // e.g. 24
-    val gateway: String       // e.g. "10.8.0.1"
+    val assignedIp: String,        // e.g. "10.8.0.2"
+    val prefixLen: Int,            // e.g. 24
+    val gateway: String,           // e.g. "10.8.0.1"
+    val assignedIp6: String? = null,  // e.g. "fc00::2" — null for IPv4-only servers
+    val prefixLen6: Int?    = null,   // e.g. 120 — null for IPv4-only servers
+    val gateway6: String?   = null    // e.g. "fc00::1" — null for IPv4-only servers
 ) {
-    /** CIDR notation for the assigned address, e.g. "10.8.0.2/24". */
+    /** CIDR notation for the assigned IPv4 address, e.g. "10.8.0.2/24". */
     val cidr: String get() = "$assignedIp/$prefixLen"
 
-    /** Network address for the CIDR, e.g. "10.8.0.0". */
+    /** True if the server assigned both IPv4 and IPv6 addresses (CTL_ASSIGN_DUAL). */
+    val isDualStack: Boolean get() = assignedIp6 != null
+
+    /** Network address for the IPv4 CIDR, e.g. "10.8.0.0". */
     val network: String get() {
         val parts = assignedIp.split(".").map { it.toInt() }
         val mask = if (prefixLen == 0) 0 else (-1 shl (32 - prefixLen))

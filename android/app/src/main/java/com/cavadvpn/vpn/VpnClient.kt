@@ -9,15 +9,20 @@ import com.cavadvpn.transport.ClientMux
 import com.cavadvpn.transport.MuxStream
 import com.cavadvpn.transport.NoiseConn
 import com.cavadvpn.transport.ObfsConn
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 
-// Control stream message types (must match Go server)
-private const val CTL_HELLO  : Byte = 0x01
-private const val CTL_ASSIGN : Byte = 0x02
-private const val CTL_ERROR  : Byte = 0xFF.toByte()
-private const val CTL_ASSIGN_PAYLOAD_LEN = 9  // ip(4) + prefixLen(1) + gateway(4)
+// Control stream message types (must match Go server main.go)
+private const val CTL_HELLO             : Byte = 0x01
+private const val CTL_ASSIGN            : Byte = 0x02  // IPv4-only assignment (10 bytes total)
+private const val CTL_ASSIGN_DUAL       : Byte = 0x05  // IPv4+IPv6 dual-stack (43 bytes total)
+private const val CTL_ERROR             : Byte = 0xFF.toByte()
+private const val CTL_ASSIGN_PAYLOAD_LEN      = 9   // ip4(4) + pfxLen4(1) + gw4(4)
+// Wire format CTL_ASSIGN_DUAL payload after type byte:
+//   ip4(4) + pfxLen4(1) + gw4(4) + ip6(16) + pfxLen6(1) + gw6(16) = 42 bytes
+private const val CTL_ASSIGN_DUAL_PAYLOAD_LEN = 42
 
 /**
  * Manages a full VPN connection to the CavadVPN server.
@@ -207,30 +212,78 @@ class VpnClient(private val config: VpnConfig) {
     private fun doControlStream(muxConn: ClientMux): RouteInfo {
         val ctl = muxConn.openStream()
         try {
-            // Send ctlHello
             ctl.write(byteArrayOf(CTL_HELLO))
 
-            // Receive ctlAssign: [0x02, ip(4), prefixLen(1), gateway(4)] = 10 bytes
-            val resp = ctl.readExactly(1 + CTL_ASSIGN_PAYLOAD_LEN)
-            when (resp[0]) {
-                CTL_ERROR  -> throw IllegalStateException("server returned CTL_ERROR")
-                CTL_ASSIGN -> { /* fall through */ }
-                else -> throw IllegalStateException("unexpected control response 0x%02x".format(resp[0].toInt() and 0xFF))
+            // Read the type byte first, then read the appropriate payload length.
+            val typeBuf = ctl.readExactly(1)
+            return when (typeBuf[0]) {
+                CTL_ASSIGN -> {
+                    val payload = ctl.readExactly(CTL_ASSIGN_PAYLOAD_LEN)
+                    parseCtlAssign(payload)
+                }
+                CTL_ASSIGN_DUAL -> {
+                    val payload = ctl.readExactly(CTL_ASSIGN_DUAL_PAYLOAD_LEN)
+                    parseCtlAssignDual(payload)
+                }
+                CTL_ERROR -> throw IllegalStateException("server returned CTL_ERROR")
+                else -> throw IllegalStateException(
+                    "unexpected control response 0x%02x".format(typeBuf[0].toInt() and 0xFF)
+                )
             }
-
-            val ip      = "%d.%d.%d.%d".format(
-                resp[1].toInt() and 0xFF, resp[2].toInt() and 0xFF,
-                resp[3].toInt() and 0xFF, resp[4].toInt() and 0xFF
-            )
-            val pfxLen  = resp[5].toInt() and 0xFF
-            val gateway = "%d.%d.%d.%d".format(
-                resp[6].toInt() and 0xFF, resp[7].toInt() and 0xFF,
-                resp[8].toInt() and 0xFF, resp[9].toInt() and 0xFF
-            )
-
-            return RouteInfo(ip, pfxLen, gateway)
         } finally {
             ctl.close()
+        }
+    }
+
+    companion object {
+        /** Parse a CTL_ASSIGN payload (9 bytes): ip4(4) + pfxLen4(1) + gw4(4). */
+        internal fun parseCtlAssign(payload: ByteArray): RouteInfo {
+            require(payload.size == CTL_ASSIGN_PAYLOAD_LEN) {
+                "CTL_ASSIGN payload must be $CTL_ASSIGN_PAYLOAD_LEN bytes, got ${payload.size}"
+            }
+            val ip = formatIPv4(payload, 0)
+            val pfxLen = payload[4].toInt() and 0xFF
+            val gateway = formatIPv4(payload, 5)
+            return RouteInfo(ip, pfxLen, gateway)
+        }
+
+        /**
+         * Parse a CTL_ASSIGN_DUAL payload (42 bytes):
+         *   ip4(4) + pfxLen4(1) + gw4(4) + ip6(16) + pfxLen6(1) + gw6(16)
+         *
+         * Returns a dual-stack RouteInfo with both IPv4 and IPv6 fields populated.
+         */
+        internal fun parseCtlAssignDual(payload: ByteArray): RouteInfo {
+            require(payload.size == CTL_ASSIGN_DUAL_PAYLOAD_LEN) {
+                "CTL_ASSIGN_DUAL payload must be $CTL_ASSIGN_DUAL_PAYLOAD_LEN bytes, got ${payload.size}"
+            }
+            val ip4     = formatIPv4(payload, 0)
+            val pfxLen4 = payload[4].toInt() and 0xFF
+            val gw4     = formatIPv4(payload, 5)
+            val ip6     = formatIPv6(payload.copyOfRange(9, 25))
+            val pfxLen6 = payload[25].toInt() and 0xFF
+            val gw6     = formatIPv6(payload.copyOfRange(26, 42))
+            return RouteInfo(ip4, pfxLen4, gw4, ip6, pfxLen6, gw6)
+        }
+
+        /** Format 4 bytes starting at [offset] as dotted-decimal IPv4. */
+        internal fun formatIPv4(buf: ByteArray, offset: Int): String =
+            "%d.%d.%d.%d".format(
+                buf[offset].toInt()     and 0xFF,
+                buf[offset + 1].toInt() and 0xFF,
+                buf[offset + 2].toInt() and 0xFF,
+                buf[offset + 3].toInt() and 0xFF
+            )
+
+        /**
+         * Format a 16-byte big-endian IPv6 address using standard RFC 5952 notation
+         * (e.g. "fc00::1" rather than "fc00:0:0:0:0:0:0:1").
+         *
+         * Uses InetAddress.getByAddress so the JVM handles :: compression correctly.
+         */
+        internal fun formatIPv6(bytes: ByteArray): String {
+            require(bytes.size == 16) { "IPv6 address must be 16 bytes" }
+            return InetAddress.getByAddress(bytes).hostAddress ?: throw IllegalArgumentException("invalid IPv6 bytes")
         }
     }
 }
