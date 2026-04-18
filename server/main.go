@@ -1288,6 +1288,25 @@ func writeHandshakeMsg(conn net.Conn, msg []byte) error {
 // 65535 payload + 16-byte ChaCha20-Poly1305 AEAD tag.
 const maxNoiseFrame = 65535 + 16
 
+// noiseReadTimeout is the maximum idle time before a noiseConn read is
+// timed out and the connection is declared dead.
+// Value = 8 × muxKeepaliveInterval (15s) → tolerates 7 dropped pings.
+const noiseReadTimeout = 120 * time.Second
+
+// noiseDeadlineIntervalNs controls how often noiseConn lazily refreshes
+// the read deadline (stored in nanoseconds for atomic access from tests).
+// Default: 60s — the effective dead-connection timeout is
+// noiseReadTimeout − noiseDeadlineInterval = 60s minimum, still 4× the
+// keepalive interval. Reducing this from per-packet to per-60s eliminates
+// ~2630 SetReadDeadline runtime-poller calls/sec at 30 Mbps.
+var noiseDeadlineIntervalNs atomic.Int64
+
+func init() { noiseDeadlineIntervalNs.Store(int64(60 * time.Second)) }
+
+func noiseDeadlineInterval() time.Duration {
+	return time.Duration(noiseDeadlineIntervalNs.Load())
+}
+
 // streamReadBufPool pools the 64 KB read buffers used in handleDataStream.
 // Each VPN session requires one buffer for its lifetime (~65536 bytes).
 // Pooling eliminates the GC pressure of allocating and freeing these large
@@ -1336,6 +1355,11 @@ type noiseConn struct {
 	decryptBuf [65535]byte
 	// perf is an optional perf collector for latency tracking.
 	perf *perf.Collector
+	// deadlineSetAt records when the read deadline was last refreshed.
+	// Zero value → never set; triggers an immediate refresh on first Read.
+	// The lazy refresh (once per noiseDeadlineInterval) eliminates
+	// ~2630 SetReadDeadline calls/sec at 30 Mbps vs the prior per-packet approach.
+	deadlineSetAt time.Time
 }
 
 // newNoiseConn creates a noiseConn wrapping conn with the given session.
@@ -1433,16 +1457,25 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 	// (inner) starts SECOND. This prevents the timer inversion bug where
 	// the subtimer could exceed its container.
 	//
-	// Read deadline: cap the maximum blocking time at 120 seconds.
-	// The mux keepalive (transport.muxKeepaliveInterval = 15s) sends a
-	// FramePing every 15s, resetting this deadline on each receive.
-	// 120s = 8× keepalive interval → tolerates up to 7 dropped/delayed pings
-	// before declaring the connection dead. Generous to handle macOS WiFi
-	// power saving which can pause UDP for 30-60s during idle.
-	nc.conn.SetReadDeadline(time.Now().Add(120 * time.Second)) //nolint:errcheck
+	// Read deadline: lazily refreshed once per noiseDeadlineInterval (60s)
+	// rather than on every packet. At 30 Mbps (≈2630 reads/sec) this reduces
+	// SetReadDeadline runtime-poller calls from 2630/sec to ≤1/60sec —
+	// a ~150,000× reduction. The effective dead-connection timeout remains
+	// noiseReadTimeout (120s); the minimum observable window shrinks to
+	// noiseReadTimeout−noiseDeadlineInterval = 60s (still 4× keepalive).
+	// The mux keepalive (FramePing every 15s) triggers a Read every 15s on
+	// idle connections, so the 60s check fires at most once per 4 pings.
+	//
+	// `now` is reused as obfsReadStart for perf tracking — eliminates a
+	// redundant time.Now() call on the perf-enabled hot path.
+	now := time.Now()
+	if now.Sub(nc.deadlineSetAt) >= noiseDeadlineInterval() {
+		nc.conn.SetReadDeadline(now.Add(noiseReadTimeout)) //nolint:errcheck
+		nc.deadlineSetAt = now
+	}
 	var obfsReadStart, afterRead time.Time
 	if nc.perf != nil {
-		obfsReadStart = time.Now()
+		obfsReadStart = now // reuse — same instant, saves one time.Now()
 	}
 	n, err := nc.conn.Read(nc.recvBuf[:])
 	if nc.perf != nil {

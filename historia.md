@@ -3366,6 +3366,89 @@ ioCopyBufPool.Put(pb)
 
 ---
 
+---
+
+## Запуск 50 — 2026-04-18
+
+### Выполнено: Lazy SetReadDeadline в noiseConn — устранение 2630 runtime-вызовов/сек
+
+**Файлы:** `server/main.go`, `server/main_test.go`
+
+**Проблема:**
+
+В `noiseConn.Read()` перед каждым блокирующим `conn.Read()` вызывался:
+```go
+nc.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+```
+
+Этот вызов происходил на **каждый** входящий пакет. При 30 Mbps / 1430-байтных пакетах:
+- ~2630 пакетов/сек → **2630 вызовов SetReadDeadline/сек**
+
+`SetReadDeadline` в Go — не syscall, но не бесплатная операция:
+1. Вызов `runtime_pollSetDeadline` (runtime-экспортированная функция)
+2. Захват timer-мьютекса в runtime poller
+3. Обновление poll descriptor (runtimeCtx) дедлайна
+4. Возможное пробуждение таймер-горутины
+
+Оценочная стоимость: 50–200 нс/вызов. При 2630/сек → 130–530 мкс/сек = 0.013–0.053% CPU на одном ядре. Для одиночного VPN клиента — незначительно. При 50+ соединениях (каждое с потоком загрузки и выгрузки) — складывается в измеримый overhead.
+
+Дополнительно: на perf-enabled пути код вызывал `time.Now()` дважды:
+```go
+nc.conn.SetReadDeadline(time.Now().Add(120 * time.Second))  // первый time.Now()
+if nc.perf != nil {
+    obfsReadStart = time.Now()  // второй time.Now() — избыточный
+}
+```
+
+**Решение: lazy refresh раз в 60 секунд**
+
+```go
+// noiseDeadlineIntervalNs — атомарный int64 для безопасного переопределения в тестах
+var noiseDeadlineIntervalNs atomic.Int64
+func init() { noiseDeadlineIntervalNs.Store(int64(60 * time.Second)) }
+func noiseDeadlineInterval() time.Duration { return time.Duration(noiseDeadlineIntervalNs.Load()) }
+
+// В noiseConn struct:
+deadlineSetAt time.Time  // zero = никогда не устанавливалось → сразу обновит
+
+// В Read(), вместо безусловного SetReadDeadline:
+now := time.Now()
+if now.Sub(nc.deadlineSetAt) >= noiseDeadlineInterval() {
+    nc.conn.SetReadDeadline(now.Add(noiseReadTimeout))
+    nc.deadlineSetAt = now
+}
+var obfsReadStart time.Time
+if nc.perf != nil {
+    obfsReadStart = now  // reuse — экономим один time.Now() на perf-пути
+}
+```
+
+**Корректность:**
+- Первый `Read()`: `deadlineSetAt.IsZero()` → `now.Sub(time.Time{})` = огромное значение → немедленный SetReadDeadline ✓
+- Активный трафик (2630 пакетов/сек): дедлайн обновляется раз в 60 сек, а не 2630 раз ✓
+- Мёртвое соединение: последний SetReadDeadline был установлен максимум 60с назад. Дедлайн истекает через `120s − 0s = 120s` после последнего Reset, или через `120s − 60s = 60s` в worst-case если пакеты поступали до самого момента отказа → соединение закрывается корректно ✓
+- Mux keepalive (FramePing каждые 15с) инициирует Read каждые 15с → 60s/15s = 4 пинга без обновления дедлайна, на 5-м — обновится ✓
+
+**Дополнительный эффект — устранение избыточного `time.Now()` на perf-пути:**
+- До: 2 вызова `time.Now()` перед Read (deadline + perf) на perf-enabled path
+- После: 1 вызов `time.Now()` (переиспользуется для обоих)
+
+**Эффект суммарно:**
+- `SetReadDeadline`: 2630/сек → ≤1/60сек (при 30 Mbps, один клиент)
+- При 50 активных сессий download+upload: ~263000/сек → ~50/60сек
+- Устранён лишний `time.Now()` на perf-enabled path: -1 VDSO-вызов/пакет
+
+**Тест `TestNoiseConnLazyDeadline`:**
+- `deadlineCountConn` — обёртка net.Conn, считает вызовы SetReadDeadline
+- Ускоряет interval до 50ms для быстрого прохода
+- Phase 1: первый Read → 1 вызов; 2 быстрых последующих → всё ещё 1
+- Phase 2: sleep(60ms) > interval → следующий Read → 2 вызова; ещё один быстрый → всё ещё 2
+
+`go test . -run TestNoiseConnLazyDeadline -v -count=1` — PASS (0.06s)
+`go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог — обновлено 2026-04-18)
 
 1. **~~CTL_ASSIGN_DUAL Python клиент~~** — ~~РЕШЕНО~~ (Запуск 42).
@@ -3376,5 +3459,7 @@ ioCopyBufPool.Put(pb)
 6. **~~vlessUDPRelay upload pool + dialRetry~~** — ~~РЕШЕНО~~ (Запуск 47).
 7. **~~Test flakiness (Run 48)~~** — ~~РЕШЕНО~~ (Запуск 48).
 8. **~~ioCopyBufPool (vlessTCPRelay + relay.go)~~** — ~~РЕШЕНО~~ (Запуск 49).
-9. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps.
-10. **Новые оптимизации hot path** — после pprof анализа. Текущий hot path уже zero-alloc; следующий шаг — CPU profiling для syscall overhead и scheduler latency.
+9. **~~Lazy SetReadDeadline~~** — ~~РЕШЕНО~~ (Запуск 50).
+10. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps. Следующая приоритетная задача.
+11. **streamBond lock-free** — заменить `sync.Mutex` в `streamBond.next/nextWithCount` на `atomic.Pointer[[]dataWriter]` + `atomic.Uint32` для COW-паттерна. Устранит mutex lock/unlock на каждый пакет из routeFromTun (2630/сек при 30 Mbps).
+12. **pacer timer pool** — `time.NewTimer(wait)` в `WaitForSlotCtx` создаёт heap-аллокацию при каждом ожидании pacing-слота. Pool для timer объектов устранит аллокацию на congested paths.

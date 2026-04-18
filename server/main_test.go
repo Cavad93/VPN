@@ -1772,6 +1772,100 @@ func TestWriteHandshakeMsgPayloadError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TestNoiseConnLazyDeadline — verifies that SetReadDeadline is called lazily
+// (at most once per noiseDeadlineInterval) rather than on every Read call.
+// ---------------------------------------------------------------------------
+
+// deadlineCountConn wraps net.Conn and counts SetReadDeadline calls.
+type deadlineCountConn struct {
+	net.Conn
+	calls atomic.Int32
+}
+
+func (c *deadlineCountConn) SetReadDeadline(t time.Time) error {
+	c.calls.Add(1)
+	return c.Conn.SetReadDeadline(t)
+}
+
+func TestNoiseConnLazyDeadline(t *testing.T) {
+	t.Parallel()
+
+	// Shorten the interval so the test completes in milliseconds.
+	orig := noiseDeadlineIntervalNs.Load()
+	noiseDeadlineIntervalNs.Store(int64(50 * time.Millisecond))
+	t.Cleanup(func() { noiseDeadlineIntervalNs.Store(orig) })
+
+	serverKP, _ := crypto.GenerateKeyPair()
+	clientKP, _ := crypto.GenerateKeyPair()
+
+	cConn, sConn := net.Pipe()
+	defer cConn.Close()
+	defer sConn.Close()
+
+	// Perform Noise handshake.
+	sResCh := make(chan *crypto.Session, 1)
+	go func() {
+		hs, _ := crypto.NewHandshake(crypto.Responder, serverKP)
+		msg1, _ := readHandshakeMsg(sConn)
+		hs.ReadMessage1(msg1)          //nolint:errcheck
+		msg2, _ := hs.WriteMessage2()
+		writeHandshakeMsg(sConn, msg2) //nolint:errcheck
+		msg3, _ := readHandshakeMsg(sConn)
+		sess, _ := hs.ReadMessage3(msg3)
+		sResCh <- sess
+	}()
+
+	hs, _ := crypto.NewHandshake(crypto.Initiator, clientKP)
+	msg1, _ := hs.WriteMessage1()
+	writeHandshakeMsg(cConn, msg1) //nolint:errcheck
+	msg2, _ := readHandshakeMsg(cConn)
+	hs.ReadMessage2(msg2) //nolint:errcheck
+	msg3, clientSess, _ := hs.WriteMessage3()
+	writeHandshakeMsg(cConn, msg3) //nolint:errcheck
+	serverSess := <-sResCh
+
+	// Wrap the server side in a counting conn.
+	counting := &deadlineCountConn{Conn: sConn}
+	serverNC := newNoiseConn(counting, serverSess)
+	clientNC := newNoiseConn(cConn, clientSess)
+
+	sendRecv := func() {
+		t.Helper()
+		go clientNC.Write([]byte("ping")) //nolint:errcheck
+		buf := make([]byte, 4)
+		if _, err := serverNC.Read(buf); err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+	}
+
+	// --- Phase 1: rapid reads within the interval ---
+	// First Read should trigger SetReadDeadline (deadline never set).
+	sendRecv()
+	if got := counting.calls.Load(); got != 1 {
+		t.Fatalf("phase 1 first Read: want 1 SetReadDeadline call, got %d", got)
+	}
+
+	// Two more rapid reads — interval (50ms) has not elapsed → no new calls.
+	sendRecv()
+	sendRecv()
+	if got := counting.calls.Load(); got != 1 {
+		t.Fatalf("phase 1 rapid reads: want 1 SetReadDeadline call, got %d", got)
+	}
+
+	// --- Phase 2: wait past interval, then read again ---
+	time.Sleep(60 * time.Millisecond) // > 50ms interval
+	sendRecv()
+	if got := counting.calls.Load(); got != 2 {
+		t.Fatalf("phase 2 after interval: want 2 SetReadDeadline calls, got %d", got)
+	}
+
+	// Another rapid read should NOT increment again.
+	sendRecv()
+	if got := counting.calls.Load(); got != 2 {
+		t.Fatalf("phase 2 rapid read: want 2 SetReadDeadline calls, got %d", got)
+	}
+}
+
 // TestNoiseConnWriteError — covers error path in noiseConn.Write
 // ---------------------------------------------------------------------------
 
