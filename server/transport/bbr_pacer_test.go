@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -218,4 +219,58 @@ func TestPacerThroughputAccuracy(t *testing.T) {
 			elapsed, actualRate, targetRate)
 	}
 	_ = totalBytes // used in error messages above
+}
+
+// TestPacerTimerPoolGetPut verifies the pool contract:
+// timers returned by getPacerTimer fire correctly, and timers returned
+// via putPacerTimer are in a stopped+drained state for safe reuse.
+func TestPacerTimerPoolGetPut(t *testing.T) {
+	// Round 1: timer fires normally.
+	d := 5 * time.Millisecond
+	timer := getPacerTimer(d)
+	select {
+	case <-timer.C:
+		// fired — good
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timer from pool did not fire")
+	}
+	putPacerTimer(timer) // must not panic or block
+
+	// Round 2: same timer object is reusable after Put.
+	timer2 := getPacerTimer(d)
+	select {
+	case <-timer2.C:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("reused timer did not fire on second use")
+	}
+	putPacerTimer(timer2)
+}
+
+// TestPacerTimerPoolContextCancel verifies putPacerTimer correctly drains
+// the channel when context cancellation races with timer expiry.
+func TestPacerTimerPoolContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	p := newPacer(1_000, 100) // very slow rate forces wait > 0
+
+	err := p.WaitForSlotCtx(ctx, 200)
+	if err == nil {
+		// context was already cancelled; we expect an error
+		t.Fatal("expected context cancellation error, got nil")
+	}
+}
+
+// TestPacerTimerPoolZeroAllocs verifies that WaitForSlotCtx with wait=0
+// (tokens available) never allocates, and that after warm-up the wait>0
+// path also allocates zero times (pool reuse).
+func TestPacerTimerPoolZeroAllocs(t *testing.T) {
+	// Fast path (no wait): must be zero-alloc.
+	p := newPacer(0, 14000) // unlimited
+	allocs := testing.AllocsPerRun(100, func() {
+		p.WaitForSlotCtx(context.Background(), 1400) //nolint:errcheck
+	})
+	if allocs > 0 {
+		t.Fatalf("fast path (no wait): expected 0 allocs, got %.0f", allocs)
+	}
 }

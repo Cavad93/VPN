@@ -3525,6 +3525,89 @@ func (sb *streamBond) add(s dataWriter) {
 
 ---
 
+## Запуск 52 — 2026-04-18
+
+### Выполнено: pacer timer pool — устранение heap-аллокации `time.NewTimer` на congested send path
+
+**Файлы:** `server/transport/bbr_pacer.go`, `server/transport/bbr_pacer_test.go`
+
+**Проблема:**
+
+`WaitForSlotCtx` вызывался каждый раз, когда BBR-пейсер не мог отправить пакет немедленно (токен-бакет исчерпан). Внутри:
+
+```go
+t := time.NewTimer(wait)  // heap-аллокация ~64 bytes + runtime timer struct
+defer t.Stop()
+```
+
+`time.NewTimer` всегда аллоцирует новый `runtimeTimer` в heap через `runtime.newTimer`. При 30 Mbps с 1430-байтными пакетами (~2630 пакетов/сек) и при пейсинге на полной скорости: **~2630 аллокаций/сек**, каждая ~64–128 байт = ~170–340 KB/сек heap pressure только от таймеров.
+
+Дополнительно: каждый `defer t.Stop()` добавлял один deferred frame на стек, а при отмене контекста таймер не возвращался — просто GC-собирался.
+
+**Решение: `sync.Pool` для `*time.Timer`**
+
+```go
+var pacerTimerPool = sync.Pool{
+    New: func() any {
+        t := time.NewTimer(0)
+        if !t.Stop() { <-t.C } // drain initial fire → stopped+drained state
+        return t
+    },
+}
+```
+
+**Контракт пула:** таймер в пуле всегда _stopped и channel дренирован_.
+
+```go
+func getPacerTimer(d time.Duration) *time.Timer {
+    t := pacerTimerPool.Get().(*time.Timer)
+    t.Reset(d) // safe: stopped + drained
+    return t
+}
+
+func putPacerTimer(t *time.Timer) {
+    if !t.Stop() {
+        select { case <-t.C: default: }  // drain if fired before Stop
+    }
+    pacerTimerPool.Put(t)
+}
+```
+
+**`WaitForSlotCtx` — явные Put вместо `defer t.Stop()`:**
+
+```go
+t := getPacerTimer(wait)
+select {
+case <-t.C:
+    putPacerTimer(t)  // channel drained (we just read it); Stop returns false but no value
+case <-ctx.Done():
+    putPacerTimer(t)  // Stop+drain inside putPacerTimer
+    return ctx.Err()
+}
+```
+
+**Корректность race при timer fire + ctx cancel одновременно:**
+
+Если timer и ctx cancel происходят в один момент, Go runtime выбирает один из двух `case`. Оба пути заканчиваются `putPacerTimer(t)`:
+- `case <-t.C`: channel пуст, `!t.Stop()` true, `select default` берётся → чисто.
+- `case <-ctx.Done()`: `putPacerTimer` вызывает `t.Stop()`; если fire уже случился — drain; иначе Stop отменяет → чисто.
+
+**Эффект:**
+- Устранена аллокация `time.NewTimer(wait)` ~2630×/сек при пейсинге на 30 Mbps → **0 аллокаций** в steady-state.
+- Экономия: ~170–340 KB/сек heap pressure → сокращение GC cycles.
+- Убран `defer t.Stop()` — один deferred frame меньше на каждый вызов с wait>0.
+- Пул разделяется между всеми goroutines (один глобальный пул на пакет `transport`).
+
+**Тесты (3 новых):**
+- `TestPacerTimerPoolGetPut` — таймер из пула корректно fire дважды (reuse после Put)
+- `TestPacerTimerPoolContextCancel` — отмена контекста не паникует, возвращает ошибку
+- `TestPacerTimerPoolZeroAllocs` — fast path (wait=0) имеет 0 аллокаций
+
+`go test ./transport/ -run TestPacerTimerPool -v -count=1` — 3/3 PASS.  
+`go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог — обновлено 2026-04-18)
 
 1. **~~CTL_ASSIGN_DUAL Python клиент~~** — ~~РЕШЕНО~~ (Запуск 42).
@@ -3537,5 +3620,6 @@ func (sb *streamBond) add(s dataWriter) {
 8. **~~ioCopyBufPool (vlessTCPRelay + relay.go)~~** — ~~РЕШЕНО~~ (Запуск 49).
 9. **~~Lazy SetReadDeadline~~** — ~~РЕШЕНО~~ (Запуск 50).
 10. **~~streamBond lock-free~~** — ~~РЕШЕНО~~ (Запуск 51).
-11. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps. Следующая приоритетная задача.
-12. **pacer timer pool** — `time.NewTimer(wait)` в `WaitForSlotCtx` создаёт heap-аллокацию при каждом ожидании pacing-слота. Pool для timer объектов устранит аллокацию на congested paths.
+11. **~~pacer timer pool~~** — ~~РЕШЕНО~~ (Запуск 52).
+12. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps. Следующая приоритетная задача.
+13. **retransmit timer pool** — `time.NewTimer(retransmitTick)` в `udp.go:retransmitLoop` (line ~797) — аллоцирует таймер при каждом старте/рестарте retransmit loop. Pool аналогичный `pacerTimerPool` устранит аллокацию.

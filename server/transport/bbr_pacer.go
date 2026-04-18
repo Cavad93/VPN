@@ -6,6 +6,43 @@ import (
 	"time"
 )
 
+// pacerTimerPool reuses time.Timer objects to eliminate the heap allocation
+// that time.NewTimer causes on every pacing-wait call.
+//
+// Contract for timers in the pool: always stopped, channel always drained.
+var pacerTimerPool = sync.Pool{
+	New: func() any {
+		t := time.NewTimer(0)
+		// Drain the immediate fire from the zero-duration timer so it enters
+		// the pool in a clean stopped+drained state.
+		if !t.Stop() {
+			<-t.C
+		}
+		return t
+	},
+}
+
+// getPacerTimer retrieves a timer from the pool and arms it for duration d.
+// The returned timer is running; caller must eventually call putPacerTimer.
+func getPacerTimer(d time.Duration) *time.Timer {
+	t := pacerTimerPool.Get().(*time.Timer)
+	// Safe: timers in pool are always stopped and channel is drained.
+	t.Reset(d)
+	return t
+}
+
+// putPacerTimer stops t, drains any pending fire, and returns it to the pool.
+func putPacerTimer(t *time.Timer) {
+	if !t.Stop() {
+		// Timer already fired; drain the channel so the next Reset is clean.
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	pacerTimerPool.Put(t)
+}
+
 // pacer spreads packet transmissions evenly over time instead of sending
 // bursts. This is critical for BBR: without pacing, a burst of packets
 // fills router buffers, causing queuing delay and false loss signals.
@@ -100,14 +137,14 @@ func (p *pacer) WaitForSlotCtx(ctx context.Context, packetSize int) error {
 		return nil
 	}
 
-	// Use a timer channel instead of time.Sleep: the timer can be stopped
-	// immediately on context cancellation, avoiding goroutine leaks and
-	// allowing the caller to abort on shutdown.
-	t := time.NewTimer(wait)
-	defer t.Stop()
+	// Use a pooled timer instead of time.NewTimer to avoid a heap allocation
+	// on every pacing-wait call. At 30 Mbps this path is hit ~2630×/sec.
+	t := getPacerTimer(wait)
 	select {
 	case <-t.C:
+		putPacerTimer(t)
 	case <-ctx.Done():
+		putPacerTimer(t) // Stop+drain inside putPacerTimer
 		return ctx.Err()
 	}
 
