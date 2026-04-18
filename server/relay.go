@@ -168,9 +168,13 @@ func relayOne(client net.Conn, target string, knockKey *transport.KnockPSK, logg
 	}
 
 	// Bidirectional pipe: client ↔ upstream.
+	// Use ioCopyBufPool (32 KiB) so that each direction avoids a per-connection
+	// heap allocation that would otherwise live for the relay session lifetime.
 	done := make(chan struct{}, 2)
 	pipe := func(dst, src net.Conn) {
-		io.Copy(dst, src) //nolint:errcheck
+		pb := ioCopyBufPool.Get().(*[]byte)
+		io.CopyBuffer(dst, src, *pb) //nolint:errcheck
+		ioCopyBufPool.Put(pb)
 		// Signal the other goroutine that this direction is done.
 		dst.Close()
 		src.Close()

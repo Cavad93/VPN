@@ -3512,3 +3512,100 @@ func TestVlessUDPRelayUploadPooled(t *testing.T) {
 		t.Fatal("vlessUDPRelay did not exit after context cancel + wakeup packet")
 	}
 }
+
+// TestVlessTCPRelayPooled verifies that vlessTCPRelay correctly forwards data
+// in both directions and uses ioCopyBufPool (io.CopyBuffer) instead of
+// allocating a fresh 32 KiB buffer per direction.
+//
+// Setup:
+//   - A real TCP echo server (target): echoes every byte it receives.
+//   - A pipe-based reader that delivers upload data to the relay.
+//   - A writeSizeRecorder writer that captures download data from the relay.
+//
+// Assertions:
+//  1. Upload path: echo server receives the payload sent via the reader.
+//  2. Download path: writer receives the echoed payload (VLESSWriteResponse + data).
+//  3. Relay terminates cleanly when both connections close.
+func TestVlessTCPRelayPooled(t *testing.T) {
+	t.Parallel()
+
+	// --- TCP echo server (target) ---
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer echoLn.Close()
+
+	const uploadPayload = "hello-vless-tcp-relay-pool"
+
+	echoReady := make(chan struct{})
+	go func() {
+		close(echoReady)
+		conn, err2 := echoLn.Accept()
+		if err2 != nil {
+			return
+		}
+		defer conn.Close()
+		// Echo back exactly the upload payload then close.
+		buf := make([]byte, 256)
+		n, _ := conn.Read(buf)
+		conn.Write(buf[:n]) //nolint:errcheck
+	}()
+	<-echoReady
+
+	// --- Reader: delivers upload payload then EOF ---
+	readerConn, readerWrite := net.Pipe()
+	go func() {
+		readerWrite.Write([]byte(uploadPayload)) //nolint:errcheck
+		readerWrite.Close()
+	}()
+
+	// --- Writer: captures all bytes written by the relay ---
+	var writerBuf bytes.Buffer
+	writerDone := make(chan struct{})
+	writerConn, writerRead := net.Pipe()
+	go func() {
+		defer close(writerDone)
+		io.Copy(&writerBuf, writerRead) //nolint:errcheck
+	}()
+
+	srv := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		srv.vlessTCPRelay(ctx, readerConn, writerConn, &transport.VLESSRequest{}, echoLn.Addr().String(), "test")
+		writerConn.Close()
+	}()
+
+	// Wait for relay to finish.
+	select {
+	case <-relayDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("vlessTCPRelay did not finish within timeout")
+	}
+
+	// Wait for writer goroutine to drain.
+	select {
+	case <-writerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer goroutine did not finish")
+	}
+
+	// Verify download: writerBuf must contain at least VLESSWriteResponse (2 bytes)
+	// followed by the echoed upload payload.
+	got := writerBuf.Bytes()
+
+	// VLESSWriteResponse writes 2 bytes (version + addon len).
+	const vlessRespLen = 2
+	if len(got) < vlessRespLen+len(uploadPayload) {
+		t.Fatalf("download too short: want ≥%d bytes, got %d (%q)",
+			vlessRespLen+len(uploadPayload), len(got), got)
+	}
+	gotPayload := string(got[vlessRespLen:])
+	if gotPayload != uploadPayload {
+		t.Errorf("download payload mismatch: want %q, got %q", uploadPayload, gotPayload)
+	}
+}

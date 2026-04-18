@@ -25,6 +25,21 @@ import (
 	"github.com/cavad93/vpn/server/transport"
 )
 
+// ioCopyBufPool pools 32 KiB buffers for io.CopyBuffer calls in vlessTCPRelay
+// and relay.go pipe goroutines.  io.Copy allocates a fresh 32 KiB buffer per
+// direction per TCP relay connection; with 50 simultaneous proxied connections
+// that is 50 × 2 × 32 KiB = 3.2 MB of heap live for the connection lifetime
+// (minutes to hours).  Pooling reduces steady-state allocs to zero.
+//
+// Each goroutine holds its own *[]byte for the full duration of io.CopyBuffer —
+// no concurrent sharing within one call.  Get/Put are thus safe.
+var ioCopyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
 // vlessUDPRespPool pools 65538-byte buffers used in vlessUDPRelay to combine
 // the 2-byte length prefix with the UDP payload into a single Write call,
 // avoiding the 2-TLS-record overhead of separate header and data writes.
@@ -384,10 +399,14 @@ func (s *Server) vlessTCPRelay(ctx context.Context, reader io.Reader, writer io.
 
 	done := make(chan struct{}, 1)
 	go func() {
-		io.Copy(writer, target) //nolint:errcheck
+		pb := ioCopyBufPool.Get().(*[]byte)
+		io.CopyBuffer(writer, target, *pb) //nolint:errcheck
+		ioCopyBufPool.Put(pb)
 		done <- struct{}{}
 	}()
-	io.Copy(target, reader) //nolint:errcheck
+	pb := ioCopyBufPool.Get().(*[]byte)
+	io.CopyBuffer(target, reader, *pb) //nolint:errcheck
+	ioCopyBufPool.Put(pb)
 	select {
 	case <-done:
 	case <-ctx.Done():

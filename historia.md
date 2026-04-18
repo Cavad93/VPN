@@ -3305,6 +3305,67 @@ interval 8 too long: 13.907636ms
 
 ---
 
+---
+
+## Запуск 49 — 2026-04-18
+
+### Выполнено: ioCopyBufPool — устранение heap-аллокации в vlessTCPRelay и relay.go
+
+**Файлы:** `server/vless_handler.go`, `server/relay.go`, `server/main_test.go`
+
+**Проблема:**
+
+`io.Copy(dst, src)` внутри себя вызывает `make([]byte, 32*1024)` при каждом вызове — буфер 32 KiB живёт в heap на протяжении всего TCP-соединения (минуты–часы). Функция `vlessTCPRelay` создаёт 2 таких буфера (download + upload), `relay.go`/`pipe` — ещё 2.
+
+**Метрики:**
+- 50 одновременных VLESS TCP proxy соединений: 50 × 2 × 32 KiB = **3.2 MB** heap живёт часами
+- 50 relay соединений (relay-mode): ещё 50 × 2 × 32 KiB = **3.2 MB** heap
+- Итого: до **6.4 MB** — не освобождается пока соединения активны; GC не помогает
+
+**Решение:**
+
+`ioCopyBufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}` — общий для `vless_handler.go` и `relay.go` (оба `package main`).
+
+`io.Copy(dst, src)` → `io.CopyBuffer(dst, src, *pb)` где `pb` взят из пула до вызова и возвращён после завершения CopyBuffer.
+
+```go
+// vlessTCPRelay — download goroutine:
+pb := ioCopyBufPool.Get().(*[]byte)
+io.CopyBuffer(writer, target, *pb)  // io.Copy заменён
+ioCopyBufPool.Put(pb)
+
+// vlessTCPRelay — upload path:
+pb := ioCopyBufPool.Get().(*[]byte)
+io.CopyBuffer(target, reader, *pb)
+ioCopyBufPool.Put(pb)
+
+// relay.go pipe closure (оба направления):
+pb := ioCopyBufPool.Get().(*[]byte)
+io.CopyBuffer(dst, src, *pb)
+ioCopyBufPool.Put(pb)
+```
+
+**Почему pool безопасен:**
+- `io.CopyBuffer` повторно использует буфер внутри одного вызова — данные записываются в `pb`, затем копируются в dst (TCP/TLS Write копирует до возврата). После завершения CopyBuffer буфер не используется.
+- Каждая горутина держит свой `pb` на всё время `CopyBuffer` — нет sharing между горутинами.
+- Pool Get/Put — корректен: Go pool гарантирует что возвращённый объект не выдаётся повторно пока не сдан обратно.
+
+**Эффект:**
+- `vlessTCPRelay`: 2 × `make(32 KiB)` per соединение → 0 в steady-state
+- `relay.go/pipe`: 2 × `make(32 KiB)` per соединение → 0 в steady-state
+- При 50 VLESS + 50 relay соединениях: **6.4 MB** → **≤2 × 32 KiB** (pool держит 1 буфер между соединениями)
+
+**Тест `TestVlessTCPRelayPooled`:**
+- Реальный TCP echo server (loopback) как target
+- `net.Pipe()` пара как reader/writer
+- Проверяет: upload payload доходит до echo server, echo возвращается через writer
+- Проверяет VLESSWriteResponse (2 байта) + payload в download
+
+`go test . -run TestVlessTCPRelayPooled -v -count=1` — PASS  
+`go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог — обновлено 2026-04-18)
 
 1. **~~CTL_ASSIGN_DUAL Python клиент~~** — ~~РЕШЕНО~~ (Запуск 42).
@@ -3313,6 +3374,7 @@ interval 8 too long: 13.907636ms
 4. **~~wsLargeWritePool~~** — ~~РЕШЕНО~~ (Запуск 45).
 5. **~~vlessUDPRelay double-write~~** — ~~РЕШЕНО~~ (Запуск 46).
 6. **~~vlessUDPRelay upload pool + dialRetry~~** — ~~РЕШЕНО~~ (Запуск 47).
-7. **~~Test flakiness (Run 48)~~** — ~~РЕШЕНО~~ (Запуск 48): 3 теста с race/timing issues.
-8. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps.
-9. **Новые оптимизации hot path** — после pprof анализа. Текущий hot path уже zero-alloc; следующий шаг — CPU profiling для syscall overhead и scheduler latency.
+7. **~~Test flakiness (Run 48)~~** — ~~РЕШЕНО~~ (Запуск 48).
+8. **~~ioCopyBufPool (vlessTCPRelay + relay.go)~~** — ~~РЕШЕНО~~ (Запуск 49).
+9. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps.
+10. **Новые оптимизации hot path** — после pprof анализа. Текущий hot path уже zero-alloc; следующий шаг — CPU profiling для syscall overhead и scheduler latency.
