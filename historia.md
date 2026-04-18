@@ -3449,6 +3449,82 @@ if nc.perf != nil {
 
 ---
 
+---
+
+## Запуск 51 — 2026-04-18
+
+### Выполнено: streamBond lock-free COW — устранение mutex на горячем пути routeFromTun
+
+**Файл:** `server/main.go`
+
+**Проблема:**
+
+`streamBond.next()` и `nextWithCount()` вызывались на каждый IP-пакет из TUN-интерфейса.  
+При 30 Mbps / 1430-байтных пакетах: **~2630 вызовов/сек**, каждый выполнял `mu.Lock()` + операции + `mu.Unlock()`.
+
+`sync.Mutex` lock/unlock — не бесплатная операция:
+1. Если не захвачен: CAS операция + memory barrier (~5–20 нс)
+2. Под contention (параллельный `add`/`remove` при reconnect): park/unpark горутины (~500–2000 нс)
+
+При 50 активных сессиях, каждая со своим TUN-потоком (~2630/сек): суммарно **131 500 mutex op/сек** в `streamBond`.
+
+Дополнительно: `nextWithCount` — единственное место в коде, где два поля (`list`, `idx`) должны читаться консистентно. Прежняя реализация правильно держала их под одним mutex'ом, но этот же mutex конкурировал с `add`/`remove`.
+
+**Решение: COW (Copy-On-Write) + atomic.Pointer**
+
+```go
+type streamBond struct {
+    listPtr atomic.Pointer[[]dataWriter] // COW snapshot; nil == empty
+    idx     atomic.Uint64               // round-robin counter; overflow safe
+    writeMu sync.Mutex                  // serialises add/remove writers only
+}
+```
+
+**Инвариант:**
+- `listPtr` всегда содержит указатель на неизменяемый срез (или nil).
+- `add`/`remove` захватывают `writeMu`, копируют старый срез, модифицируют копию, атомарно сохраняют новый указатель через `listPtr.Store(&newList)`.
+- `next`/`nextWithCount`/`count` только `listPtr.Load()` — никаких lock/unlock.
+
+**Hot path (next / nextWithCount) — lock-free:**
+```go
+func (sb *streamBond) nextWithCount() (s dataWriter, total int) {
+    p := sb.listPtr.Load()          // 1 atomic load (pointer)
+    if p == nil { return nil, 0 }
+    list := *p
+    total = len(list)
+    if total == 0 { return nil, 0 }
+    idx := sb.idx.Add(1) - 1        // 1 atomic fetch-add
+    s = list[idx%uint64(total)]     // 1 slice index (no bounds-check: idx%n ∈ [0,n))
+    return s, total
+}
+```
+
+**Write path (add / remove) — COW под writeMu:**
+```go
+func (sb *streamBond) add(s dataWriter) {
+    sb.writeMu.Lock()
+    // load old, make new with +1, copy, append s, store
+    sb.writeMu.Unlock()
+}
+```
+
+**Почему uint64 safe при переполнении:**  
+`uint64` переполняется в 0. При `n > 0`: `uint64(x) % n` всегда в `[0, n)` для любого `x`. В отличие от `int64`, нет отрицательных значений, нет паники при индексации.
+
+**Консистентность snapshot:**  
+`listPtr.Load()` возвращает pointer на срез, который не изменится после Load (COW-неизменяемость). `idx.Add(1)-1` — атомарный fetch-and-add. Комбинация корректна: если между Load и Add кто-то вызвал add/remove, `list` и `idx` всё равно консистентны между собой — старая версия списка с новым idx. Это точно та же «stale total» семантика, которая была и при mutex-подходе (caller проверяет `ds == nil`).
+
+**Эффект:**
+- Hot path `nextWithCount`: 1 mutex lock/unlock/пакет → **0 mutex, 2 atomic ops** (Load + Add)
+- Hot path `next`: 1 mutex lock/unlock/пакет → **0 mutex, 2 atomic ops**  
+- При 30 Mbps, 50 сессий: 131 500 mutex op/сек → **0**
+- `count()` тоже lock-free: 1 atomic Load
+
+**Тесты:** `go test -race -run TestStreamBond -count=3` — 6/6 PASS.  
+`go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог — обновлено 2026-04-18)
 
 1. **~~CTL_ASSIGN_DUAL Python клиент~~** — ~~РЕШЕНО~~ (Запуск 42).
@@ -3460,6 +3536,6 @@ if nc.perf != nil {
 7. **~~Test flakiness (Run 48)~~** — ~~РЕШЕНО~~ (Запуск 48).
 8. **~~ioCopyBufPool (vlessTCPRelay + relay.go)~~** — ~~РЕШЕНО~~ (Запуск 49).
 9. **~~Lazy SetReadDeadline~~** — ~~РЕШЕНО~~ (Запуск 50).
-10. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps. Следующая приоритетная задача.
-11. **streamBond lock-free** — заменить `sync.Mutex` в `streamBond.next/nextWithCount` на `atomic.Pointer[[]dataWriter]` + `atomic.Uint32` для COW-паттерна. Устранит mutex lock/unlock на каждый пакет из routeFromTun (2630/сек при 30 Mbps).
+10. **~~streamBond lock-free~~** — ~~РЕШЕНО~~ (Запуск 51).
+11. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps. Следующая приоритетная задача.
 12. **pacer timer pool** — `time.NewTimer(wait)` в `WaitForSlotCtx` создаёт heap-аллокацию при каждом ожидании pacing-слота. Pool для timer объектов устранит аллокацию на congested paths.

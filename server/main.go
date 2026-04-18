@@ -105,73 +105,98 @@ type dataWriter interface {
 // connections. Each connection has its own TCP congestion window; the
 // aggregate throughput ≈ N × per-connection throughput. With 0.7% packet
 // loss limiting each connection to ~1.7 Mbps, 8 connections yield ~14 Mbps.
+//
+// Lock-free read path (COW pattern):
+//   - listPtr holds an immutable snapshot of the current stream slice.
+//   - add/remove allocate a new slice, copy, and store atomically under writeMu.
+//   - next/nextWithCount/count load the pointer without any mutex — zero
+//     contention on the routeFromTun hot path (~2630 packets/sec at 30 Mbps).
+//   - idx is a monotonic atomic counter; uint64 overflow wraps to 0 — safe
+//     because uint64(x) % n is always ≥ 0 for any x when n > 0.
 type streamBond struct {
-	mu   sync.Mutex
-	list []dataWriter
-	idx  int
+	listPtr atomic.Pointer[[]dataWriter] // COW snapshot; nil pointer == empty
+	idx     atomic.Uint64               // round-robin counter; never reset
+	writeMu sync.Mutex                  // serialises add/remove writers only
 }
 
 func (sb *streamBond) add(s dataWriter) {
-	sb.mu.Lock()
-	sb.list = append(sb.list, s)
-	sb.mu.Unlock()
+	sb.writeMu.Lock()
+	var old []dataWriter
+	if p := sb.listPtr.Load(); p != nil {
+		old = *p
+	}
+	newList := make([]dataWriter, len(old)+1)
+	copy(newList, old)
+	newList[len(old)] = s
+	sb.listPtr.Store(&newList)
+	sb.writeMu.Unlock()
 }
 
 func (sb *streamBond) remove(s dataWriter) {
-	sb.mu.Lock()
-	for i, st := range sb.list {
-		if st == s {
-			sb.list = append(sb.list[:i], sb.list[i+1:]...)
-			break
+	sb.writeMu.Lock()
+	var old []dataWriter
+	if p := sb.listPtr.Load(); p != nil {
+		old = *p
+	}
+	newList := make([]dataWriter, 0, len(old))
+	for _, st := range old {
+		if st != s {
+			newList = append(newList, st)
 		}
 	}
-	sb.mu.Unlock()
+	sb.listPtr.Store(&newList)
+	sb.writeMu.Unlock()
 }
 
 // next returns the next stream in round-robin order, or nil if empty.
+// Lock-free: reads listPtr atomically and increments idx atomically.
 func (sb *streamBond) next() dataWriter {
-	sb.mu.Lock()
-	n := len(sb.list)
-	if n == 0 {
-		sb.mu.Unlock()
+	p := sb.listPtr.Load()
+	if p == nil {
 		return nil
 	}
-	s := sb.list[sb.idx%n]
-	sb.idx++
-	sb.mu.Unlock()
-	return s
+	list := *p
+	n := uint64(len(list))
+	if n == 0 {
+		return nil
+	}
+	return list[(sb.idx.Add(1)-1)%n]
 }
 
 // nextWithCount returns the next stream in round-robin order together with the
-// current bond size in a single mutex acquisition.
+// current bond size in a single atomic snapshot.
 //
 // Hot-path optimisation for routeFromTun: the naive approach calls count() to
 // bound the retry loop and then next() for each attempt — 2 lock/unlock cycles
 // per packet in the common case (single bonded stream, write succeeds).
-// nextWithCount collapses both into one critical section so the common path
-// pays exactly 1 lock/unlock per IP packet routed from TUN to client.
+// nextWithCount provides both in one atomic load + one atomic increment,
+// paying zero mutex cost per IP packet routed from TUN to client.
 //
 // Thread safety: the returned total may be stale if streams are added or
-// removed concurrently between calls. This is the same race that existed with
-// the separate count()+next() pattern; the caller already handles it by
-// checking ds == nil before each write.
+// removed concurrently. The caller handles this by checking ds == nil before
+// each write attempt.
 func (sb *streamBond) nextWithCount() (s dataWriter, total int) {
-	sb.mu.Lock()
-	total = len(sb.list)
-	if total > 0 {
-		s = sb.list[sb.idx%total]
-		sb.idx++
+	p := sb.listPtr.Load()
+	if p == nil {
+		return nil, 0
 	}
-	sb.mu.Unlock()
+	list := *p
+	total = len(list)
+	if total == 0 {
+		return nil, 0
+	}
+	idx := sb.idx.Add(1) - 1
+	s = list[idx%uint64(total)]
 	return s, total
 }
 
-// count returns the number of bonded streams.
+// count returns the number of bonded streams. Lock-free.
 func (sb *streamBond) count() int {
-	sb.mu.Lock()
-	n := len(sb.list)
-	sb.mu.Unlock()
-	return n
+	p := sb.listPtr.Load()
+	if p == nil {
+		return 0
+	}
+	return len(*p)
 }
 
 // congestionProber is implemented by transport.Conn (UDP+BBR mode).
