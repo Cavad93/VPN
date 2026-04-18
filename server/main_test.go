@@ -3354,6 +3354,22 @@ func TestVlessUDPRelayFraming(t *testing.T) {
 		t.Fatal("UDP echo server did not receive a packet")
 	}
 
+	// Wait for the relay to process the echo response (write it back to the
+	// client writer). Without this, a race exists: echoDone fires when the echo
+	// packet is SENT, but the relay goroutine may not yet have called
+	// udpConn.Read to receive it. Cancelling ctx at that moment causes the
+	// relay's ctx.Done() fast-path to fire before any response is written.
+	waitDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		rec.mu.Lock()
+		n := len(rec.sizes)
+		rec.mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
 	// Cancel the context, then send a small wake-up packet to unblock
 	// udpConn.Read so the relay can check ctx.Done() on the next iteration.
 	cancel()
