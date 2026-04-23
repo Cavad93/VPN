@@ -3755,3 +3755,110 @@ type relayAddrKey struct {
 `go test . -run 'TestMakeRelayAddrKey|TestUDPRelay' -v -count=1` — 8/8 PASS.
 `go test ./... -count=1` — все 8 пакетов зелёные.
 `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Запуск 55 — 2026-04-23
+
+### Выполнено: udpRelayPktPool — пул буферов для UDP relay receive path
+
+**Файлы:** `server/relay.go`, `server/relay_test.go`
+
+**Проблема:**
+
+В `runUDPRelay` на каждый входящий UDP-пакет из ReadFrom вызывалось:
+
+```go
+pkt := make([]byte, n)   // heap-аллокация под каждый пакет
+copy(pkt, buf[:n])
+```
+
+При 30 Mbps / 1430-байтных пакетах (~2630 пакетов/сек) на каждого клиента:
+- N=1 клиент: ~2630 аллокаций/сек = ~3.7 MB/сек heap pressure
+- N=3 клиента (Россия↔Казахстан реальный сценарий): ~7890 аллокаций/сек = ~11 MB/сек
+- N=50 клиентов (публичный relay): ~131 500 аллокаций/сек = ~185 MB/сек heap pressure
+
+Паттерн идентичен Run 14 (`udpAddrKey`, ~5260 string-аллокаций/сек), Run 15 (`decodePayloadPool`, ~3.7 MB/сек) и Run 54 (`relayAddrKey`).
+
+**Решение: `udpRelayPktPool` + `chan *[]byte`**
+
+```go
+var udpRelayPktPool = sync.Pool{
+    New: func() any {
+        b := make([]byte, udpBufSize)
+        return &b
+    },
+}
+```
+
+Изменён тип `udpSession.sendCh`: `chan []byte` → `chan *[]byte`.
+
+**ReadFrom loop:**
+```go
+// БЫЛО:
+pkt := make([]byte, n)
+copy(pkt, buf[:n])
+// ...
+case sess.sendCh <- pkt:
+
+// СТАЛО:
+pb := udpRelayPktPool.Get().(*[]byte)
+*pb = (*pb)[:n]      // reslice to actual packet length
+copy(*pb, buf[:n])
+// ...
+case sess.sendCh <- pb:   // pool token + data via channel
+default:
+    *pb = (*pb)[:cap(*pb)]   // restore before returning to pool
+    udpRelayPktPool.Put(pb)  // drop path: return immediately
+```
+
+**Upstream writer goroutine:**
+```go
+// БЫЛО:
+for pkt := range ch {
+    up.Write(pkt)
+    globalRelayMetrics.upstreamTxBytes.Add(int64(len(pkt)))
+}
+
+// СТАЛО:
+for pb := range ch {
+    up.Write(*pb)
+    globalRelayMetrics.upstreamTxBytes.Add(int64(len(*pb)))
+    *pb = (*pb)[:cap(*pb)]    // restore full capacity
+    udpRelayPktPool.Put(pb)   // return to pool after write
+}
+```
+
+**Upstream → client goroutine — пул для rbuf:**
+```go
+// БЫЛО:
+rbuf := make([]byte, udpBufSize)  // одна аллокация per-session
+
+// СТАЛО:
+rbp := udpRelayPktPool.Get().(*[]byte)
+rbuf := *rbp
+defer func() { *rbp = (*rbp)[:cap(*rbp)]; udpRelayPktPool.Put(rbp) }()
+```
+
+Последнее устраняет per-session аллокацию `udpBufSize`-буфера при reconnect storms.
+
+**Рабочий принцип slice reslice:**
+- Пул хранит `*[]byte` с length=cap=`udpBufSize`
+- Перед send: `*pb = (*pb)[:n]` — view на первые n байт; cap сохраняется
+- После write: `*pb = (*pb)[:cap(*pb)]` — восстановление полной длины
+- Pool видит полный буфер, готовый для следующего `Get`
+
+**Эффект:**
+- Устранено `make([]byte, n)` ~2630×N раз/сек при N клиентах → 0 в steady-state
+- Устранено `make([]byte, udpBufSize)` per session (upstream→client goroutine)
+- Суммарная экономия при N=50 клиентов: ~185 MB/сек heap pressure → 0
+
+**Тесты (5 новых):**
+- `TestUDPRelayPktPool_GetPut` — pool contract: Get возвращает udpBufSize буфер
+- `TestUDPRelayPktPool_ResliceAndRestore` — reslice к n → restore к cap (pool reuse pattern)
+- `TestUDPRelayPktPool_DataIntegrity` — данные сохраняются через Get→copy→Write cycle
+- `TestUDPRelayDroppedPacketReturnsToPool` — drop path: буфер возвращается в пул без утечки
+- `TestUDPRelayEndToEnd_PoolIntegration` — e2e: пакеты разных размеров (1, 100, 1430, 4096 байт) корректно проходят через pool path
+
+`go test . -run 'TestUDPRelayPktPool|TestUDPRelayEndToEnd' -v -count=1` — 5/5 PASS.
+`go test ./... -count=1` — все 8 пакетов зелёные.

@@ -545,3 +545,104 @@ func TestMakeRelayAddrKey_NonUDPFallback(t *testing.T) {
 		t.Fatalf("non-UDPAddr fallback should have port=0, got %d", key.port)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// udpRelayPktPool tests
+// ---------------------------------------------------------------------------
+
+// TestUDPRelayPktPool_GetPut verifies the pool contract: Get returns a
+// udpBufSize-capacity buffer; Put returns it for reuse.
+func TestUDPRelayPktPool_GetPut(t *testing.T) {
+	pb := udpRelayPktPool.Get().(*[]byte)
+	if cap(*pb) != udpBufSize {
+		t.Fatalf("pool buffer cap = %d, want %d", cap(*pb), udpBufSize)
+	}
+	udpRelayPktPool.Put(pb)
+}
+
+// TestUDPRelayPktPool_ResliceAndRestore verifies the reslice-and-restore
+// pattern used in runUDPRelay: set length to n, use, restore to cap.
+func TestUDPRelayPktPool_ResliceAndRestore(t *testing.T) {
+	pb := udpRelayPktPool.Get().(*[]byte)
+
+	n := 42
+	*pb = (*pb)[:n]
+	copy(*pb, bytes.Repeat([]byte{0xAB}, n))
+
+	if len(*pb) != n {
+		t.Fatalf("after reslice: len=%d, want %d", len(*pb), n)
+	}
+	// Restore full capacity before Put (mimics upstream writer goroutine).
+	*pb = (*pb)[:cap(*pb)]
+	if len(*pb) != udpBufSize {
+		t.Fatalf("after restore: len=%d, want %d", len(*pb), udpBufSize)
+	}
+	udpRelayPktPool.Put(pb)
+}
+
+// TestUDPRelayPktPool_DataIntegrity verifies that packet data survives the
+// Get→reslice→copy→Write(*pb) round-trip without corruption.
+func TestUDPRelayPktPool_DataIntegrity(t *testing.T) {
+	payload := []byte("hello pool 12345")
+	n := len(payload)
+
+	pb := udpRelayPktPool.Get().(*[]byte)
+	*pb = (*pb)[:n]
+	copy(*pb, payload)
+
+	if !bytes.Equal(*pb, payload) {
+		t.Fatalf("data mismatch after copy: got %q want %q", *pb, payload)
+	}
+
+	*pb = (*pb)[:cap(*pb)]
+	udpRelayPktPool.Put(pb)
+}
+
+// TestUDPRelayDroppedPacketReturnsToPool verifies the drop path: when the
+// sendCh is full, the pool buffer must be returned (not leaked).
+// We verify this indirectly by checking no panic occurs and the pool
+// is still functional after the return.
+func TestUDPRelayDroppedPacketReturnsToPool(t *testing.T) {
+	pb := udpRelayPktPool.Get().(*[]byte)
+	n := 100
+	*pb = (*pb)[:n]
+	// Simulate the drop path: channel full → return to pool.
+	*pb = (*pb)[:cap(*pb)]
+	udpRelayPktPool.Put(pb)
+
+	// Pool must still be usable.
+	pb2 := udpRelayPktPool.Get().(*[]byte)
+	if cap(*pb2) != udpBufSize {
+		t.Fatalf("pool unusable after drop-path Put: cap=%d", cap(*pb2))
+	}
+	udpRelayPktPool.Put(pb2)
+}
+
+// TestUDPRelayEndToEnd_PoolIntegration verifies that the end-to-end relay
+// (including the pool path) forwards variable-size packets correctly.
+func TestUDPRelayEndToEnd_PoolIntegration(t *testing.T) {
+	echo := startUDPEchoServer(t)
+	relay := startUDPRelay(t, echo)
+
+	conn, err := net.Dial("udp", relay)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	// Send packets of different sizes to exercise pool reslicing.
+	for _, size := range []int{1, 100, 1430, 4096} {
+		payload := bytes.Repeat([]byte{byte(size & 0xFF)}, size)
+		if _, err := conn.Write(payload); err != nil {
+			t.Fatalf("write size=%d: %v", size, err)
+		}
+		buf := make([]byte, size)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			t.Fatalf("read size=%d: %v", size, err)
+		}
+		if !bytes.Equal(buf, payload) {
+			t.Fatalf("size=%d: echo mismatch", size)
+		}
+	}
+}

@@ -251,10 +251,31 @@ func makeRelayAddrKey(addr net.Addr) relayAddrKey {
 	return key
 }
 
+// udpRelayPktPool pools udpBufSize-byte receive buffers for the
+// ReadFrom → sendCh → upstream-writer pipeline in runUDPRelay.
+//
+// Without pooling: ReadFrom calls make([]byte, n) on every incoming UDP packet.
+// At 30 Mbps / 1430-byte packets (≈2630 pkt/sec) per client this is
+// ~2630 allocs/sec/client = ~3.7 MB/sec heap pressure per client.
+//
+// Each pool entry is a *[]byte whose slice length is set to the actual
+// packet size before being sent through sendCh, so the consumer can call
+// Write(*pb) with the correct length. Before returning to the pool the
+// slice is reset to full capacity: *pb = (*pb)[:cap(*pb)].
+var udpRelayPktPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, udpBufSize)
+		return &b
+	},
+}
+
 // udpSession tracks one client ↔ upstream mapping.
 type udpSession struct {
 	upstream net.Conn
-	sendCh   chan []byte // async write queue: decouples ReadFrom from upstream Write
+	// sendCh carries pooled packet buffers from ReadFrom to the upstream
+	// writer goroutine. Using *[]byte (pool token) instead of []byte
+	// eliminates make([]byte, n) on every incoming UDP packet.
+	sendCh   chan *[]byte
 	lastSeen time.Time
 }
 
@@ -320,8 +341,12 @@ func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *sl
 		// Segment A: count bytes received from VPN clients (MacBook → SPb).
 		globalRelayMetrics.clientRxBytes.Add(int64(n))
 
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
+		// Borrow a pool buffer, set its length to n, copy the packet data.
+		// This replaces make([]byte, n) + copy which was called on every packet.
+		pb := udpRelayPktPool.Get().(*[]byte)
+		*pb = (*pb)[:n]
+		copy(*pb, buf[:n])
+
 		key := makeRelayAddrKey(clientAddr)
 
 		mu.Lock()
@@ -330,6 +355,9 @@ func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *sl
 			up, err := net.Dial("udp", relayTarget)
 			if err != nil {
 				mu.Unlock()
+				// Return the pool buffer before continuing (packet dropped).
+				*pb = (*pb)[:cap(*pb)]
+				udpRelayPktPool.Put(pb)
 				logger.Warn("udp relay: dial upstream failed", "target", relayTarget, "err", err)
 				continue
 			}
@@ -337,24 +365,35 @@ func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *sl
 				uc.SetReadBuffer(4 << 20)  //nolint:errcheck
 				uc.SetWriteBuffer(4 << 20) //nolint:errcheck
 			}
-			// sendCh buffers up to 512 packets so ReadFrom never stalls on write.
-			ch := make(chan []byte, 512)
+			// sendCh carries pooled *[]byte tokens; capacity 512 packets.
+			ch := make(chan *[]byte, 512)
 			sess = &udpSession{upstream: up, sendCh: ch, lastSeen: time.Now()}
 			sessions[key] = sess
 
-			// Upstream writer goroutine: drains sendCh → upstream.
-			// Runs independently of ReadFrom; UDP writes are near-instant.
-			go func(up net.Conn, ch <-chan []byte) {
-				for pkt := range ch {
-					up.Write(pkt) //nolint:errcheck
+			// Upstream writer goroutine: drains sendCh → upstream, returns
+			// each buffer to udpRelayPktPool after the write completes.
+			go func(up net.Conn, ch <-chan *[]byte) {
+				for pb := range ch {
+					up.Write(*pb) //nolint:errcheck
 					// Segment B: count bytes forwarded to Astana.
-					globalRelayMetrics.upstreamTxBytes.Add(int64(len(pkt)))
+					globalRelayMetrics.upstreamTxBytes.Add(int64(len(*pb)))
+					// Restore full capacity before returning to pool.
+					*pb = (*pb)[:cap(*pb)]
+					udpRelayPktPool.Put(pb)
 				}
 			}(up, ch)
 
 			// Upstream → client goroutine: one per session.
+			// rbuf is borrowed from the pool for the session lifetime
+			// and returned when the upstream closes.
 			go func(up net.Conn, dst net.Addr) {
-				rbuf := make([]byte, udpBufSize)
+				rbp := udpRelayPktPool.Get().(*[]byte)
+				*rbp = (*rbp)[:udpBufSize]
+				rbuf := *rbp
+				defer func() {
+					*rbp = (*rbp)[:cap(*rbp)]
+					udpRelayPktPool.Put(rbp)
+				}()
 				for {
 					m, err := up.Read(rbuf)
 					if err != nil {
@@ -373,12 +412,14 @@ func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *sl
 		sess.lastSeen = time.Now()
 		mu.Unlock()
 
-		// Non-blocking enqueue: if channel is full, drop the packet.
-		// BBR/ReliableUDP on the client will retransmit; occasional drops
-		// here are better than blocking ReadFrom for all clients.
+		// Non-blocking enqueue: if channel is full, return the buffer to the
+		// pool (packet dropped) rather than blocking ReadFrom for all clients.
+		// BBR/ReliableUDP on the client will retransmit.
 		select {
-		case sess.sendCh <- pkt:
+		case sess.sendCh <- pb:
 		default:
+			*pb = (*pb)[:cap(*pb)]
+			udpRelayPktPool.Put(pb)
 			globalRelayMetrics.clientDrops.Add(1)
 			logger.Warn("udp relay: send queue full, dropping packet", "client", key)
 		}
