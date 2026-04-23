@@ -449,3 +449,99 @@ func TestRelayActiveConnectionSurvivesPastTimeout(t *testing.T) {
 	}
 	// Success: 2 seconds of active traffic with 500ms idle timeout — connection survived.
 }
+
+// ---------------------------------------------------------------------------
+// Tests for makeRelayAddrKey — zero-alloc UDP session map key
+// ---------------------------------------------------------------------------
+
+// TestMakeRelayAddrKey_IPv4 verifies that a 4-byte IPv4 UDPAddr produces the
+// expected IPv4-in-IPv6 representation and the correct port.
+func TestMakeRelayAddrKey_IPv4(t *testing.T) {
+	addr := &net.UDPAddr{IP: net.IP{1, 2, 3, 4}, Port: 51000}
+	key := makeRelayAddrKey(addr)
+
+	if key.port != 51000 {
+		t.Fatalf("port: got %d, want 51000", key.port)
+	}
+	// Bytes 10-11 must be 0xff (IPv4-in-IPv6 marker).
+	if key.ip[10] != 0xff || key.ip[11] != 0xff {
+		t.Fatalf("IPv4-in-IPv6 marker missing: ip[10:12] = %v", key.ip[10:12])
+	}
+	if key.ip[12] != 1 || key.ip[13] != 2 || key.ip[14] != 3 || key.ip[15] != 4 {
+		t.Fatalf("IPv4 octets wrong: ip[12:16] = %v", key.ip[12:16])
+	}
+	if key.zone != "" {
+		t.Fatalf("zone should be empty for IPv4, got %q", key.zone)
+	}
+}
+
+// TestMakeRelayAddrKey_IPv4MappedIPv6 verifies that a 16-byte IPv4-mapped IPv6
+// address (::ffff:1.2.3.4) produces the SAME key as the 4-byte IPv4 form.
+// This is the normalization test — dual-stack sockets may return either form.
+func TestMakeRelayAddrKey_IPv4MappedIPv6(t *testing.T) {
+	addr4 := &net.UDPAddr{IP: net.IP{1, 2, 3, 4}, Port: 51000}
+	addr16 := &net.UDPAddr{
+		IP:   net.IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4},
+		Port: 51000,
+	}
+	key4 := makeRelayAddrKey(addr4)
+	key16 := makeRelayAddrKey(addr16)
+
+	if key4 != key16 {
+		t.Fatalf("IPv4 and IPv4-mapped-IPv6 keys differ:\n  4-byte: %v\n  16-byte: %v", key4, key16)
+	}
+}
+
+// TestMakeRelayAddrKey_IPv6 verifies that a native IPv6 address is stored
+// correctly and that the zone field is preserved.
+func TestMakeRelayAddrKey_IPv6(t *testing.T) {
+	ip6 := net.ParseIP("2001:db8::1")
+	addr := &net.UDPAddr{IP: ip6, Port: 12345, Zone: "eth0"}
+	key := makeRelayAddrKey(addr)
+
+	if key.port != 12345 {
+		t.Fatalf("port: got %d, want 12345", key.port)
+	}
+	if key.zone != "eth0" {
+		t.Fatalf("zone: got %q, want %q", key.zone, "eth0")
+	}
+	var want [16]byte
+	copy(want[:], ip6.To16())
+	if key.ip != want {
+		t.Fatalf("IPv6 ip field wrong:\n  got:  %v\n  want: %v", key.ip, want)
+	}
+}
+
+// TestMakeRelayAddrKey_DifferentPortsDifferentKeys verifies that two addresses
+// with the same IP but different ports produce distinct keys.
+func TestMakeRelayAddrKey_DifferentPortsDifferentKeys(t *testing.T) {
+	base := net.IP{10, 0, 0, 1}
+	key1 := makeRelayAddrKey(&net.UDPAddr{IP: base, Port: 1111})
+	key2 := makeRelayAddrKey(&net.UDPAddr{IP: base, Port: 2222})
+	if key1 == key2 {
+		t.Fatal("different ports should produce different keys")
+	}
+}
+
+// TestMakeRelayAddrKey_DifferentIPsDifferentKeys verifies that two addresses
+// with different IPs but the same port produce distinct keys.
+func TestMakeRelayAddrKey_DifferentIPsDifferentKeys(t *testing.T) {
+	key1 := makeRelayAddrKey(&net.UDPAddr{IP: net.IP{10, 0, 0, 1}, Port: 5000})
+	key2 := makeRelayAddrKey(&net.UDPAddr{IP: net.IP{10, 0, 0, 2}, Port: 5000})
+	if key1 == key2 {
+		t.Fatal("different IPs should produce different keys")
+	}
+}
+
+// TestMakeRelayAddrKey_NonUDPFallback verifies that a non-UDPAddr type does
+// not panic and returns a key whose zone field contains the string representation.
+func TestMakeRelayAddrKey_NonUDPFallback(t *testing.T) {
+	addr := &net.TCPAddr{IP: net.IP{1, 2, 3, 4}, Port: 80}
+	key := makeRelayAddrKey(addr)
+	if key.zone == "" {
+		t.Fatal("non-UDPAddr fallback should populate zone with String() representation")
+	}
+	if key.port != 0 {
+		t.Fatalf("non-UDPAddr fallback should have port=0, got %d", key.port)
+	}
+}

@@ -3623,6 +3623,7 @@ case <-ctx.Done():
 11. **~~pacer timer pool~~** — ~~РЕШЕНО~~ (Запуск 52).
 12. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps. Следующая приоритетная задача.
 13. **~~retransmit timer pool~~** — ~~РЕШЕНО~~ (Запуск 53): `retransmitLoop` теперь использует `getPacerTimer`/`putPacerTimer` вместо `time.NewTimer`.
+14. **~~relayAddrKey — устранение string-аллокации в UDP relay~~** — ~~РЕШЕНО~~ (Запуск 54): `map[string]*udpSession` → `map[relayAddrKey]*udpSession`.
 
 ---
 
@@ -3685,4 +3686,72 @@ defer putPacerTimer(timer)                // Stop+drain+return в пул
 - `TestRetransmitLoopExitsOnContextCancel` — `conn.Close()` завершается без дедлока; `putPacerTimer` в defer не блокируется на потенциально-запущенном таймере
 
 `go test ./transport/ -run 'TestRetransmitLoop|TestPacerTimerPool|TestDoRetransmit' -count=1` — все 9 тестов PASS.
+
+---
+
+## Запуск 54 — 2026-04-23
+
+### Выполнено: relayAddrKey — устранение string-аллокации на каждый входящий UDP-пакет в relay
+
+**Файлы:** `server/relay.go`, `server/relay_test.go`
+
+**Проблема:**
+
+В `runUDPRelay` на каждый входящий UDP-пакет вычислялся строковый ключ сессии:
+
+```go
+key := clientAddr.String()   // heap-аллокация строки "IP:port"
+sess, ok := sessions[key]    // map[string]*udpSession
+```
+
+`net.Addr.String()` форматирует строку вида `"1.2.3.4:51000"` — новая heap-аллокация на каждый пакет. В UDP relay режиме пакеты поступают от N клиентов одновременно. При трёх клиентах на 30 Mbps (~2630 пакетов/сек каждый):
+
+- N=3: ~7890 string-аллокаций/сек, каждая ~14-20 байт = ~110-158 KB/сек heap pressure
+- N=50: ~131 500 string-аллокаций/сек = ~1.8-2.5 MB/сек heap pressure
+
+Паттерн идентичен проблеме, устранённой в Запуске 14 для UDP transport (`udpAddrKey`).
+
+**Решение: `relayAddrKey` — сравнимая struct без аллокаций**
+
+```go
+type relayAddrKey struct {
+    ip   [16]byte // IPv4-in-IPv6 или IPv6; нет указателей → нет аллокации как map key
+    port int
+    zone string   // IPv6 link-local zone; для IPv4 всегда "" (нет аллокации)
+}
+```
+
+`makeRelayAddrKey(addr net.Addr) relayAddrKey` — чистая stack-операция:
+- 4-байтный IPv4: нормализуется в IPv4-in-IPv6 форму (`::ffff:x.x.x.x`)
+- 16-байтный IPv4-mapped или IPv6: копируется напрямую
+- Не-UDPAddr (только в тестах): fallback через `zone = addr.String()`
+
+**Ключевые изменения:**
+
+1. Добавлен тип `relayAddrKey` и функция `makeRelayAddrKey` в `relay.go`
+2. `sessions := make(map[string]*udpSession)` → `make(map[relayAddrKey]*udpSession)`
+3. `key := clientAddr.String()` → `key := makeRelayAddrKey(clientAddr)`
+
+**Нормализация IPv4:**
+
+4-байтный `"1.2.3.4"` → `key.ip = [0,0,0,0,0,0,0,0,0,0,0xff,0xff,1,2,3,4]`
+16-байтный `"::ffff:1.2.3.4"` → те же байты.
+
+Оба варианта дают одинаковый ключ — корректная работа на dual-stack сокетах.
+
+**Эффект:**
+- Устранено ~2630×N string-аллокаций/сек при N клиентах на 30 Mbps → 0
+- `makeRelayAddrKey` — 40-байтная struct-копия (stack-allocated, быстрее string formatting)
+- GC давление при N=50 клиентах снижается на ~1.8-2.5 MB/сек
+
+**Тесты (6 новых):**
+- `TestMakeRelayAddrKey_IPv4` — IPv4 byte layout и IPv4-in-IPv6 маркер
+- `TestMakeRelayAddrKey_IPv4MappedIPv6` — 4-byte и 16-byte IPv4 дают **одинаковый** ключ (нормализация)
+- `TestMakeRelayAddrKey_IPv6` — native IPv6 с zone field
+- `TestMakeRelayAddrKey_DifferentPortsDifferentKeys` — разные порты → разные ключи
+- `TestMakeRelayAddrKey_DifferentIPsDifferentKeys` — разные IP → разные ключи
+- `TestMakeRelayAddrKey_NonUDPFallback` — non-UDPAddr не паникует, заполняет zone
+
+`go test . -run 'TestMakeRelayAddrKey|TestUDPRelay' -v -count=1` — 8/8 PASS.
+`go test ./... -count=1` — все 8 пакетов зелёные.
 `go test ./... -count=1` — все 8 пакетов зелёные.

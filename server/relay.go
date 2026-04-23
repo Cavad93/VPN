@@ -211,6 +211,46 @@ const udpSessionTimeout = 10 * time.Minute
 // udpBufSize is the receive buffer size — max UDP datagram.
 const udpBufSize = 65536
 
+// relayAddrKey is a comparable struct used as a map key for UDP relay sessions.
+// It replaces clientAddr.String() to eliminate the heap-allocated string on
+// every incoming UDP packet — the same technique applied to the UDP transport
+// in transport.udpAddrKey (Run 14).
+//
+// IPv4 addresses are normalised to IPv4-in-IPv6 form so that the 4-byte and
+// 16-byte representations of the same address compare equal — required on
+// dual-stack sockets where the kernel may return either form.
+type relayAddrKey struct {
+	ip   [16]byte // IPv4-in-IPv6 or IPv6; no pointer → zero-alloc as map key
+	port int
+	zone string // IPv6 link-local zone; always "" for IPv4
+}
+
+// makeRelayAddrKey builds a relayAddrKey from a net.Addr returned by
+// net.PacketConn.ReadFrom. On a UDP socket the addr is always *net.UDPAddr;
+// the non-UDPAddr branch is a safety fallback for test code.
+func makeRelayAddrKey(addr net.Addr) relayAddrKey {
+	ua, ok := addr.(*net.UDPAddr)
+	if !ok {
+		// Fallback for non-UDP addresses (only in tests). Store the string
+		// representation in zone so different addresses still produce distinct keys.
+		return relayAddrKey{zone: addr.String()}
+	}
+	var key relayAddrKey
+	key.port = ua.Port
+	key.zone = ua.Zone
+	switch len(ua.IP) {
+	case 4:
+		// Normalise IPv4 to IPv4-in-IPv6 (::ffff:x.x.x.x) so that 4-byte and
+		// 16-byte representations of the same IPv4 address produce the same key.
+		key.ip[10] = 0xff
+		key.ip[11] = 0xff
+		copy(key.ip[12:], ua.IP)
+	case 16:
+		copy(key.ip[:], ua.IP)
+	}
+	return key
+}
+
 // udpSession tracks one client ↔ upstream mapping.
 type udpSession struct {
 	upstream net.Conn
@@ -236,7 +276,7 @@ func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *sl
 	}()
 
 	var mu sync.Mutex
-	sessions := make(map[string]*udpSession)
+	sessions := make(map[relayAddrKey]*udpSession)
 
 	// Periodic cleanup of idle sessions.
 	go func() {
@@ -282,7 +322,7 @@ func runUDPRelay(ctx context.Context, listenAddr, relayTarget string, logger *sl
 
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
-		key := clientAddr.String()
+		key := makeRelayAddrKey(clientAddr)
 
 		mu.Lock()
 		sess, ok := sessions[key]
