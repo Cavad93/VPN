@@ -3622,4 +3622,67 @@ case <-ctx.Done():
 10. **~~streamBond lock-free~~** — ~~РЕШЕНО~~ (Запуск 51).
 11. **~~pacer timer pool~~** — ~~РЕШЕНО~~ (Запуск 52).
 12. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps. Следующая приоритетная задача.
-13. **retransmit timer pool** — `time.NewTimer(retransmitTick)` в `udp.go:retransmitLoop` (line ~797) — аллоцирует таймер при каждом старте/рестарте retransmit loop. Pool аналогичный `pacerTimerPool` устранит аллокацию.
+13. **~~retransmit timer pool~~** — ~~РЕШЕНО~~ (Запуск 53): `retransmitLoop` теперь использует `getPacerTimer`/`putPacerTimer` вместо `time.NewTimer`.
+
+---
+
+## Запуск 53 — 2026-04-23
+
+### Выполнено: retransmit timer pool — 0 аллокаций на старт/перезапуск соединения
+
+**Файлы:** `server/transport/udp.go`, `server/transport/udp_test.go`
+
+**Проблема:**
+
+`retransmitLoop` создавал таймер через `time.NewTimer(retransmitTick)` при каждом старте горутины:
+
+```go
+timer := time.NewTimer(retransmitTick)  // heap alloc per connection
+defer timer.Stop()
+```
+
+Каждый вызов `time.NewTimer` аллоцирует `*time.Timer` (в heap) — структуру с внутренним `*runtimeTimer`. В стандартном режиме одно VPN-соединение создаёт 1 `retransmitLoop` горутину. При bond_count=8 — 8 горутин × 1 аллокация = 8 аллокаций при подключении. При частых мобильных reconnects (drop каждые 30–60 с на CIS маршрутах) это создаёт непрерывное давление на GC.
+
+Пул `pacerTimerPool` (из `bbr_pacer.go`, Run 52) уже существовал в том же пакете и имел идентичный контракт: timer в пуле — _stopped и channel дренирован_.
+
+**Решение:**
+
+Заменить `time.NewTimer` + `defer timer.Stop()` на `getPacerTimer` + `defer putPacerTimer`:
+
+```go
+// ДО:
+timer := time.NewTimer(retransmitTick)
+defer timer.Stop()
+
+// ПОСЛЕ:
+timer := getPacerTimer(retransmitTick)    // из пула, 0 аллокаций в steady-state
+defer putPacerTimer(timer)                // Stop+drain+return в пул
+```
+
+**Корректность `timer.Reset(interval)` в loop:**
+
+После `<-timer.C` (чтение из канала) таймер находится в состоянии "stopped, channel drained". `timer.Reset(interval)` безопасен без предварительного `Stop()` — стандартный контракт Go timer. ✓
+
+**Корректность race: `ctx.Done()` + `timer.C` одновременно:**
+
+Если оба channel ready, Go runtime выбирает один из двух `case`. На пути `ctx.Done()`:
+- `defer putPacerTimer(timer)` вызывает `t.Stop()`.
+- Если таймер успел сработать (`t.Stop()` возвращает false) → `select <-t.C` дренирует channel.
+- Если таймер ещё не сработал → `t.Stop()` отменяет и возвращает true → channel чист.
+- В обоих случаях таймер возвращается в пул в корректном состоянии. ✓
+
+**Пул разделяется между pacing и retransmit** — `getPacerTimer`/`putPacerTimer` общие. Это нормально: `sync.Pool` без размерной специализации, тип `*time.Timer` одинаков.
+
+**Эффект:**
+
+- При первом подключении и каждом reconnect: аллокация `*time.Timer` → 0 (из пула).
+- При bond_count=8: 8 аллокаций/reconnect → 0.
+- Экономия GC: таймеры (heap obj с внутренним `runtimeTimer` pointer) не создаются и не GC-ятся при reconnect storms.
+
+**Тесты добавлены (2 новых):**
+
+- `TestRetransmitLoopUsesPooledTimer` — `getPacerTimer`/`putPacerTimer` работают корректно при переиспользовании (pool contract: fire→put→get→fire снова)
+- `TestRetransmitLoopExitsOnContextCancel` — `conn.Close()` завершается без дедлока; `putPacerTimer` в defer не блокируется на потенциально-запущенном таймере
+
+`go test ./transport/ -run 'TestRetransmitLoop|TestPacerTimerPool|TestDoRetransmit' -count=1` — все 9 тестов PASS.
+`go test ./... -count=1` — все 8 пакетов зелёные.

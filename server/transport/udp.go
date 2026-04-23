@@ -794,8 +794,12 @@ func (c *Conn) sendACK() {
 // This avoids wasting CPU scanning pending packets when RTO is high,
 // while still detecting timeouts quickly on low-latency paths.
 func (c *Conn) retransmitLoop() {
-	timer := time.NewTimer(retransmitTick)
-	defer timer.Stop()
+	// Borrow a pooled timer instead of time.NewTimer to avoid one heap
+	// allocation per connection start/reconnect. putPacerTimer stops and
+	// drains the timer before returning it to the pool, so concurrent
+	// ctx.Done() + timer fire races are handled correctly.
+	timer := getPacerTimer(retransmitTick)
+	defer putPacerTimer(timer)
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -810,6 +814,8 @@ func (c *Conn) retransmitLoop() {
 			if interval > 200*time.Millisecond {
 				interval = 200 * time.Millisecond
 			}
+			// Safe: timer.C was just drained (we read from it), so Reset
+			// does not need a preceding Stop (Go timer contract).
 			timer.Reset(interval)
 		}
 	}

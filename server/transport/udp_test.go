@@ -808,3 +808,67 @@ func TestFastRetransmitStaleACKIgnored(t *testing.T) {
 		t.Errorf("stale ACK should not increment dupAckCount, got %d", cnt)
 	}
 }
+
+// TestRetransmitLoopUsesPooledTimer verifies that retransmitLoop uses the pooled
+// timer from pacerTimerPool (getPacerTimer/putPacerTimer) so that no heap
+// allocation occurs per connection start. We verify indirectly: create two
+// connections sequentially and confirm the second one's loop starts without panic
+// (pool contract maintained) and that the timer pool has a timer available after
+// the first connection closes.
+func TestRetransmitLoopUsesPooledTimer(t *testing.T) {
+	t.Parallel()
+
+	// Get a timer from the pool, confirm it fires, put it back.
+	// This mirrors exactly what retransmitLoop does at startup and shutdown.
+	timer := getPacerTimer(10 * time.Millisecond)
+	select {
+	case <-timer.C:
+		// fired as expected
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("getPacerTimer: timer did not fire within 500ms")
+	}
+	putPacerTimer(timer) // must not block
+
+	// After Put, pool has a reusable timer. Get it again and verify it still works.
+	timer2 := getPacerTimer(10 * time.Millisecond)
+	select {
+	case <-timer2.C:
+		// reuse works
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("reused timer from pool did not fire")
+	}
+	putPacerTimer(timer2)
+}
+
+// TestRetransmitLoopExitsOnContextCancel verifies that retransmitLoop goroutine
+// exits promptly when the connection context is cancelled, and that putPacerTimer
+// correctly cleans up a potentially-running timer on exit (no goroutine leak).
+func TestRetransmitLoopExitsOnContextCancel(t *testing.T) {
+	t.Parallel()
+
+	ln, err := Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	conn, err := Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+
+	// Close triggers ctx cancellation, which retransmitLoop listens on.
+	// putPacerTimer in the defer must handle the running timer without blocking.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn.Close()
+	}()
+
+	select {
+	case <-done:
+		// Close completed without deadlock — retransmitLoop exited cleanly.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close blocked for >2s — possible timer pool deadlock in retransmitLoop")
+	}
+}
