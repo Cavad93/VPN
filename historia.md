@@ -3950,3 +3950,65 @@ return err
 
 1. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps. Требует живого сервера с нагрузкой.
 2. **relay done-channel pool** — `make(chan struct{}, 2)` в `relayOne` — одна аллокация per TCP connection; мог бы использовать `sync.Pool` для канала.
+
+---
+
+## Запуск 57 — 2026-04-24
+
+### Выполнено: BBR pacer интеграция — `WaitForPacing` в `writePacket`
+
+**Файлы:** `server/transport/bbr_state.go`, `server/transport/udp.go`, `server/transport/bbr_pacer_test.go`
+
+**Проблема:**
+
+Начиная с Run 52, `bbr_pacer.go` использует `pacerTimerPool` и реализует полный token-bucket паузер с `WaitForSlotCtx`. Паузер вызывается внутри BBR state machine (`SetRate` при каждом ACK), но никогда не вызывался в горячем пути отправки данных — пакеты отправлялись сразу как открывался cwnd, без ограничения по времени.
+
+**Без паузинга (до этого запуска):**
+- DATA пакеты burst'уются в сеть сразу после открытия cwnd
+- Router queue заполняется N=32 пакетами → queuing delay ~1.2 мс при 30 Mbps
+- RTT измерение: base_RTT + queuing delay → BtlBw estimate занижен
+- cwnd (= BDP = BtlBw × RTT) → ограничен заниженным BtlBw → throughput ниже реального
+
+**Решение:**
+
+1. **`BBRState.WaitForPacing(ctx, size)`** в `bbr_state.go`:
+   ```go
+   func (s *BBRState) WaitForPacing(ctx context.Context, size int) error {
+       return s.pacer.WaitForSlotCtx(ctx, size)
+   }
+   ```
+
+2. **`writePacket`** — паузинг перед `sendMu.Lock()`:
+   ```go
+   if pktType == PacketTypeData && len(payload) > 0 {
+       if err := c.bbr.WaitForPacing(c.ctx, len(payload)+HeaderSize); err != nil {
+           return errors.New("transport: connection closed")
+       }
+   }
+   c.sendMu.Lock()
+   // ... прежняя логика
+   ```
+
+**Ключевые детали:**
+- Только DATA пакеты: SYN/FIN не паузируются (управляющие, должны быть немедленными)
+- Retransmits не паузируются: `doRetransmit` вызывает `conn.WriteToUDP` напрямую (RTO-driven)
+- rate=0 (Startup): `WaitForSlotCtx` возвращает немедленно — burst-probe в Startup не ограничивается
+- Timer pool (из Run 52): `WaitForSlotCtx` использует `getPacerTimer/putPacerTimer` — 0 аллокаций на congested path
+- Пауза вне sendMu: горутина не блокирует другие операции над Conn во время ожидания паузера
+
+**Тесты (4 новых):**
+- `TestBBRStateWaitForPacingUnlimited` — 100 вызовов при rate=0 < 5 мс
+- `TestBBRStateWaitForPacingThrottles` — при конечном rate, второй вызов ждёт >20µs
+- `TestBBRStateWaitForPacingContextCancel` — контекст отменяет ожидание за 10 мс
+- `TestWritePacketPacingBypassedForNonData` — FIN завершается <200 мс при rate=1 B/s
+
+**Результат:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Следующие задачи (приоритетный бэклог)
+
+1. **relay done-channel pool** — `make(chan struct{}, 2)` в `relayOne` — одна аллокация per TCP connection.
+2. **pprof анализ под нагрузкой** — инфраструктура добавлена (Run 24). Требует живого сервера.
+3. **IPv6 ECN propagation** — `markECNCE` только IPv4.
+

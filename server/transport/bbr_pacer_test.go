@@ -274,3 +274,117 @@ func TestPacerTimerPoolZeroAllocs(t *testing.T) {
 		t.Fatalf("fast path (no wait): expected 0 allocs, got %.0f", allocs)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// BBRState.WaitForPacing integration tests
+// ---------------------------------------------------------------------------
+
+// TestBBRStateWaitForPacingUnlimited verifies that WaitForPacing is a no-op
+// when the pacer rate is 0 (unlimited — default during Startup probe).
+func TestBBRStateWaitForPacingUnlimited(t *testing.T) {
+	est := newBBREstimator()
+	ifl := newInflightTracker()
+	p := newPacer(0, bbrMaxBurst) // unlimited: rate=0
+	bbr := NewBBRState(est, ifl, p, MaxPayloadSize)
+
+	start := time.Now()
+	for i := 0; i < 100; i++ {
+		if err := bbr.WaitForPacing(context.Background(), MaxPayloadSize); err != nil {
+			t.Fatalf("WaitForPacing returned error: %v", err)
+		}
+	}
+	elapsed := time.Since(start)
+
+	// 100 calls with unlimited rate must complete in well under 5ms.
+	if elapsed > 5*time.Millisecond {
+		t.Fatalf("unlimited WaitForPacing too slow: %v for 100 calls", elapsed)
+	}
+}
+
+// TestBBRStateWaitForPacingThrottles verifies that WaitForPacing slows down
+// sends once the pacer has a finite rate.
+func TestBBRStateWaitForPacingThrottles(t *testing.T) {
+	est := newBBREstimator()
+	ifl := newInflightTracker()
+	// Rate = 14 MB/s → inter-packet gap ~100µs for 1430-byte packets.
+	// Burst = 1 packet so the first send is immediate, subsequent ones wait.
+	p := newPacer(14_000_000, MaxPayloadSize)
+	bbr := NewBBRState(est, ifl, p, MaxPayloadSize)
+
+	// Consume burst.
+	if err := bbr.WaitForPacing(context.Background(), MaxPayloadSize); err != nil {
+		t.Fatal(err)
+	}
+
+	// Next call must wait (no remaining burst tokens).
+	start := time.Now()
+	if err := bbr.WaitForPacing(context.Background(), MaxPayloadSize); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed < 20*time.Microsecond {
+		t.Fatalf("WaitForPacing did not throttle: returned in %v (expected >20µs)", elapsed)
+	}
+}
+
+// TestBBRStateWaitForPacingContextCancel verifies that WaitForPacing respects
+// context cancellation instead of blocking indefinitely.
+func TestBBRStateWaitForPacingContextCancel(t *testing.T) {
+	est := newBBREstimator()
+	ifl := newInflightTracker()
+	// Very slow rate: 1 B/s → would wait ~1430 seconds for one packet.
+	// We cancel the context after 10ms to verify early exit.
+	p := newPacer(1, MaxPayloadSize) // 1 B/s
+	bbr := NewBBRState(est, ifl, p, MaxPayloadSize)
+
+	// Exhaust the burst so the next call actually has to wait.
+	_ = bbr.WaitForPacing(context.Background(), MaxPayloadSize)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := bbr.WaitForPacing(ctx, MaxPayloadSize)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("WaitForPacing should have returned an error on context cancel")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("WaitForPacing ignored context cancel: blocked for %v", elapsed)
+	}
+}
+
+// TestWritePacketPacingBypassedForNonData verifies that FIN packets are NOT
+// paced — they bypass the pacer and must not be delayed even with rate=1 B/s.
+func TestWritePacketPacingBypassedForNonData(t *testing.T) {
+	ln, err := Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	dialConn, err := Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer dialConn.Close()
+
+	// Override the pacer with an extremely slow rate: 1 B/s.
+	// DATA packets would wait ~1430 seconds, but FIN (non-DATA) should not.
+	dialConn.bbr.pacer.SetRate(1) // 1 B/s
+	dialConn.bbr.pacer.mu.Lock()
+	dialConn.bbr.pacer.tokens = 0 // drain the burst
+	dialConn.bbr.pacer.mu.Unlock()
+
+	// Close() sends a FIN packet — this must complete quickly despite rate=1 B/s.
+	start := time.Now()
+	dialConn.Close()
+	elapsed := time.Since(start)
+
+	// FIN (non-DATA) must not be throttled by the pacer.
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("Close/FIN was paced (should not be): took %v", elapsed)
+	}
+}

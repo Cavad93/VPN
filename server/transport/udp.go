@@ -380,10 +380,33 @@ var sendBufPool = sync.Pool{
 }
 
 // writePacket sends one packet and registers it for ACK tracking.
-// Blocks if BBR's congestion window is full. Flow control is done entirely
-// through cwnd — no per-packet pacing sleep (time.Sleep has ~1ms granularity
-// in Go, which caps throughput at ~11 Mbps with 1400-byte packets).
+// Blocks if BBR's congestion window is full.
+//
+// BBR pacing is enforced BEFORE acquiring sendMu: for DATA packets the
+// BBR token-bucket pacer controls the inter-packet gap, spreading sends
+// evenly over time (RFC 9002 §7.7). This prevents burst fills of router
+// buffers that inflate RTT measurements and corrupt BtlBw estimates.
+//
+// Pacing uses a pooled time.Timer (getPacerTimer/putPacerTimer) which is
+// cancellable via ctx and achieves ~100µs precision on Linux HRTIMERS —
+// sufficient for pacing at 30+ Mbps with 1430-byte packets (inter-packet
+// gap ~380µs).
+//
+// Retransmits bypass pacing (doRetransmit calls conn.WriteToUDP directly)
+// because retransmit timing is RTO-driven, not pacing-driven.
+// SYN and FIN packets are not paced; they are single control packets.
 func (c *Conn) writePacket(pktType uint8, payload []byte) error {
+	// Pace DATA packets before entering the critical section.
+	// WaitForPacing is a no-op when pacer rate == 0 (unlimited, during
+	// Startup probe before the first BtlBw estimate). After the first ACK
+	// batch arrives, BBRState.OnACK calls pacer.SetRate(pacingRate) and
+	// subsequent DATA sends are spread evenly at the BBR pacing rate.
+	if pktType == PacketTypeData && len(payload) > 0 {
+		if err := c.bbr.WaitForPacing(c.ctx, len(payload)+HeaderSize); err != nil {
+			return errors.New("transport: connection closed")
+		}
+	}
+
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 

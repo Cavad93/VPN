@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -476,4 +477,18 @@ func (s *BBRState) Reset() {
 	s.estimator.Reset()
 	s.inflight.Reset()
 	s.pacer.Reset()
+}
+
+// WaitForPacing blocks until the BBR pacer allows sending size bytes.
+// Must be called BEFORE acquiring any send-side mutex to avoid holding
+// a lock during the sleep. Returns ctx.Err() if the context is cancelled.
+//
+// No-op when the pacing rate is 0 (unlimited), which is the default during
+// the initial Startup probe before the first BtlBw estimate is available.
+//
+// The pacer uses a token-bucket model seeded with bbrMaxBurst bytes so that
+// the first burst (up to 10 × MTU) is always immediate. Subsequent sends
+// are rate-limited to the current BBR pacing rate once it is known.
+func (s *BBRState) WaitForPacing(ctx context.Context, size int) error {
+	return s.pacer.WaitForSlotCtx(ctx, size)
 }
