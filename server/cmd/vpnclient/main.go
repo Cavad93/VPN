@@ -194,6 +194,14 @@ type vpnSession struct {
 	origGW       string              // original default gateway, computed once
 	tun          *tunDevice
 	transport    string // "tcp" or "udp"
+
+	// bbrSeedBW and bbrSeedRTT control optional BBR bandwidth seeding for the
+	// UDP transport. When both are non-zero, SetInitialBandwidth is called to
+	// skip BBR Startup and begin at the specified operating point. When either
+	// is zero (the default), BBR Startup probes bandwidth organically —
+	// adapting to any path without a hardcoded prior.
+	bbrSeedBW  int // Mbps (0 = use Startup)
+	bbrSeedRTT int // milliseconds (0 = use Startup)
 }
 
 // connect performs the full connection sequence: TCP → obfs → Noise → mux → IP
@@ -361,8 +369,16 @@ func (vs *vpnSession) connectUDP() (
 	}
 	cleanupConn := func() { udpConn.Close() }
 
-	// Seed BBR with 15 Mbps @ estimated 65ms RTT — skip slow Startup phase.
-	udpConn.SetInitialBandwidth(15_000_000/8, 65*time.Millisecond)
+	// Apply BBR seed only when the operator provides explicit values via flags.
+	// Default (0/0) lets BBR Startup discover the real bandwidth organically,
+	// which adapts to any path and avoids the ProbeBW plateau at a hardcoded
+	// rate (see Run 58 in historia.md for the full analysis of why the previous
+	// 15 Mbps hardcode was harmful on slower routes and sub-optimal on faster ones).
+	if vs.bbrSeedBW > 0 && vs.bbrSeedRTT > 0 {
+		bwBytesPerSec := int64(vs.bbrSeedBW) * 1_000_000 / 8
+		rtt := time.Duration(vs.bbrSeedRTT) * time.Millisecond
+		udpConn.SetInitialBandwidth(bwBytesPerSec, rtt)
+	}
 
 	// 2. TLS obfuscation handshake over UDP (with optional port-knock).
 	log.Info("starting obfs handshake (UDP)")
@@ -664,6 +680,8 @@ func run() error {
 	knockKeyHex := flag.String("knock-key", "", "hex-encoded 32-byte PSK for relay port knocking (must match relay's -knock-key)")
 	bonds := flag.Int("bonds", numBondConns, "number of parallel TCP connections (more = faster on lossy high-RTT paths)")
 	transportFlag := flag.String("transport", "udp", "transport protocol: tcp or udp (udp uses BBR congestion control)")
+	bbrSeedBW  := flag.Int("bbr-seed-bw", 0, "BBR initial bandwidth seed in Mbps for UDP transport (0 = use BBR Startup; set to your bottleneck bandwidth for faster ramp-up on known paths, e.g. 6 for SPb→Astana)")
+	bbrSeedRTT := flag.Int("bbr-seed-rtt", 0, "BBR initial RTT seed in milliseconds for UDP transport (0 = use BBR Startup; set to your path RTT for faster ramp-up, e.g. 78 for SPb→Astana)")
 	flag.Parse()
 
 	if *transportFlag != "tcp" && *transportFlag != "udp" {
@@ -721,6 +739,8 @@ func run() error {
 		origGW:       origGW,
 		tun:          tun,
 		transport:    *transportFlag,
+		bbrSeedBW:    *bbrSeedBW,
+		bbrSeedRTT:   *bbrSeedRTT,
 	}
 
 	// Top-level context: Ctrl+C or SIGTERM cancels everything.

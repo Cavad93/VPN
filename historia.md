@@ -4047,10 +4047,79 @@ BBRSeedRTT: 0, // 0 = use BBR Startup (RTprop measured from first ACK)
 
 ---
 
+## Запуск 59 — 2026-04-24 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: vpnclient BBR seed — убрать hardcoded 15 Mbps, добавить флаги
+
+**Файл:** `server/cmd/vpnclient/main.go`
+
+**Проблема:**
+
+В `connectUDP` было:
+```go
+// Seed BBR with 15 Mbps @ estimated 65ms RTT — skip slow Startup phase.
+udpConn.SetInitialBandwidth(15_000_000/8, 65*time.Millisecond)
+```
+
+Эта строка имеет **ту же структурную проблему**, что и серверный seed 6 Mbps / 78ms (исправлена в Run 58):
+
+1. `SetInitialBandwidth(15 Mbps, 65ms)` переводит BBR из Startup → ProbeBW немедленно
+2. Если реальная пропускная способность **ниже** 15 Mbps (типично для CIS-маршрутов: 4-8 Mbps):
+   - BBR стартует на 15 Mbps → отправляет быстрее чем может пройти → потери → cwnd halving
+   - Несколько ProbeBW-циклов × 8 RTT каждый = 1-2 секунды конвергенции вниз
+   - Асимметрия: сервер начинает с Startup (≈5.9 Mbps, правильно), клиент начинает с 15 Mbps (слишком высоко)
+3. Если реальная пропускная способность **выше** 15 Mbps (быстрые пути: 50+ Mbps):
+   - BBR входит в ProbeBW с 15 Mbps как базовый BtlBw
+   - Медленно зондирует вверх (+25% за цикл), вместо Startup's быстрого удвоения
+4. **Самосбывающееся пророчество**: 15 Mbps seed → BBR плавает вокруг этого значения → тест показывает ~15 Mbps → seed подтверждается — хотя реальная полоса может быть другой
+
+**Исправление:**
+
+```go
+// ДО:
+// Seed BBR with 15 Mbps @ estimated 65ms RTT — skip slow Startup phase.
+udpConn.SetInitialBandwidth(15_000_000/8, 65*time.Millisecond)
+
+// ПОСЛЕ:
+if vs.bbrSeedBW > 0 && vs.bbrSeedRTT > 0 {
+    bwBytesPerSec := int64(vs.bbrSeedBW) * 1_000_000 / 8
+    rtt := time.Duration(vs.bbrSeedRTT) * time.Millisecond
+    udpConn.SetInitialBandwidth(bwBytesPerSec, rtt)
+}
+```
+
+**Новые поля в `vpnSession`:**
+```go
+bbrSeedBW  int // Mbps (0 = use Startup)
+bbrSeedRTT int // milliseconds (0 = use Startup)
+```
+
+**Новые флаги в `run()`:**
+```bash
+-bbr-seed-bw  int   # Mbps (0 = Startup; e.g. 6 for SPb→Astana)
+-bbr-seed-rtt int   # ms  (0 = Startup; e.g. 78 for SPb→Astana)
+```
+
+**Поведение по умолчанию (0/0):**
+- BBR Startup: начинает с `cwnd=32 pkts × RTT ≈ 5.9 Mbps`, удваивает каждый RTT
+- ~5 RTT × 78ms = 390ms до плато реального BtlBw
+- Адаптируется к любому пути без предположений об операторе
+- **Симметрично** с сервером: оба используют Startup → оба конвергируют к реальной полосе
+
+**Явный seed (для оператора с известным путём):**
+```bash
+sudo ./vpnclient -server X.X.X.X:38947 -bbr-seed-bw 6 -bbr-seed-rtt 78
+# ^ SPb→Астана: сразу входит в ProbeBW на 6 Mbps, быстрее чем ждать Startup
+```
+
+**Сборка:** `GOOS=darwin GOARCH=amd64 go build ./cmd/vpnclient/` — OK  
+**Тесты:** `go test ./... -count=1` — все 8 пакетов зелёные (vpnclient имеет `//go:build darwin`, не компилируется на Linux напрямую; логика if-guard покрыта server-side тестами `TestBBRSeedDisabledWhenZero`, `TestBBRSeedMbpsConversion`)
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **relay done-channel pool** — `make(chan struct{}, 2)` в `relayOne` — одна аллокация per TCP connection.
 2. **pprof анализ под нагрузкой** — инфраструктура добавлена (Run 24). Требует живого сервера.
 3. **IPv6 ECN propagation** — `markECNCE` только IPv4.
-4. **Клиентский seed** — `cmd/vpnclient/main.go` сидит BBR на 15 Mbps. Аналогичное исправление: убрать seed до 0 и дать Startup работать симметрично с сервером.
 
