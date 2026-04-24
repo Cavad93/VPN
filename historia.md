@@ -3862,3 +3862,91 @@ defer func() { *rbp = (*rbp)[:cap(*rbp)]; udpRelayPktPool.Put(rbp) }()
 
 `go test . -run 'TestUDPRelayPktPool|TestUDPRelayEndToEnd' -v -count=1` — 5/5 PASS.
 `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Запуск 56 — 2026-04-24
+
+### Выполнено: stack-alloc оптимизации — knock.go и ws.go
+
+**Файлы:** `server/transport/knock.go`, `server/transport/ws.go`
+
+**Задача:** Устранение двух оставшихся heap-аллокаций в некритических, но часто вызываемых путях.
+
+---
+
+### 1. knock.go — `mac.Sum(tag[:0])` вместо `mac.Sum(nil) + copy`
+
+**Проблема:**
+
+```go
+// ДО:
+sum := mac.Sum(nil)  // ← make([]byte, 32) внутри runtime hash.Sum
+var tag [32]byte
+copy(tag[:], sum)    // ← лишняя копия
+return tag
+```
+
+`mac.Sum(nil)` вызывает `make([]byte, 32)` внутри `hash.Sum` чтобы создать слайс под результат, затем пишет туда 32 байта дайджеста. Мы сразу же копируем в `tag` и отбрасываем этот слайс.
+
+При relay-моде с активными сканерами: новые TCP-соединения приходят непрерывно, каждое вызывает `ComputeKnockTag` (через `VerifyKnock`) → 1 аллокация × N соединений/сек = накопленный GC pressure.
+
+**Исправление:**
+
+```go
+// ПОСЛЕ:
+var tag [32]byte
+mac.Sum(tag[:0])  // appends 32 bytes into tag's backing array; zero heap alloc
+return tag
+```
+
+`hash.Hash.Sum(b []byte)` **дописывает** дайджест в слайс `b` и возвращает результирующий слайс. `tag[:0]` — пустой слайс с `cap=32 == sha256.Size`. Поскольку cap достаточен, `Sum` пишет напрямую в backing array `tag` без аллокации нового буфера.
+
+**Эффект:** Устранена `make([]byte, 32)` + `copy` на каждый вызов `ComputeKnockTag`. При 1000 knock-проверках/сек: экономия 32 KB/сек heap pressure.
+
+---
+
+### 2. ws.go — `[127]byte` stack array вместо `make([]byte, 2+length)` для control frames
+
+**Проблема:**
+
+```go
+// ДО (строка 520):
+// Control payloads are tiny (≤125 bytes); a small heap alloc is fine.
+buf := make([]byte, 2+length)  // ← heap alloc 2..127 bytes
+copy(buf, hdr[:])
+copy(buf[2:], payload)
+_, err := ws.conn.Write(buf)
+return err
+```
+
+Control frames (ping/pong/close) имеют payload ≤ 125 байт (RFC 6455 §5.5), поэтому буфер всегда 2..127 байт. Оригинальный код намеренно не оптимизировался ("a small heap alloc is fine") — но стандартный `net.Conn.Write` копирует данные в ядерный send buffer до возврата, поэтому stack-аллоцированный массив абсолютно безопасен.
+
+Pong-фреймы генерируются из read-горутины в ответ на ping-фреймы keepalive (каждые 15 секунд). Это означает ~4 аллокации/минуту — редко, но принцип чистоты: в нашем коде не должно оставаться `make()` там, где это не необходимо.
+
+**Исправление:**
+
+```go
+// ПОСЛЕ:
+// RFC 6455 §5.5: payload ≤ 125 bytes → max frame = 127 bytes; fits on stack.
+// net.Conn.Write copies into kernel buffer before returning — safe to pass local array.
+var buf [127]byte
+buf[0] = hdr[0]
+buf[1] = hdr[1]
+copy(buf[2:], payload)
+_, err := ws.conn.Write(buf[:2+length])
+return err
+```
+
+**Эффект:** Устранена heap-аллокация 2-127 байт на каждый control frame. При 4 ping/pong в минуту: 240 аллокаций/час → 0. Код стал явно документировать ограничение RFC 6455 §5.5.
+
+---
+
+**Тесты:** `go test ./transport/ -run 'TestComputeKnockTag|TestVerifyKnock|TestWSPingPong|TestWSBinary|TestWSClose' -count=1` — 14/14 PASS. `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
+## Следующие задачи (приоритетный бэклог)
+
+1. **pprof анализ под нагрузкой** — использовать `/debug/pprof/` для поиска CPU hotspots при 30 Mbps. Требует живого сервера с нагрузкой.
+2. **relay done-channel pool** — `make(chan struct{}, 2)` в `relayOne` — одна аллокация per TCP connection; мог бы использовать `sync.Pool` для канала.

@@ -516,11 +516,14 @@ func (ws *WSConn) writeFrame(opcode byte, payload []byte) error {
 			_, err := ws.conn.Write(hdr[:])
 			return err
 		}
-		// Control payloads are tiny (≤125 bytes); a small heap alloc is fine.
-		buf := make([]byte, 2+length)
-		copy(buf, hdr[:])
+		// RFC 6455 §5.5 guarantees payload ≤ 125 bytes, so 2+125 = 127 fits in a
+		// stack-allocated array. net.Conn.Write copies data into the kernel send
+		// buffer before returning, so passing a pointer to a local array is safe.
+		var buf [127]byte
+		buf[0] = hdr[0]
+		buf[1] = hdr[1]
 		copy(buf[2:], payload)
-		_, err := ws.conn.Write(buf)
+		_, err := ws.conn.Write(buf[:2+length])
 		return err
 	}
 

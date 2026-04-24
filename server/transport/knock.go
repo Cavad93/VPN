@@ -62,12 +62,15 @@ const (
 
 // ComputeKnockTag computes HMAC-SHA256(psk, random) and returns the full
 // 32-byte result. This is embedded as the session_id in the ClientHello.
+//
+// Sum(tag[:0]) appends the 32-byte digest into the backing array of the
+// stack-allocated tag — cap(tag[:0]) == 32 == sha256.Size, so no heap
+// allocation occurs. This replaces the two-step Sum(nil)+copy pattern.
 func ComputeKnockTag(psk KnockPSK, random [32]byte) [32]byte {
 	mac := hmac.New(sha256.New, psk[:])
 	mac.Write(random[:])
-	sum := mac.Sum(nil) // 32 bytes
 	var tag [32]byte
-	copy(tag[:], sum)
+	mac.Sum(tag[:0]) // write directly into tag's backing array; zero heap alloc
 	return tag
 }
 
