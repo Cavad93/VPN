@@ -4006,9 +4006,51 @@ return err
 
 ---
 
+## Запуск 58 — 2026-04-24
+
+### Выполнено: BBR seed default → 0 — Startup по умолчанию (устранение потолка download)
+
+**Файлы:** `server/main.go`, `server/main_test.go`
+
+**Контекст:**
+
+`DefaultConfig()` содержал `BBRSeedBW: 6, BBRSeedRTT: 78` — жёсткие дефолты основанные на одном измерении пути СПб→Астана. В Run 57 в `writePacket` был интегрирован BBR pacer (`WaitForPacing`), что сделало BBR Startup полностью корректным: теперь пакеты отправляются с правильным темпом, а не burst'ами.
+
+**Проблема с дефолтом 6 Mbps:**
+
+1. `SetInitialBandwidth(750000 bytes/sec, 78ms)` переводит BBR в **ProbeBW с cycleIndex=2 (cruise)** — первые **6 × 78ms = 468 мс** BBR идёт на круизной скорости 6 Mbps, не зондируя.
+2. Каждый полный ProbeBW-цикл занимает 8 × RTT ≈ 624 мс и увеличивает BtlBw на ~25%. От 6 Mbps до 10 Mbps = 2-3 цикла = 1.5-2 секунды. В коротких тестах download фиксировался именно на 6 Mbps.
+3. **Самосбывающееся пророчество**: seed = измеренный результат → BBR стартует с этого → тесты показывают это → снова используется как seed.
+4. **Структурная асимметрия**: клиентский Go-VPN сидит на 15 Mbps → быстро падает до реальной полосы через Loss. Сервер сидит на 6 Mbps → медленно поднимается через ProbeBW.
+
+**Исправление:**
+
+```go
+// DefaultConfig():
+BBRSeedBW:  0, // 0 = use BBR Startup (discovers real BW automatically)
+BBRSeedRTT: 0, // 0 = use BBR Startup (RTprop measured from first ACK)
+```
+
+С паузером в `writePacket` (Run 57), BBR Startup теперь работает правильно:
+- Начальный cwnd = `minCwndPackets = 32` → при RTT≈78ms начальная скорость ≈ **5.9 Mbps** (близко к прежнему seed)
+- Startup удваивает pacingRate каждый RTT до плато BtlBw (~5 RTT = 390 мс)
+- Drain → ProbeBW с **реальным BtlBw**, а не hardcoded значением
+- Работает для любого пути: LAN, domestic, international
+
+Оператор может по-прежнему указать seed через `-bbr-seed-bw 6 -bbr-seed-rtt 78` если хочет ускорить старт на известном пути.
+
+**Тесты обновлены:**
+- `TestBBRSeedDefaults`: ожидает `0/0` вместо `6/78`
+- `TestBBRSeedAppliedOnUDPConn`: явно выставляет `cfg.BBRSeedBW=6, cfg.BBRSeedRTT=78` вместо reliance на дефолт
+
+**Результат:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **relay done-channel pool** — `make(chan struct{}, 2)` в `relayOne` — одна аллокация per TCP connection.
 2. **pprof анализ под нагрузкой** — инфраструктура добавлена (Run 24). Требует живого сервера.
 3. **IPv6 ECN propagation** — `markECNCE` только IPv4.
+4. **Клиентский seed** — `cmd/vpnclient/main.go` сидит BBR на 15 Mbps. Аналогичное исправление: убрать seed до 0 и дать Startup работать симметрично с сервером.
 

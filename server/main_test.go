@@ -3254,16 +3254,17 @@ func TestUDPNetConnCongested(t *testing.T) {
 // TestBBRSeedConfig — configurable BBR initial bandwidth seed
 // ---------------------------------------------------------------------------
 
-// TestBBRSeedDefaults verifies that DefaultConfig has the expected seed values
-// for the standard SPb→Astana deployment path.
+// TestBBRSeedDefaults verifies that DefaultConfig has seed=0 (BBR Startup).
+// With pacer integrated in writePacket (Run 57), Startup accurately discovers
+// the true bottleneck bandwidth in ~5 RTTs without a hardcoded seed value.
 func TestBBRSeedDefaults(t *testing.T) {
 	t.Parallel()
 	cfg := DefaultConfig()
-	if cfg.BBRSeedBW != 6 {
-		t.Errorf("BBRSeedBW default: got %d, want 6 (Mbps)", cfg.BBRSeedBW)
+	if cfg.BBRSeedBW != 0 {
+		t.Errorf("BBRSeedBW default: got %d, want 0 (use BBR Startup)", cfg.BBRSeedBW)
 	}
-	if cfg.BBRSeedRTT != 78 {
-		t.Errorf("BBRSeedRTT default: got %d, want 78 (ms)", cfg.BBRSeedRTT)
+	if cfg.BBRSeedRTT != 0 {
+		t.Errorf("BBRSeedRTT default: got %d, want 0 (use BBR Startup)", cfg.BBRSeedRTT)
 	}
 }
 
@@ -3333,8 +3334,11 @@ func TestBBRSeedAppliedOnUDPConn(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Apply seed as runUDP would when BBRSeedBW=6, BBRSeedRTT=78.
-	cfg := DefaultConfig() // BBRSeedBW=6, BBRSeedRTT=78
+	// Default config has BBRSeedBW=0 (Startup), so the seed is NOT applied.
+	// Explicitly set a non-zero seed to exercise SetInitialBandwidth code path.
+	cfg := DefaultConfig()
+	cfg.BBRSeedBW = 6  // SPb→Astana example
+	cfg.BBRSeedRTT = 78
 	if cfg.BBRSeedBW > 0 && cfg.BBRSeedRTT > 0 {
 		bwBytesPerSec := int64(cfg.BBRSeedBW) * 1_000_000 / 8
 		rtt := time.Duration(cfg.BBRSeedRTT) * time.Millisecond

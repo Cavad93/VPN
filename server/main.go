@@ -63,16 +63,17 @@ type Config struct {
 	AllowedKeysFile string // path to persist the allowed-keys list across restarts
 
 	// BBR initial bandwidth seed (UDP transport only).
-	// When both are non-zero, SetInitialBandwidth is called on each new
-	// UDP connection so BBR skips the slow Startup phase and jumps directly
-	// to ProbeBW. Zero values disable seeding (BBR runs its normal Startup).
+	// Default: 0/0 — BBR runs its normal Startup phase, which discovers the
+	// true bottleneck bandwidth in ~5 RTTs without any hardcoded assumptions.
 	//
-	// Set to the expected bottleneck bandwidth and RTT for your deployment:
-	//   -bbr-seed-bw 6 -bbr-seed-rtt 78   # SPb→Astana (6 Mbps, 78ms)
+	// Set to non-zero only when you want to skip Startup for a known path:
+	//   -bbr-seed-bw 6  -bbr-seed-rtt 78  # SPb→Astana (6 Mbps, 78ms)
 	//   -bbr-seed-bw 50 -bbr-seed-rtt 20  # domestic (50 Mbps, 20ms)
-	//   -bbr-seed-bw 0                     # disable — use BBR Startup
-	BBRSeedBW  int // bottleneck bandwidth in Mbps (0 = disabled)
-	BBRSeedRTT int // expected RTT in milliseconds (0 = disabled)
+	//
+	// WARNING: a wrong seed (too low) permanently slows convergence; Startup
+	// is the safer default and converges in <400ms on any path.
+	BBRSeedBW  int // bottleneck bandwidth in Mbps (0 = use Startup)
+	BBRSeedRTT int // expected RTT in milliseconds (0 = use Startup)
 }
 
 // DefaultConfig returns a Config populated with sensible defaults.
@@ -83,11 +84,17 @@ func DefaultConfig() Config {
 		PrivKeyFile:     "server_privkey.hex",
 		Transport:       "udp",
 		AllowedKeysFile: "allowed_keys.txt",
-		// Seed BBR at the typical international VPN path parameters.
-		// Avoids slow Startup (10+ RTTs) on reconnect for the common case.
-		// Override with -bbr-seed-bw / -bbr-seed-rtt for your deployment.
-		BBRSeedBW:  6,  // 6 Mbps — measured SPb→Astana bottleneck
-		BBRSeedRTT: 78, // 78ms  — measured SPb→Astana RTT
+		// BBR Startup discovers the true bottleneck bandwidth organically.
+		// With pacer now integrated in writePacket (Run 57), Startup is accurate:
+		//   - cwnd = minCwndPackets=32 → ~5.9 Mbps initial rate
+		//   - doubles each RTT until BtlBw plateaus (~5 RTTs ≈ 390ms)
+		//   - any path converges to its real bandwidth, not a hardcoded guess
+		//
+		// Use -bbr-seed-bw/-bbr-seed-rtt only when you need the fastest possible
+		// ramp-up and already know the exact path parameters (e.g. a fixed
+		// dedicated server with a well-measured RTT and bandwidth ceiling).
+		BBRSeedBW:  0, // 0 = use BBR Startup (discovers real BW automatically)
+		BBRSeedRTT: 0, // 0 = use BBR Startup (RTprop measured from first ACK)
 	}
 }
 
