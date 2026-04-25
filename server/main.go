@@ -268,8 +268,7 @@ type Server struct {
 	tun         TunDevice
 	pool        *ipPool
 	pool6       *ip6Pool // nil when Tun6CIDR is not configured
-	nextIDMu    sync.Mutex
-	nextID      uint64
+	nextID      atomic.Uint64
 	// notifSvc is optional; when set, push notifications are fired on
 	// session connect / disconnect events.
 	notifSvc *notify.NotificationService
@@ -299,7 +298,7 @@ func NewServer(cfg Config, kp *crypto.KeyPair, tun TunDevice, allowedKeys [][cry
 		sessions: make(map[uint64]*clientSession),
 		tun:      tun,
 		pool:     pool,
-		nextID:   1,
+		// nextID zero-value is 0; first Add(1) returns 1 — matches old nextID:1 init.
 	}
 
 	if cfg.Tun6CIDR != "" {
@@ -1271,12 +1270,9 @@ func (s *Server) isKeyAllowed(key [32]byte) bool {
 }
 
 // nextSessionID returns the next monotonically increasing session ID.
+// atomic.Add eliminates the mutex previously required here.
 func (s *Server) nextSessionID() uint64 {
-	s.nextIDMu.Lock()
-	defer s.nextIDMu.Unlock()
-	id := s.nextID
-	s.nextID++
-	return id
+	return s.nextID.Add(1)
 }
 
 // readHandshakeMsg reads a length-prefixed handshake message (2-byte big-endian length).

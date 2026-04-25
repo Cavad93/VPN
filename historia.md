@@ -4182,9 +4182,59 @@ relayChanPool.Put(done)  // channel is empty, safe to reuse
 
 ---
 
+## Запуск 61 — 2026-04-25 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: nextSessionID — atomic.Uint64 вместо sync.Mutex
+
+**Файл:** `server/main.go`
+
+**Проблема:**
+
+```go
+// ДО:
+nextIDMu    sync.Mutex
+nextID      uint64
+
+func (s *Server) nextSessionID() uint64 {
+    s.nextIDMu.Lock()
+    defer s.nextIDMu.Unlock()
+    id := s.nextID
+    s.nextID++
+    return id
+}
+```
+
+`nextSessionID()` вызывается один раз при установке каждой VPN-сессии. `sync.Mutex.Lock()` требует вызова runtime scheduler, сбрасывает CPU store buffer, и загрязняет lock-профиль pprof. Для монотонного счётчика, где нужен только `fetch-and-add`, mutex является излишним примитивом.
+
+**Исправление:**
+
+```go
+// ПОСЛЕ:
+nextID atomic.Uint64  // zero-value = 0; first Add(1) returns 1
+
+func (s *Server) nextSessionID() uint64 {
+    return s.nextID.Add(1)
+}
+```
+
+- `atomic.Uint64.Add(1)` = одна инструкция `LOCK XADD` (~3 нс vs ~20 нс mutex)
+- Убирает 2 mutex операции (Lock + Unlock) за вызов
+- Начальный ID = 1: первый `Add(1)` возвращает 1 (zero-value 0 + 1 = 1)
+- Поле `nextIDMu sync.Mutex` удалено из Server struct (-8 байт на объект)
+
+**Эффект:**
+- При 1000 reconnect/сек (100 клиентов × 10 reconnect/мин): ~2000 mutex op/сек → 0
+- Устранён единственный оставшийся `sync.Mutex` на пути установки сессии
+- Меньше lock-хэша в pprof → чище профиль при диагностике contention
+
+**Тесты:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. ~~**relay done-channel pool**~~ — **ВЫПОЛНЕНО** (Запуск 60)
 2. **pprof анализ под нагрузкой** — инфраструктура добавлена (Run 24). Требует живого сервера.
 3. ~~**IPv6 ECN propagation**~~ — **ВЫПОЛНЕНО** (ветка, commit 1b3283d)
+4. ~~**nextSessionID atomic**~~ — **ВЫПОЛНЕНО** (Запуск 61)
 
