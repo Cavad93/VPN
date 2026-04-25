@@ -4300,3 +4300,71 @@ func (s *Server) nextSessionID() uint64 {
 3. ~~**IPv6 ECN propagation**~~ — **ВЫПОЛНЕНО** (ветка, commit 1b3283d)
 4. ~~**nextSessionID atomic**~~ — **ВЫПОЛНЕНО** (Запуск 61)
 
+
+---
+
+## Запуск 62 — 2026-04-25 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: mmsgStatePool — pool sendmmsg/recvmmsg header arrays (0 alloc per batch op)
+
+**Файл:** `server/transport/batch_linux.go`
+
+**Проблема:**
+
+```go
+// ДО — flushPlatform:
+mmsghdrs  := make([]mmsghdr, n)               // ~4 096 байт
+iovecs    := make([]unix.Iovec, n)             // ~1 024 байт
+sockaddrs := make([]unix.RawSockaddrInet4, n)  // ~1 024 байт
+// итого ~6 144 байт heap на каждый flush
+
+// ДО — readPlatform:
+mmsghdrs  := make([]mmsghdr, n)
+iovecs    := make([]unix.Iovec, n)
+sockaddrs := make([]unix.RawSockaddrInet4, n)
+// итого ещё ~6 144 байт heap на каждый recv
+```
+
+При 30 Mbps, batch_size≈16: ~164 batch flush/sec + ~164 batch read/sec = **~2 MB/sec heap pressure** → GC stalls.
+
+**Исправление:**
+
+```go
+// mmsgState объединяет все три массива в один struct (пуловый элемент)
+type mmsgState struct {
+    hdrs  [maxBatchSize]mmsghdr
+    iovs  [maxBatchSize]unix.Iovec
+    addrs [maxBatchSize]unix.RawSockaddrInet4
+}
+
+var mmsgStatePool = sync.Pool{New: func() any { return new(mmsgState) }}
+
+// flushPlatform:
+state := mmsgStatePool.Get().(*mmsgState)
+mmsghdrs  := state.hdrs[:n]
+iovecs    := state.iovs[:n]
+sockaddrs := state.addrs[:n]
+// ... заполнение и sendmmsg ...
+mmsgStatePool.Put(state)  // после rawConn.Control — sync, безопасно
+
+// readPlatform:
+state := mmsgStatePool.Get().(*mmsgState)
+// ... заполнение и recvmmsg ...
+// results строятся до Put (net.IPv4 копирует байты, нет ссылок в state)
+mmsgStatePool.Put(state)
+```
+
+**Безопасность пула:**
+- `rawConn.Control(fn)` и `rawConn.Read(fn)` выполняют fn **синхронно** — горутина блокируется до возврата из kernel syscall
+- `Put` вызывается **после** возврата из Control/Read — состояние гарантированно не используется
+- results строятся **до** Put: `net.IPv4(a,b,c,d)` создаёт новый `[]byte{v4InV6Prefix..., a,b,c,d}`, никаких ссылок в state.addrs не остаётся
+- Ранний return при IPv6 в flushPlatform: сначала Put, затем return — утечки нет
+
+**Эффект:**
+- 0 heap alloc per batch op в steady state (pool hit rate ~100% при 1 горутине на flush/read)
+- Устранены ~2 MB/sec heap pressure при 30 Mbps → пропорционально меньше GC pauses
+- Размер pooled struct: `mmsgState` ≈ 6 144 байт; pool держит ≤ 1 экземпляр на GOMAXPROCS (CPU × 1 = минимум contention)
+- fast-path: одиночные пакеты (n==1) по-прежнему используют WriteToUDP / ReadFromUDP без pool overhead
+
+**Тесты:** `go test ./... -count=1` — все 8 пакетов зелёные.
+

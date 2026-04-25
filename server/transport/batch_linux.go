@@ -11,10 +11,40 @@ package transport
 
 import (
 	"net"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
+
+// mmsghdr matches the Linux mmsghdr struct for sendmmsg/recvmmsg.
+type mmsghdr struct {
+	Hdr unix.Msghdr
+	Len uint32
+}
+
+// mmsgState holds the fixed-size arrays required for sendmmsg/recvmmsg.
+// Using a pooled struct eliminates three make() calls (~6 KB total) per
+// batch flush/read call:
+//
+//   - [maxBatchSize]mmsghdr         ≈ 64 × 64 bytes = 4 096 bytes
+//   - [maxBatchSize]unix.Iovec      ≈ 64 × 16 bytes = 1 024 bytes
+//   - [maxBatchSize]RawSockaddrInet4 ≈ 64 × 16 bytes = 1 024 bytes
+//   - total                                          = 6 144 bytes
+//
+// At 30 Mbps with batch size 16: ~164 batch ops/sec × 6 KB ≈ 1 MB/sec
+// heap pressure → eliminated. The pool holds at most one item per goroutine
+// (flush and read are each single-goroutine paths), so contention is zero.
+type mmsgState struct {
+	hdrs  [maxBatchSize]mmsghdr
+	iovs  [maxBatchSize]unix.Iovec
+	addrs [maxBatchSize]unix.RawSockaddrInet4
+}
+
+// mmsgStatePool pools mmsgState objects to avoid per-batch heap allocation.
+// Safety: Control/Read run the closure synchronously (the goroutine blocks
+// until the syscall completes), so the state is never in use when Put is called.
+var mmsgStatePool = sync.Pool{New: func() any { return new(mmsgState) }}
 
 // flushPlatform sends all queued packets using sendmmsg(2) — one syscall
 // for up to 64 packets instead of 64 individual WriteToUDP calls.
@@ -37,16 +67,18 @@ func (w *batchWriter) flushPlatform() error {
 		return w.flushFallback()
 	}
 
-	// Build the mmsghdr array for sendmmsg.
-	mmsghdrs := make([]mmsghdr, n)
-	iovecs := make([]unix.Iovec, n)
-	sockaddrs := make([]unix.RawSockaddrInet4, n)
+	// Borrow pre-allocated header arrays from the pool — zero heap allocation.
+	state := mmsgStatePool.Get().(*mmsgState)
+	mmsghdrs := state.hdrs[:n]
+	iovecs := state.iovs[:n]
+	sockaddrs := state.addrs[:n]
 
 	for i, msg := range w.msgs {
 		// Build sockaddr_in for each destination.
 		ip4 := msg.addr.IP.To4()
 		if ip4 == nil {
-			// Skip non-IPv4 addresses, fall back for this batch.
+			// Return state before falling back to avoid a leak.
+			mmsgStatePool.Put(state)
 			return w.flushFallback()
 		}
 		sockaddrs[i].Family = unix.AF_INET
@@ -66,6 +98,7 @@ func (w *batchWriter) flushPlatform() error {
 	}
 
 	// Call sendmmsg via raw syscall.
+	// rawConn.Control blocks until the closure returns — state is valid throughout.
 	var sendErr error
 	err = rawConn.Control(func(fd uintptr) {
 		sent := 0
@@ -85,6 +118,8 @@ func (w *batchWriter) flushPlatform() error {
 			sent += int(r)
 		}
 	})
+	// Return state after Control completes — syscall is done, memory is safe to reuse.
+	mmsgStatePool.Put(state)
 	if err != nil {
 		return err
 	}
@@ -101,12 +136,6 @@ func (w *batchWriter) flushFallback() error {
 		}
 	}
 	return firstErr
-}
-
-// mmsghdr matches the Linux mmsghdr struct for sendmmsg/recvmmsg.
-type mmsghdr struct {
-	Hdr unix.Msghdr
-	Len uint32
 }
 
 // readPlatform reads multiple packets using recvmmsg(2) — one syscall
@@ -136,9 +165,11 @@ func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 		return []batchResult{{n: nn, addr: addr, buf: r.bufs[0][:nn]}}, 1, nil
 	}
 
-	mmsghdrs := make([]mmsghdr, n)
-	iovecs := make([]unix.Iovec, n)
-	sockaddrs := make([]unix.RawSockaddrInet4, n)
+	// Borrow pre-allocated header arrays from the pool — zero heap allocation.
+	state := mmsgStatePool.Get().(*mmsgState)
+	mmsghdrs := state.hdrs[:n]
+	iovecs := state.iovs[:n]
+	sockaddrs := state.addrs[:n]
 
 	for i := range mmsghdrs {
 		iovecs[i].Base = &r.bufs[i][0]
@@ -154,8 +185,9 @@ func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 	var recvErr error
 	// Use Read (blocking) to wait for at least one packet, then recvmmsg
 	// picks up any additional packets that arrived.
+	// rawConn.Read blocks until the closure returns — state is valid throughout.
 	err = rawConn.Read(func(fd uintptr) bool {
-		r, _, errno := unix.Syscall6(
+		rv, _, errno := unix.Syscall6(
 			unix.SYS_RECVMMSG,
 			fd,
 			uintptr(unsafe.Pointer(&mmsghdrs[0])),
@@ -170,17 +202,12 @@ func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 			recvErr = errno
 			return true
 		}
-		count = int(r)
+		count = int(rv)
 		return true
 	})
-	if err != nil {
-		return nil, 0, err
-	}
-	if recvErr != nil {
-		return nil, 0, recvErr
-	}
 
-	// Convert raw sockaddrs to net.UDPAddr.
+	// Build results from raw sockaddrs — all data is copied out of state
+	// before we return the state to the pool.
 	results := make([]batchResult, count)
 	for i := 0; i < count; i++ {
 		sa := &sockaddrs[i]
@@ -190,6 +217,15 @@ func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 			addr: &net.UDPAddr{IP: net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3]), Port: port},
 			buf:  r.bufs[i][:mmsghdrs[i].Len],
 		}
+	}
+	// Return state now: results contain no references into state arrays.
+	mmsgStatePool.Put(state)
+
+	if err != nil {
+		return nil, 0, err
+	}
+	if recvErr != nil {
+		return nil, 0, recvErr
 	}
 	return results, count, nil
 }
