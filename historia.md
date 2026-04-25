@@ -1465,11 +1465,46 @@ TC[1:0] = ECN field → byte[1] bits[5:4]
 
 ---
 
+## Запуск 28 — 2026-04-25 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: TestStreamBondNextWithCount — тест lock-free nextWithCount() оптимизации
+
+**Файлы:** `server/main_test.go`
+
+**Контекст:**
+
+При анализе текущей ветки обнаружено, что `claude/reduce-vpn-bandwidth-NGVmG` уже содержала превосходящую реализацию от предыдущих сессий:
+
+- **streamBond** переписан на **COW (Copy-On-Write) + atomic** патерн:
+  - `listPtr atomic.Pointer[[]dataWriter]` — иммутабельный снапшот списка
+  - `idx atomic.Uint64` — монотонный round-robin счётчик
+  - `writeMu sync.Mutex` — только для add/remove (не для чтения)
+- **`nextWithCount()`** — полностью lock-free: `listPtr.Load()` (atomic) + `idx.Add(1)` (atomic), **нулевых mutex acquisitions** в hot path
+- **`routeFromTun`** уже использует `nextWithCount()` вместо `count()+next()`
+
+Это лучше предложенного mutex-based `nextCount()`: вместо 2→1 mutex op даёт **2→0** (полный lock-free).
+
+**Вклад сессии:**
+
+Добавлен **`TestStreamBondNextWithCount`** — верификация семантики lock-free `nextWithCount()`:
+- empty bond → (nil, 0)
+- 3-element bond: count=3, stream non-nil
+- 4 последовательных вызова (`nextWithCount()` + 2×`next()` + `nextWithCount()`) посещают 3 уникальных writer'а и правильно оборачиваются
+- Гарантирует отсутствие регрессий при будущих изменениях COW логики
+
+**Тесты:** `go test . -run TestStreamBondNextWithCount -v` — PASS. `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **IPv6 inner tunnel** — ~~РЕШЕНО~~ (Запуск 27): `markECNCE` теперь обрабатывает IPv6 Traffic Class через `markECNCEv4`/`markECNCEv6` helpers.
 
 2. **pprof под нагрузкой** — ~~ДОБАВЛЕНО~~ (Запуск 24). Следующий шаг: реально проанализировать профили при 30 Mbps нагрузке и найти CPU hotspots.
+
+3. **TCP_QUICKACK re-arming** — На Linux TCP_QUICKACK сбрасывается после каждого отправленного ACK. Сервер устанавливает его один раз при accept(). Для устойчивого отключения delayed ACK нужно переустанавливать перед каждым recv() в upload-пути. Это улучшило бы cwnd-growth в upload-направлении при высоком RTT.
+
+4. **noiseConn.Read deadline overhead** — каждый `nc.conn.SetReadDeadline()` вызов в `noiseConn.Read()` совершает syscall. С 64 bond-соединениями и keepalive-чтениями это ~64 syscalls/15сек (для keepalive) + по 1 syscall на каждый входящий пакет. Можно сократить через `SetDeadline` с renewalable deadline вместо per-read deadline.
 
 ---
 
