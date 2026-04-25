@@ -170,7 +170,9 @@ func relayOne(client net.Conn, target string, knockKey *transport.KnockPSK, logg
 	// Bidirectional pipe: client ↔ upstream.
 	// Use ioCopyBufPool (32 KiB) so that each direction avoids a per-connection
 	// heap allocation that would otherwise live for the relay session lifetime.
-	done := make(chan struct{}, 2)
+	// done is borrowed from relayChanPool to avoid the make(chan struct{}, 2)
+	// heap allocation on every accepted TCP connection.
+	done := relayChanPool.Get().(chan struct{})
 	pipe := func(dst, src net.Conn) {
 		pb := ioCopyBufPool.Get().(*[]byte)
 		io.CopyBuffer(dst, src, *pb) //nolint:errcheck
@@ -184,9 +186,11 @@ func relayOne(client net.Conn, target string, knockKey *transport.KnockPSK, logg
 	go pipe(upstreamIO, routedIO)
 	go pipe(routedIO, upstreamIO)
 
-	// Wait for both directions to finish.
+	// Wait for both directions to finish. After both receives the channel is
+	// empty (each goroutine sends exactly once into a capacity-2 channel).
 	<-done
 	<-done
+	relayChanPool.Put(done) // return clean channel to pool
 
 	logger.Info("relay: connection closed", "client", routed.RemoteAddr())
 }
@@ -262,6 +266,19 @@ func makeRelayAddrKey(addr net.Addr) relayAddrKey {
 // packet size before being sent through sendCh, so the consumer can call
 // Write(*pb) with the correct length. Before returning to the pool the
 // slice is reset to full capacity: *pb = (*pb)[:cap(*pb)].
+// relayChanPool pools the bidirectional-pipe done channels used in relayOne.
+// Each TCP relay connection needs exactly one chan struct{} with capacity 2:
+// two goroutines (one per direction) each send one value, relayOne receives both.
+// After both receives the channel is empty and safe to return to the pool.
+//
+// At 1000 concurrent relay connections this saves ~1000 make(chan struct{}, 2)
+// allocations per second (each channel is ≈96 bytes of heap + runtime overhead).
+var relayChanPool = sync.Pool{
+	New: func() any {
+		return make(chan struct{}, 2)
+	},
+}
+
 var udpRelayPktPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, udpBufSize)

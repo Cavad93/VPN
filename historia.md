@@ -4127,9 +4127,64 @@ sudo ./vpnclient -server X.X.X.X:38947 -bbr-seed-bw 6 -bbr-seed-rtt 78
 
 ---
 
+## Запуск 60 — 2026-04-25 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: relayChanPool — устранение аллокации done-канала в relayOne
+
+**Файл:** `server/relay.go`
+
+**Проблема:**
+
+В `relayOne` каждое TCP-соединение создавало:
+```go
+done := make(chan struct{}, 2)
+```
+
+Это одна heap-аллокация на каждое входящее соединение через relay. Для relay-сервера с высокой частотой reconnect (bonding-режим: 8+ соединений на клиента, авто-реконнект каждые N секунд):
+- При 100 clients × 8 bond-connections × 1 reconnect/мин = ~13 `make(chan struct{}, 2)` в секунду
+- Каждый chan struct{} ≈ 96 байт heap + runtime scheduler overhead (hchan struct)
+- Итого: ~1.3 KB/сек heap pressure + GC davление от tiny, short-lived objects
+
+Это же паттерн, что и `ioCopyBufPool` (добавлен ранее), только для synchronisation channel вместо copy buffer.
+
+**Решение:**
+
+Добавлен `relayChanPool = sync.Pool{New: func() any { return make(chan struct{}, 2) }}`.
+
+Инвариант безопасности: после `<-done; <-done` канал гарантированно пуст:
+- Каждая из двух `pipe` горутин делает ровно один `done <- struct{}{}`
+- Канал имеет capacity=2, поэтому оба send non-blocking
+- После двух receive: `len(done) == 0` → безопасный возврат в пул
+
+```go
+// БЫЛО:
+done := make(chan struct{}, 2)
+// ...
+<-done
+<-done
+
+// СТАЛО:
+done := relayChanPool.Get().(chan struct{})
+// ...
+<-done
+<-done
+relayChanPool.Put(done)  // channel is empty, safe to reuse
+```
+
+**Почему это не sync.WaitGroup:** WaitGroup требует `wg.Add(2)` → `wg.Done()` × 2 → `wg.Wait()`. При pooling WG нужен `Reset()` которого нет в API. Chan struct{} идеален для pooling именно потому, что его состояние (empty vs full) полностью определено после двух receives.
+
+**Эффект:**
+- Устранена `make(chan struct{}, 2)` аллокация per TCP relay connection → 0 heap pressure в steady-state
+- При 100 clients × 8 bond connections: ~13 аллокаций/сек → 0
+- Meньше GC pressure от short-lived hchan objects
+
+**Тесты:** `go test . -run TestRelay -v` — 5/5 PASS; `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
-1. **relay done-channel pool** — `make(chan struct{}, 2)` в `relayOne` — одна аллокация per TCP connection.
+1. ~~**relay done-channel pool**~~ — **ВЫПОЛНЕНО** (Запуск 60)
 2. **pprof анализ под нагрузкой** — инфраструктура добавлена (Run 24). Требует живого сервера.
-3. **IPv6 ECN propagation** — `markECNCE` только IPv4.
+3. ~~**IPv6 ECN propagation**~~ — **ВЫПОЛНЕНО** (ветка, commit 1b3283d)
 
