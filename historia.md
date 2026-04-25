@@ -1496,6 +1496,68 @@ TC[1:0] = ECN field → byte[1] bits[5:4]
 
 ---
 
+## Запуск 29 — 2026-04-25 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: WSConn streaming — устранение heap-аллокации на каждый WebSocket фрейм
+
+**Файлы:** `server/transport/ws.go`, `server/transport/ws_test.go`
+
+**Контекст (задача из бэклога):**
+
+`WSConn.Read()` выделял `make([]byte, length)` на каждый входящий фрейм через `readFrame()`, затем хранил sub-slice в `readBuf []byte`. При 30 Mbps (MTU 1430 байт) → ~2630 аллокаций/сек → ~3.75 MB/сек heap pressure, постоянное давление на GC. Та же проблема была решена для ObfsConn в Запуске 1 через streaming-паттерн с `readBufRemaining int`.
+
+**Принцип streaming-паттерна:**
+
+Вместо буферизации фрейма целиком — хранить позицию в текущем фрейме и копировать данные напрямую в буфер вызывающего:
+- `frameRem int` — сколько байт осталось в текущем data-фрейме
+- `masked bool` — использует ли текущий фрейм маскирование (RFC 6455, клиент→сервер)
+- `maskKey [4]byte` — XOR-ключ маскирования
+- `maskOff int` — текущее смещение в 4-байтном цикле (0–3), сохраняет позицию между частичными Read()
+
+**Ротация ключа маскирования (ключевой момент):**
+
+При частичном чтении (`maskOff > 0`) нельзя применять `wsUnmask()` с исходным `maskKey` — нужно ротировать его, чтобы XOR продолжился с правильной позиции цикла:
+
+```go
+var rotKey [4]byte
+off := ws.maskOff
+for i := range rotKey {
+    rotKey[i] = ws.maskKey[(off+i)&3]
+}
+wsUnmask(p[:n], rotKey)
+ws.maskOff = (off + n) & 3
+```
+
+`wsUnmask()` (uint64 batch XOR, из remote-ветки) обрабатывает 8 байт за итерацию — ротированный ключ позволяет использовать его без потери производительности.
+
+**Удалено:**
+- `wsReadPoolMaxSize = 1500` — константа
+- `wsReadPool sync.Pool` — пул буферов
+- `readBuf []byte` — поле WSConn
+- `readBufBacking *[]byte` — поле WSConn
+- `readFrame() (fin, opcode, payload, backing, err)` — метод, возвращавший аллоцированный срез
+
+**Добавлено:**
+- 4 поля в WSConn: `frameRem`, `masked`, `maskKey`, `maskOff`
+- `consumeFrameData(p []byte) (int, error)` — streaming-копирование из `bufio.Reader` в буфер вызывающего
+- `readFrameHeader()` — чтение 2–14 байт заголовка, всё на стеке
+
+**Обработка управляющих фреймов:**
+- Ping: `[125]byte` на стеке, немедленный pong
+- Close: `io.CopyN(io.Discard, ...)` — дрейн без аллокации
+- Пустой data-фрейм (length=0): `return 0, nil` (не `continue` — иначе следующий фрейм читается в том же вызове)
+
+**Тесты (обновления):**
+- `TestWSReadFramePoolMaxSizeDataIntegrity` → `TestWSReadFrameAtMTUSizeDataIntegrity` (хардкод 1430)
+- `TestWSReadFrameOversizedDataIntegrity` — хардкод 1501 вместо `wsReadPoolMaxSize+1`
+- `TestWSReadFramePartialReadDrainsCorrectly` — `ws.readBufBacking != nil` → `ws.frameRem != 0`
+- **Новый** `TestWSMaskingOffsetAcrossReads` — 13-байтный payload в 3 чтениях (3+5+5), верифицирует правильную ротацию `maskOff` на не-кратных-4 границах
+- **Новый** `TestWSStreamingReadNoIntermediateAlloc` — 20-байтный payload в 2 чтениях (5+15), верифицирует декремент `frameRem`
+
+**Результат:** `go test ./... -count=1` — все 8 пакетов зелёные. Нулевых heap-аллокаций на входящий фрейм (данные идут network → bufio.Reader → буфер вызывающего без промежуточного make).
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **IPv6 inner tunnel** — ~~РЕШЕНО~~ (Запуск 27): `markECNCE` теперь обрабатывает IPv6 Traffic Class через `markECNCEv4`/`markECNCEv6` helpers.

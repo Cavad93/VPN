@@ -396,6 +396,136 @@ func TestWSBufferedRead(t *testing.T) {
 	ws.Close()
 }
 
+// TestWSMaskingOffsetAcrossReads verifies that the 4-byte XOR masking key
+// rotates correctly when a single WebSocket frame is consumed across many
+// small Read calls. This exercises the maskOff field in the streaming
+// frame-state design — critical for non-aligned partial reads.
+func TestWSMaskingOffsetAcrossReads(t *testing.T) {
+	client, server := testPipe()
+
+	done := make(chan *WSConn, 1)
+	go func() {
+		ws, err := WSUpgrade(server, "")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		done <- ws
+	}()
+
+	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
+	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
+	client.Write([]byte(req))
+	respBuf := make([]byte, 4096)
+	client.Read(respBuf)
+
+	ws := <-done
+
+	// 13-byte payload (not a multiple of 4) forces non-aligned masking.
+	// payload = [0, 1, 2, ..., 12]
+	payload := make([]byte, 13)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	// Read in (3 + 5 + 5) chunks:
+	//   after 3 bytes: maskOff = 3
+	//   after 8 bytes: maskOff = 0  (8 % 4)
+	//   after 13 bytes: maskOff = 1 (13 % 4)
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	resCh := make(chan readResult, 1)
+	go func() {
+		var all []byte
+		for _, sz := range []int{3, 5, 5} {
+			buf := make([]byte, sz)
+			if _, err := io.ReadFull(ws, buf); err != nil {
+				resCh <- readResult{nil, err}
+				return
+			}
+			all = append(all, buf...)
+		}
+		resCh <- readResult{all, nil}
+	}()
+
+	sendMaskedFrame(t, client, wsOpBinary, payload)
+
+	res := <-resCh
+	if res.err != nil {
+		t.Fatalf("read error: %v", res.err)
+	}
+	if len(res.data) != 13 {
+		t.Fatalf("got %d bytes, want 13", len(res.data))
+	}
+	for i, b := range res.data {
+		if b != payload[i] {
+			t.Errorf("byte[%d]: got 0x%02x, want 0x%02x (masking rotation error)", i, b, payload[i])
+		}
+	}
+
+	client.Close()
+	ws.Close()
+}
+
+// TestWSStreamingReadNoIntermediateAlloc verifies that a 20-byte frame is
+// correctly delivered in two partial reads (5+15), exercising the frameRem
+// counter decrement across calls — the core of the streaming read design.
+func TestWSStreamingReadNoIntermediateAlloc(t *testing.T) {
+	client, server := testPipe()
+
+	done := make(chan *WSConn, 1)
+	go func() {
+		ws, err := WSUpgrade(server, "")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		done <- ws
+	}()
+
+	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
+	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
+	client.Write([]byte(req))
+	respBuf := make([]byte, 4096)
+	client.Read(respBuf)
+
+	ws := <-done
+
+	payload := []byte("ABCDEFGHIJKLMNOPQRST") // 20 bytes
+
+	resCh := make(chan []byte, 1)
+	go func() {
+		first := make([]byte, 5)
+		if _, err := io.ReadFull(ws, first); err != nil {
+			t.Errorf("first read: %v", err)
+			resCh <- nil
+			return
+		}
+		second := make([]byte, 15)
+		if _, err := io.ReadFull(ws, second); err != nil {
+			t.Errorf("second read: %v", err)
+			resCh <- nil
+			return
+		}
+		resCh <- append(first, second...)
+	}()
+
+	sendMaskedFrame(t, client, wsOpBinary, payload)
+
+	got := <-resCh
+	if got == nil {
+		t.Fatal("nil result")
+	}
+	if string(got) != string(payload) {
+		t.Errorf("got %q, want %q", got, payload)
+	}
+
+	client.Close()
+	ws.Close()
+}
+
 // TestWSWriteFrameZeroAllocHotPath verifies that writing a VPN-sized binary
 // frame (≤ wsWriteBufSize) does not allocate on the heap.  Allocations in the
 // download direction (server→client) at ~2630 frames/sec caused ~3.75 MB/sec
@@ -727,17 +857,18 @@ func TestWSReadFrameVPNSizeDataIntegrity(t *testing.T) {
 	ws.Close()
 }
 
-// TestWSReadFramePoolMaxSizeDataIntegrity verifies a frame exactly at
-// wsReadPoolMaxSize is decoded correctly (boundary of hot path).
-func TestWSReadFramePoolMaxSizeDataIntegrity(t *testing.T) {
+// TestWSReadFrameAtMTUSizeDataIntegrity verifies a frame exactly at tunMTU
+// (1430 bytes — the typical VPN frame size) is decoded correctly.
+func TestWSReadFrameAtMTUSizeDataIntegrity(t *testing.T) {
 	client, server := testPipe()
 	ws := upgradeServerSide(t, client, server)
 
-	payload := bytes.Repeat([]byte{0xCA}, wsReadPoolMaxSize)
+	const frameSize = 1430
+	payload := bytes.Repeat([]byte{0xCA}, frameSize)
 
 	readDone := make(chan []byte, 1)
 	go func() {
-		buf := make([]byte, wsReadPoolMaxSize+10)
+		buf := make([]byte, frameSize+10)
 		n, err := ws.Read(buf)
 		if err != nil {
 			t.Errorf("Read: %v", err)
@@ -751,23 +882,24 @@ func TestWSReadFramePoolMaxSizeDataIntegrity(t *testing.T) {
 	got := <-readDone
 
 	if !bytes.Equal(got, payload) {
-		t.Errorf("at wsReadPoolMaxSize: data mismatch: len=%d want=%d", len(got), len(payload))
+		t.Errorf("at MTU size: data mismatch: len=%d want=%d", len(got), len(payload))
 	}
 	client.Close()
 	ws.Close()
 }
 
-// TestWSReadFrameOversizedDataIntegrity verifies a frame just above
-// wsReadPoolMaxSize (slow-path make) is still decoded correctly.
+// TestWSReadFrameOversizedDataIntegrity verifies a frame larger than the
+// typical VPN MTU (1501 bytes) is still decoded correctly by the streaming path.
 func TestWSReadFrameOversizedDataIntegrity(t *testing.T) {
 	client, server := testPipe()
 	ws := upgradeServerSide(t, client, server)
 
-	payload := bytes.Repeat([]byte{0xBB}, wsReadPoolMaxSize+1)
+	const frameSize = 1501
+	payload := bytes.Repeat([]byte{0xBB}, frameSize)
 
 	readDone := make(chan []byte, 1)
 	go func() {
-		buf := make([]byte, wsReadPoolMaxSize+100)
+		buf := make([]byte, frameSize+100)
 		n, err := ws.Read(buf)
 		if err != nil {
 			t.Errorf("Read: %v", err)
@@ -788,13 +920,13 @@ func TestWSReadFrameOversizedDataIntegrity(t *testing.T) {
 }
 
 // TestWSReadFramePartialReadDrainsCorrectly verifies that when a frame is read
-// in multiple small calls (via ws.readBuf), all bytes are correct and the pool
-// backing is released only after the last byte is consumed.
+// in multiple small calls (via the streaming frameRem path), all bytes are
+// correct and frameRem reaches 0 after the last byte is consumed.
 func TestWSReadFramePartialReadDrainsCorrectly(t *testing.T) {
 	client, server := testPipe()
 	ws := upgradeServerSide(t, client, server)
 
-	// 60-byte payload, read 20 bytes at a time → triggers readBuf path.
+	// 60-byte payload, read 20 bytes at a time → exercises frameRem decrement.
 	payload := make([]byte, 60)
 	for i := range payload {
 		payload[i] = byte(i * 3)
@@ -827,9 +959,9 @@ func TestWSReadFramePartialReadDrainsCorrectly(t *testing.T) {
 	if !bytes.Equal(res.data, payload) {
 		t.Errorf("partial read: data mismatch")
 	}
-	// After all bytes consumed, readBufBacking must be nil (returned to pool).
-	if ws.readBufBacking != nil {
-		t.Error("readBufBacking not nil after full drain — pool buffer leaked")
+	// After all bytes consumed, frameRem must be 0 (streaming state reset).
+	if ws.frameRem != 0 {
+		t.Errorf("frameRem=%d after full drain, want 0", ws.frameRem)
 	}
 
 	client.Close()
