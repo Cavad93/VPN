@@ -681,6 +681,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 	// Wrap in encrypted noise conn
 	nc := newNoiseConn(obfs, session)
+	// Re-arm TCP_QUICKACK lazily alongside the read-deadline refresh.
+	// conn is the original TCP socket (before BufConn/ObfsConn wrapping),
+	// so SyscallConn() returns the actual kernel fd for setsockopt.
+	nc.rearmQA = makeQuickACKRearm(conn)
 	if s.Perf != nil {
 		nc.withPerf(s.Perf)
 	}
@@ -1388,6 +1392,13 @@ type noiseConn struct {
 	// The lazy refresh (once per noiseDeadlineInterval) eliminates
 	// ~2630 SetReadDeadline calls/sec at 30 Mbps vs the prior per-packet approach.
 	deadlineSetAt time.Time
+	// rearmQA is an optional closure that re-arms TCP_QUICKACK on the
+	// underlying TCP socket. On Linux, TCP_QUICKACK is a one-shot option
+	// that the kernel resets after each outgoing ACK; calling this closure
+	// in the same lazy window as the deadline refresh ensures immediate ACKs
+	// are maintained for client uploads even after idle periods.
+	// Nil on non-Linux platforms or UDP connections.
+	rearmQA func()
 }
 
 // newNoiseConn creates a noiseConn wrapping conn with the given session.
@@ -1500,6 +1511,16 @@ func (nc *noiseConn) Read(p []byte) (int, error) {
 	if now.Sub(nc.deadlineSetAt) >= noiseDeadlineInterval() {
 		nc.conn.SetReadDeadline(now.Add(noiseReadTimeout)) //nolint:errcheck
 		nc.deadlineSetAt = now
+		// Re-arm TCP_QUICKACK in the same lazy window.
+		// On Linux, TCP_QUICKACK is one-shot: the kernel resets it after
+		// each outgoing ACK. Re-arming here (once per 60 s) catches the
+		// idle-restart and post-loss scenarios where the kernel silently
+		// enters delayed-ACK mode, adding up to 40 ms to every ACK.
+		// Cost: one Control() call (~200 ns) per 60 s per connection — zero
+		// measurable overhead on the hot receive path.
+		if nc.rearmQA != nil {
+			nc.rearmQA()
+		}
 	}
 	var obfsReadStart, afterRead time.Time
 	if nc.perf != nil {

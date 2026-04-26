@@ -246,6 +246,39 @@ func setForcedSocketBuffers(conn *net.TCPConn, size int) {
 	})
 }
 
+// makeQuickACKRearm returns a closure that re-arms TCP_QUICKACK on conn.
+//
+// On Linux, TCP_QUICKACK is a one-shot socket option: the kernel resets it
+// after each outgoing ACK whenever it decides to enter "slow ACK" mode.
+// Re-arming it lazily (called every noiseDeadlineInterval, ~60 s) ensures the
+// server does not delay ACKs for client uploads even after idle periods or
+// loss-induced bursts — the two scenarios where delayed-ACK most degrades
+// upload throughput (adds up to 40 ms per window advance).
+//
+// The closure is created once at connection accept time, capturing the raw
+// syscall.RawConn. Subsequent calls pay only one Control() invocation, which
+// takes ~200 ns — negligible against the 60-second interval.
+//
+// Returns nil when conn does not support SyscallConn (e.g. UDP, test stubs).
+func makeQuickACKRearm(conn net.Conn) func() {
+	type syscaller interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	sc, ok := conn.(syscaller)
+	if !ok {
+		return nil
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return nil
+	}
+	return func() {
+		raw.Control(func(fd uintptr) { //nolint:errcheck
+			syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpQuickAck, 1) //nolint:errcheck
+		})
+	}
+}
+
 // setConnTTL64 sets IP TTL to 64 on any net.Conn that supports SyscallConn.
 // Linux default is already 64, but we set it explicitly to ensure consistency
 // regardless of sysctl net.ipv4.ip_default_ttl changes.

@@ -24,3 +24,8 @@ func setForcedSocketBuffers(conn *net.TCPConn, size int) {
 
 // setConnTTL64 is a no-op on non-Linux/non-Windows platforms (macOS default is already 64).
 func setConnTTL64(_ net.Conn) {}
+
+// makeQuickACKRearm is a no-op on non-Linux/non-Windows platforms.
+// TCP_QUICKACK is a Linux-specific socket option; other platforms use
+// different mechanisms or have delayed-ACK disabled by default.
+func makeQuickACKRearm(_ net.Conn) func() { return nil }

@@ -131,6 +131,11 @@ func setForcedSocketBuffers(conn *net.TCPConn, size int) {
 	})
 }
 
+// makeQuickACKRearm is a no-op on Windows: the platform uses
+// TCP_NODELAY / SIO_TCP_SET_ACK_FREQUENCY for ACK tuning instead of the
+// Linux-specific TCP_QUICKACK one-shot option.
+func makeQuickACKRearm(_ net.Conn) func() { return nil }
+
 // setConnTTL64 sets IP TTL to 64 on any net.Conn that supports SyscallConn.
 // Used for accepted connections and outgoing dials. On Linux this is already 64
 // by default; on Windows the default is 128 which fingerprints the OS.

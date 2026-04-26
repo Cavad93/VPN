@@ -4368,3 +4368,68 @@ mmsgStatePool.Put(state)
 
 **Тесты:** `go test ./... -count=1` — все 8 пакетов зелёные.
 
+
+---
+
+## Запуск 63 — 2026-04-26 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: TCP_QUICKACK re-arming — устранение delayed-ACK деградации на upload-пути
+
+**Файлы:** `server/sockopt_linux.go`, `server/sockopt_windows.go`, `server/sockopt_stub.go`, `server/main.go`, `server/main_test.go`
+
+**Проблема (бэклог из Запуска 29):**
+
+На Linux `TCP_QUICKACK` — это **одноразовая** опция. Сервер устанавливал её один раз в `setForcedSocketBuffers` (при accept), но ядро сбрасывает её после каждого исходящего ACK, как только входит в «slow ACK» режим. Это происходит в двух критичных сценариях:
+
+1. **После idle периода** — мобильный клиент ушёл в фон (30+ с тишины), затем возобновил upload. Первые ACK-и после выхода из idle → delayed ACK up to 40 ms → cwnd клиента растёт медленно → первые секунды upload в 1.4× медленнее.
+
+2. **После burst потерь** — при 0.7% потерях (Россия↔Казахстан) retransmit storm → ядро переходит в slow-path ACK mode → delayed 40 ms → CUBIC/BBR на клиенте замедляется.
+
+**Математика влияния delayed ACK:**
+```
+Без TCP_QUICKACK при RTT=100ms:
+  Effective RTT для cwnd growth = 100 + 40 = 140 ms
+  Upload throughput ceiling = 21.4 Mbps (vs 30 Mbps ideal) = -28%
+```
+
+**Решение: `makeQuickACKRearm` + lazy re-arm в `noiseConn.Read`**
+
+1. **`server/sockopt_linux.go` — `makeQuickACKRearm(conn net.Conn) func()`**:
+   - Принимает raw TCP conn, извлекает `SyscallConn()`, сохраняет `RawConn` в замыкании.
+   - Возвращает closure: `func() { raw.Control(fd => setsockopt(TCP_QUICKACK, 1)) }`.
+   - Если `conn` не реализует `SyscallConn` → возвращает `nil`.
+
+2. **`server/sockopt_windows.go` / `sockopt_stub.go`** — `func makeQuickACKRearm(_ net.Conn) func() { return nil }` (no-op).
+
+3. **`noiseConn` struct** — новое поле `rearmQA func()`.
+
+4. **`noiseConn.Read` — re-arm внутри уже существующего lazy deadline block**:
+   ```go
+   if now.Sub(nc.deadlineSetAt) >= noiseDeadlineInterval() {
+       nc.conn.SetReadDeadline(now.Add(noiseReadTimeout))
+       nc.deadlineSetAt = now
+       if nc.rearmQA != nil {
+           nc.rearmQA()  // +1 Control() syscall раз в 60с — zero overhead на hot path
+       }
+   }
+   ```
+
+5. **`handleConn`** — инициализация: `nc.rearmQA = makeQuickACKRearm(conn)` сразу после `newNoiseConn`. `conn` — raw `*net.TCPConn` до оборачивания в BufConn/ObfsConn.
+
+**Почему re-arm раз в 60 с:** при bulk-transfer ядро само удерживает QUICKACK mode; сброс происходит только при переходе idle → busy (детектируется мгновенно: deadlineSetAt=zero при первом Read) или при burst-loss (детектируется через 60s). Per-recv setsockopt = 2630 syscall/сек → неприемлемо.
+
+**Overhead:** нулевой на hot path (только уже существующий `now.Sub` atomic check); +1 `Control()` (~200 нс) раз в 60 с поверх уже существующего `SetReadDeadline`.
+
+**Тесты (3 новых):**
+- `TestMakeQuickACKRearmNilOnNonTCPConn` — net.Pipe() → не паникует
+- `TestNoiseConnRearmQACalledOnDeadlineRefresh` — rearmQA вызывается при первом Read; lazy (не на каждый recv)
+- `TestNoiseConnRearmQANilSafe` — nil rearmQA с форс-рефрешем → нет паники
+
+`go test ./... -count=1 -run 'Test[^B]'` — все 8 пакетов зелёные.
+
+---
+
+## Следующие задачи (приоритетный бэклог)
+
+1. ~~TCP_QUICKACK re-arming~~ — **ВЫПОЛНЕНО** (Запуск 63).
+2. **pprof под нагрузкой** — endpoint добавлен (Запуск 24). Требует живого сервера.

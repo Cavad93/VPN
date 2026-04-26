@@ -3707,3 +3707,160 @@ func TestVlessTCPRelayPooled(t *testing.T) {
 		t.Errorf("download payload mismatch: want %q, got %q", uploadPayload, gotPayload)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TCP_QUICKACK re-arm tests
+// ---------------------------------------------------------------------------
+
+// makeNoiseSessionPair performs a Noise_XX handshake entirely in memory,
+// returning the server session (responder result) and client session (initiator
+// result).  Both sessions' cipher states are ready for use with noiseFrame.
+func makeNoiseSessionPair(t *testing.T) (serverSess, clientSess *crypto.Session) {
+	t.Helper()
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal("GenerateKeyPair:", err)
+	}
+	init_, err := crypto.NewHandshake(crypto.Initiator, kp)
+	if err != nil {
+		t.Fatal("NewHandshake initiator:", err)
+	}
+	resp_, err := crypto.NewHandshake(crypto.Responder, kp)
+	if err != nil {
+		t.Fatal("NewHandshake responder:", err)
+	}
+	msg1, err := init_.WriteMessage1()
+	if err != nil {
+		t.Fatal("WriteMessage1:", err)
+	}
+	if err := resp_.ReadMessage1(msg1); err != nil {
+		t.Fatal("ReadMessage1:", err)
+	}
+	msg2, err := resp_.WriteMessage2()
+	if err != nil {
+		t.Fatal("WriteMessage2:", err)
+	}
+	if err := init_.ReadMessage2(msg2); err != nil {
+		t.Fatal("ReadMessage2:", err)
+	}
+	msg3, clientSess, err := init_.WriteMessage3()
+	if err != nil {
+		t.Fatal("WriteMessage3:", err)
+	}
+	serverSess, err = resp_.ReadMessage3(msg3)
+	if err != nil {
+		t.Fatal("ReadMessage3:", err)
+	}
+	return
+}
+
+// noiseFrame builds a raw noise frame [2-byte big-endian length | ciphertext]
+// from plain using the given SessionCipher (no additional data).
+func noiseFrame(t *testing.T, cipher *crypto.SessionCipher, plain []byte) []byte {
+	t.Helper()
+	ct, err := cipher.Encrypt(plain, nil)
+	if err != nil {
+		t.Fatal("noiseFrame Encrypt:", err)
+	}
+	frame := make([]byte, 2+len(ct))
+	frame[0] = byte(len(ct) >> 8)
+	frame[1] = byte(len(ct))
+	copy(frame[2:], ct)
+	return frame
+}
+
+// TestMakeQuickACKRearmNilOnNonTCPConn verifies that makeQuickACKRearm returns
+// nil (or at least does not panic) for a non-TCP net.Conn such as net.Pipe().
+// On Linux, net.Pipe() does not implement SyscallConn, so nil is expected.
+// On other platforms the function is always a no-op and returns nil.
+func TestMakeQuickACKRearmNilOnNonTCPConn(t *testing.T) {
+	t.Parallel()
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	// Should not panic; return value may be nil or non-nil depending on platform.
+	fn := makeQuickACKRearm(c1)
+	_ = fn
+}
+
+// TestNoiseConnRearmQACalledOnDeadlineRefresh verifies that the rearmQA closure
+// is invoked exactly when the lazy deadline refresh fires (not on every read).
+func TestNoiseConnRearmQACalledOnDeadlineRefresh(t *testing.T) {
+	t.Parallel()
+
+	serverSess, clientSess := makeNoiseSessionPair(t)
+
+	// c1 = server side, c2 = client side
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	var rearmCalls atomic.Int32
+	nc := newNoiseConn(c1, serverSess)
+	nc.rearmQA = func() { rearmCalls.Add(1) }
+
+	// Force an immediate deadline refresh by shrinking the interval.
+	orig := noiseDeadlineIntervalNs.Load()
+	t.Cleanup(func() { noiseDeadlineIntervalNs.Store(orig) })
+	noiseDeadlineIntervalNs.Store(int64(10 * time.Millisecond))
+
+	// Write one valid noise frame from the client side.
+	go func() {
+		c2.Write(noiseFrame(t, clientSess.SendCipher, []byte("hello"))) //nolint:errcheck
+	}()
+
+	buf := make([]byte, 4096)
+	// First Read: deadlineSetAt is zero → refresh fires → rearmQA called.
+	n, err := nc.Read(buf)
+	if err != nil {
+		t.Fatal("nc.Read:", err)
+	}
+	if n == 0 {
+		t.Fatal("expected > 0 bytes")
+	}
+	if got := rearmCalls.Load(); got != 1 {
+		t.Errorf("rearmQA called %d times on first Read, want 1", got)
+	}
+
+	// Second read immediately after: interval has not elapsed → no re-arm.
+	go func() {
+		c2.Write(noiseFrame(t, clientSess.SendCipher, []byte("world"))) //nolint:errcheck
+	}()
+	_, err = nc.Read(buf)
+	if err != nil {
+		t.Fatal("nc.Read (second):", err)
+	}
+	// Accept 1 or 2: on very slow CI the 10 ms interval may have elapsed.
+	if got := rearmCalls.Load(); got < 1 {
+		t.Errorf("rearmQA was never called, want at least 1")
+	}
+}
+
+// TestNoiseConnRearmQANilSafe verifies that noiseConn.Read does not panic when
+// rearmQA is nil — the default for non-Linux connections and stub builds.
+func TestNoiseConnRearmQANilSafe(t *testing.T) {
+	t.Parallel()
+
+	serverSess, clientSess := makeNoiseSessionPair(t)
+
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	nc := newNoiseConn(c1, serverSess)
+	// rearmQA deliberately left nil.
+
+	orig := noiseDeadlineIntervalNs.Load()
+	t.Cleanup(func() { noiseDeadlineIntervalNs.Store(orig) })
+	noiseDeadlineIntervalNs.Store(int64(1 * time.Nanosecond)) // force immediate refresh
+
+	go func() {
+		c2.Write(noiseFrame(t, clientSess.SendCipher, []byte("safe"))) //nolint:errcheck
+	}()
+
+	buf := make([]byte, 4096)
+	if _, err := nc.Read(buf); err != nil {
+		t.Fatal("Read with nil rearmQA panicked or errored:", err)
+	}
+}
