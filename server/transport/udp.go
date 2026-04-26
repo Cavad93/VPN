@@ -1031,6 +1031,14 @@ func makeUDPAddrKey(addr *net.UDPAddr) udpAddrKey {
 	return k
 }
 
+// toUDPAddr reconstructs a *net.UDPAddr from the key. Only called for new
+// connections (infrequent); established-connection lookups use the key directly.
+func (k udpAddrKey) toUDPAddr() *net.UDPAddr {
+	ip := make(net.IP, net.IPv6len)
+	copy(ip, k.ip[:])
+	return &net.UDPAddr{IP: ip, Port: k.port, Zone: k.zone}
+}
+
 // Listener accepts incoming reliable UDP connections on a fixed local address.
 type Listener struct {
 	conn     *net.UDPConn
@@ -1114,16 +1122,15 @@ func (l *Listener) readLoop() {
 				continue
 			}
 
-			remote := results[i].addr
-			// makeUDPAddrKey is allocation-free (struct copy, no string interning).
-			// Replaces remote.String() which allocated ~5260 strings/sec at 30 Mbps.
-			key := makeUDPAddrKey(remote)
+			// key is pre-computed by readPlatform — zero allocation, no net.IPv4() call.
+			key := results[i].key
 			l.connsMu.RLock()
 			c, exists := l.conns[key]
 			l.connsMu.RUnlock()
 
 			if !exists {
-				// New remote — create a Conn sharing the listener's socket.
+				// New remote — reconstruct *net.UDPAddr from key (infrequent path).
+				remote := key.toUDPAddr()
 				c = newConn(l.conn, remote, false)
 				l.connsMu.Lock()
 				l.conns[key] = c

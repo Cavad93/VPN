@@ -4429,7 +4429,103 @@ mmsgStatePool.Put(state)
 
 ---
 
+## Запуск 64 — 2026-04-26 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: Zero-alloc UDP batch receive — устранение heap-аллокаций на hot receive path
+
+**Файлы:** `server/transport/batch.go`, `server/transport/batch_linux.go`, `server/transport/batch_default.go`, `server/transport/udp.go`
+
+**Проблема:**
+
+При 30 Mbps UDP (~2630 пакетов/сек, ~164 batch-операции по 16 пакетов) функция `readPlatform()` создавала три вида heap-аллокаций на каждый принятый пакет:
+
+1. **`make([]batchResult, count)`** — 164 allocs/sec (по одному на каждый batch-вызов)
+2. **`net.IPv4(a, b, c, d)`** — 2630 allocs/sec (создаёт 16-байтный `[]byte` для каждого пакета на Linux-пути через `udpAddrKeyFromRawIPv4` был новый `net.IP`)
+3. **`&net.UDPAddr{IP: ..., Port: ...}`** — 2630 allocs/sec (heap-аллокация структуры для каждого пакета)
+
+Итого: ~5412 allocs/sec ≈ 105 KB/sec постоянное heap-давление → GC pauses на hot receive path.
+
+**Решение:**
+
+**1. `batchResult.addr *net.UDPAddr` → `batchResult.key udpAddrKey` (`batch.go`)**
+
+`udpAddrKey` — 20-байтный value-тип (ip [16]byte + port int + zone string), уже существующий в пакете. Хранение ключа вместо `*net.UDPAddr` устраняет heap-аллокацию указателя и структуры.
+
+```go
+type batchResult struct {
+    n   int
+    key udpAddrKey // pre-computed remote address key; no heap allocation
+    buf []byte
+}
+```
+
+**2. `batchReader.resBuf [maxBatchSize]batchResult` (`batch.go`)**
+
+Persistent буфер результатов, аллоцированный один раз при создании `batchReader`. Вместо `make([]batchResult, count)` на каждый вызов — `r.resBuf[:count]` (sub-slice без аллокации).
+
+```go
+type batchReader struct {
+    conn   *net.UDPConn
+    bufs   [][]byte
+    resBuf [maxBatchSize]batchResult // persistent results buffer — avoids make() per batch
+}
+```
+
+**3. `udpAddrKeyFromRawIPv4(sa, port)` (`batch_linux.go`)**
+
+Новая функция строит `udpAddrKey` напрямую из `unix.RawSockaddrInet4` (raw kernel sockaddr) без промежуточных аллокаций:
+
+```go
+func udpAddrKeyFromRawIPv4(sa *unix.RawSockaddrInet4, hostPort int) udpAddrKey {
+    var k udpAddrKey
+    k.ip[10] = 0xff
+    k.ip[11] = 0xff
+    copy(k.ip[12:], sa.Addr[:])
+    k.port = hostPort
+    return k
+}
+```
+
+Нормализует IPv4-адрес в IPv4-in-IPv6 форму (`::ffff:a.b.c.d`), чтобы совпадать с `makeUDPAddrKey(net.UDPAddr{IP: net.IPv4(...)})`.
+
+**4. `key.toUDPAddr()` + обновлённый `readLoop` (`udp.go`)**
+
+`readLoop` теперь использует pre-computed `key` для O(1) map-lookup без аллокаций. `*net.UDPAddr` реконструируется только для **новых** соединений (редкий путь):
+
+```go
+key := results[i].key
+l.connsMu.RLock()
+c, exists := l.conns[key]
+l.connsMu.RUnlock()
+
+if !exists {
+    remote := key.toUDPAddr() // heap alloc — только для новых соединений
+    c = newConn(l.conn, remote, false)
+    ...
+}
+```
+
+**5. Удалён неиспользуемый `"net"` import (`batch_linux.go`)**
+
+После замены `net.UDPAddr` на `udpAddrKey` импорт пакета `"net"` стал ненужным.
+
+**Математика устранённых аллокаций при 30 Mbps:**
+
+| Аллокация | До | После |
+|---|---|---|
+| `make([]batchResult, n)` | 164/sec | 0 |
+| `net.IPv4()` в readPlatform | 2630/sec | 0 |
+| `&net.UDPAddr{}` в readPlatform | 2630/sec | 0 |
+| **Итого** | **~5424/sec, ~105 KB/sec** | **~0** |
+
+Аллокации при **новом** соединении (`key.toUDPAddr()`) — штатный cold path, не hot receive.
+
+**Тесты:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. ~~TCP_QUICKACK re-arming~~ — **ВЫПОЛНЕНО** (Запуск 63).
-2. **pprof под нагрузкой** — endpoint добавлен (Запуск 24). Требует живого сервера.
+2. ~~Zero-alloc UDP batch receive~~ — **ВЫПОЛНЕНО** (Запуск 64).
+3. **pprof под нагрузкой** — endpoint добавлен (Запуск 24). Требует живого сервера.

@@ -10,7 +10,6 @@
 package transport
 
 import (
-	"net"
 	"sync"
 	"unsafe"
 
@@ -152,7 +151,8 @@ func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 		if err != nil {
 			return nil, 0, err
 		}
-		return []batchResult{{n: nn, addr: addr, buf: r.bufs[0][:nn]}}, 1, nil
+		r.resBuf[0] = batchResult{n: nn, key: makeUDPAddrKey(addr), buf: r.bufs[0][:nn]}
+		return r.resBuf[:1], 1, nil
 	}
 
 	rawConn, err := r.conn.SyscallConn()
@@ -162,7 +162,8 @@ func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 		if err != nil {
 			return nil, 0, err
 		}
-		return []batchResult{{n: nn, addr: addr, buf: r.bufs[0][:nn]}}, 1, nil
+		r.resBuf[0] = batchResult{n: nn, key: makeUDPAddrKey(addr), buf: r.bufs[0][:nn]}
+		return r.resBuf[:1], 1, nil
 	}
 
 	// Borrow pre-allocated header arrays from the pool — zero heap allocation.
@@ -206,19 +207,21 @@ func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 		return true
 	})
 
-	// Build results from raw sockaddrs — all data is copied out of state
-	// before we return the state to the pool.
-	results := make([]batchResult, count)
+	// Build results directly into r.resBuf — eliminates make([]batchResult, count).
+	// udpAddrKeyFromRawIPv4 constructs the key from raw sockaddr bytes without
+	// allocating a net.IP slice or *net.UDPAddr (~2 allocs eliminated per packet).
+	// All data is value-copied out of state before it is returned to the pool.
+	res := r.resBuf[:count]
 	for i := 0; i < count; i++ {
 		sa := &sockaddrs[i]
 		port := int(sa.Port>>8) | int(sa.Port<<8)&0xFF00
-		results[i] = batchResult{
-			n:    int(mmsghdrs[i].Len),
-			addr: &net.UDPAddr{IP: net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3]), Port: port},
-			buf:  r.bufs[i][:mmsghdrs[i].Len],
+		res[i] = batchResult{
+			n:   int(mmsghdrs[i].Len),
+			key: udpAddrKeyFromRawIPv4(sa, port),
+			buf: r.bufs[i][:mmsghdrs[i].Len],
 		}
 	}
-	// Return state now: results contain no references into state arrays.
+	// Return state now: res contains no references into state arrays.
 	mmsgStatePool.Put(state)
 
 	if err != nil {
@@ -227,5 +230,22 @@ func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 	if recvErr != nil {
 		return nil, 0, recvErr
 	}
-	return results, count, nil
+	return res, count, nil
+}
+
+// udpAddrKeyFromRawIPv4 builds a udpAddrKey directly from a RawSockaddrInet4
+// without allocating — eliminates net.IPv4() + &net.UDPAddr{} per received packet.
+//
+// Port byte-swap: recvmmsg stores ports in network byte order (big-endian),
+// so we swap to host order: host_port = (sa.Port>>8) | ((sa.Port&0xFF)<<8).
+// This is identical to the byte-swap used by net.UDPAddr for kernel sockaddrs.
+func udpAddrKeyFromRawIPv4(sa *unix.RawSockaddrInet4, hostPort int) udpAddrKey {
+	var k udpAddrKey
+	// Normalise to IPv4-in-IPv6 form to match makeUDPAddrKey(net.UDPAddr{IP:net.IPv4(...)}).
+	k.ip[10] = 0xff
+	k.ip[11] = 0xff
+	copy(k.ip[12:], sa.Addr[:])
+	k.port = hostPort
+	// k.zone = "" (zero value) — IPv4 has no link-local zone.
+	return k
 }

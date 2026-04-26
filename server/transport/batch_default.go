@@ -28,10 +28,10 @@ func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	results := []batchResult{{
-		n:    n,
-		addr: addr,
-		buf:  r.bufs[0][:n],
-	}}
-	return results, 1, nil
+	r.resBuf[0] = batchResult{
+		n:   n,
+		key: makeUDPAddrKey(addr),
+		buf: r.bufs[0][:n],
+	}
+	return r.resBuf[:1], 1, nil
 }

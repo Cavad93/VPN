@@ -23,10 +23,17 @@ type batchMsg struct {
 }
 
 // batchResult holds one received packet from a batch read.
+//
+// key replaces the previous addr *net.UDPAddr field. Pre-computing the
+// udpAddrKey inside readPlatform (from raw sockaddr on Linux, or from the
+// ReadFromUDP result on other platforms) eliminates net.IPv4() + &net.UDPAddr{}
+// heap allocations on the hot receive path (~2630 allocs/sec at 30 Mbps).
+// The key is used directly for the O(1) map lookup in readLoop; a *net.UDPAddr
+// is reconstructed via key.toUDPAddr() only for new connections (infrequent).
 type batchResult struct {
-	n    int
-	addr *net.UDPAddr
-	buf  []byte // slice into the pre-allocated buffer
+	n   int
+	key udpAddrKey // pre-computed remote address key; no heap allocation
+	buf []byte     // slice into the pre-allocated buffer
 }
 
 // batchWriter accumulates outgoing packets and flushes them in one batch.
@@ -87,8 +94,9 @@ func (w *batchWriter) Reset() {
 
 // batchReader reads multiple packets from a UDP socket in one operation.
 type batchReader struct {
-	conn *net.UDPConn
-	bufs [][]byte // pre-allocated receive buffers
+	conn   *net.UDPConn
+	bufs   [][]byte                  // pre-allocated receive buffers
+	resBuf [maxBatchSize]batchResult // persistent results buffer — avoids make() per batch
 }
 
 // newBatchReader creates a batch reader with pre-allocated buffers.
