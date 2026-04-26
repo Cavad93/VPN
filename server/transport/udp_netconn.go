@@ -34,6 +34,10 @@ func NewUDPNetConn(c *Conn) *UDPNetConn {
 	return &UDPNetConn{inner: c}
 }
 
+// nopCancel is a pre-allocated no-op context.CancelFunc used when there is no
+// read deadline. It avoids a closure allocation on the hot Read path.
+var nopCancel context.CancelFunc = func() {}
+
 // Read implements net.Conn. Returns data from the UDP connection as a stream.
 // If the caller's buffer is smaller than the datagram, the remainder is
 // buffered and returned on the next Read call.
@@ -61,8 +65,13 @@ func (u *UDPNetConn) Read(p []byte) (int, error) {
 	}
 
 	// Read a new datagram from the UDP connection.
-	ctx := u.readContext()
+	// cancel() is called immediately after inner.Read returns to release the
+	// associated runtime timer. Without this, every Read with a non-zero deadline
+	// leaks one timer entry for up to noiseReadTimeout (120 s). At 30 Mbps the
+	// hot path calls Read ~2630/sec, accumulating ~315 K timer objects (≈25 MB).
+	ctx, cancel := u.readContext()
 	rp, err := u.inner.Read(ctx)
+	cancel() // release timer immediately; safe — inner.Read has already returned
 	if err != nil {
 		return 0, err
 	}
@@ -81,22 +90,26 @@ func (u *UDPNetConn) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// readContext returns a context with the read deadline, if set.
-func (u *UDPNetConn) readContext() context.Context {
+// readContext returns a context respecting the current read deadline, plus a
+// cancel function that MUST be called after the associated inner.Read returns.
+// Calling cancel() immediately frees the runtime timer and associated memory.
+//
+// Zero-deadline path: returns context.Background() + a pre-allocated nopCancel.
+// No heap allocation, no timer entry created.
+//
+// Non-zero-deadline path: returns context.WithDeadline(Background, dl). The
+// cancel returned by WithDeadline MUST be called once inner.Read completes to
+// remove the timer from the runtime heap. Callers must not defer cancel inside
+// the Read loop — call it directly after inner.Read returns.
+func (u *UDPNetConn) readContext() (context.Context, context.CancelFunc) {
 	u.deadlineMu.Lock()
 	dl := u.readDeadline
 	u.deadlineMu.Unlock()
 
 	if dl.IsZero() {
-		return context.Background()
+		return context.Background(), nopCancel
 	}
-	ctx, cancel := context.WithDeadline(context.Background(), dl)
-	// The cancel function will be called when Read returns or the deadline fires.
-	// We can't defer cancel() here because the context is used in inner.Read.
-	// Instead, we rely on the deadline expiring to clean up.
-	// In practice, inner.Read returns quickly (data is buffered in readCh).
-	_ = cancel
-	return ctx
+	return context.WithDeadline(context.Background(), dl)
 }
 
 // Write implements net.Conn. Sends data reliably over the UDP connection.

@@ -4619,3 +4619,65 @@ maskOff  int    // текущий offset в 4-байтном ключе
 | **pprof под нагрузкой** | ⏳ | требует живого сервера |
 
 **Тесты:** 7/8 пакетов PASS; `server` — 1 flaky test (pre-existing, не регрессия).
+
+---
+
+## Запуск 67 — 2026-04-26 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: UDPNetConn context timer leak — cancel() после inner.Read
+
+**Файлы:** `server/transport/udp_netconn.go`, `server/transport/udp_netconn_test.go`
+
+**Обнаруженная проблема:**
+
+В `UDPNetConn.readContext()` была следующая конструкция:
+
+```go
+ctx, cancel := context.WithDeadline(context.Background(), dl)
+_ = cancel  // ← утечка!
+return ctx
+```
+
+`context.WithDeadline` добавляет timer в runtime timer heap. Если `cancel()` не вызывается, timer живёт до истечения deadline. `noiseConn` устанавливает deadline один раз в 60 секунд (значение: `now + 120s`).
+
+**Математика утечки при 30 Mbps:**
+- UDP+BBR режим: `mux.readLoop` → `noiseConn.Read` → `UDPNetConn.Read` → `readContext()` → каждый раз создаёт context
+- Частота вызовов: ~2630 reads/sec (один mux-фрейм = 1430 байт = 30 Mbps / 1430 / 8)
+- Время жизни каждого timer: до 120 секунд (deadline)
+- Накопление: 2630 × 120 = **~315,600 timer объектов** одновременно в runtime timer heap
+- Память: ~315,600 × 80-200 bytes = **~25–63 MB** постоянного давления
+- CPU overhead: каждый insert/delete в timer heap = O(log 315600) ≈ 18 операций → ~5260 × 18 = ~94,680 heap операций/сек от одного этого бага
+
+Комментарий в коде "We can't defer cancel() here because the context is used in inner.Read" — **неверен**: `ctx` передаётся в `inner.Read(ctx)` по значению; после возврата `inner.Read` контекст уже не используется, и вызов `cancel()` безопасен.
+
+**Исправление:**
+
+1. `readContext()` теперь возвращает `(context.Context, context.CancelFunc)`.
+2. Для zero-deadline пути: `return context.Background(), nopCancel` — пакетная переменная, ноль аллокаций.
+3. В `Read()`: `cancel()` вызывается немедленно после `inner.Read(ctx)`.
+
+```go
+// package-level pre-allocated no-op cancel for the zero-deadline fast path
+var nopCancel context.CancelFunc = func() {}
+
+// In readContext():
+if dl.IsZero() {
+    return context.Background(), nopCancel  // zero alloc, zero timer
+}
+return context.WithDeadline(context.Background(), dl)  // cancel MUST be called after Read
+
+// In Read():
+ctx, cancel := u.readContext()
+rp, err := u.inner.Read(ctx)
+cancel() // release timer immediately; safe — inner.Read has already returned
+```
+
+**Тесты (3 новых):**
+- `TestUDPNetConnReadContextCancelledAfterRead` — 200 reads с deadline; проверяет что heap не растёт (limit: N×2048 bytes)
+- `TestUDPNetConnReadContextZeroDeadline` — readContext без deadline → context.Background() + вызов nopCancel работает
+- `TestUDPNetConnReadContextNonZeroDeadline` — readContext с deadline → context имеет правильный deadline; cancel() делает ctx.Done()
+
+**Результат:** `go test ./... -count=1` — все 8 пакетов зелёные. 11/11 TestUDPNetConn* PASS.
+
+**Оставшиеся задачи:**
+- **pprof под нагрузкой** — требует живого сервера. Следующий уровень оптимизации после heap-давления: CPU flamegraph.

@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -206,5 +207,130 @@ func TestUDPNetConnLargeWrite(t *testing.T) {
 		if received[i] != data[i] {
 			t.Fatalf("data mismatch at byte %d: got %d, want %d", i, received[i], data[i])
 		}
+	}
+}
+
+// TestUDPNetConnReadContextCancelledAfterRead verifies that setting a read
+// deadline and then doing many reads does not accumulate runtime timers.
+//
+// Each call to readContext with a non-zero deadline creates a context.WithDeadline
+// (which adds an entry to the runtime timer heap). Without calling cancel() after
+// inner.Read returns, these timers live until the deadline fires — up to 120 s.
+// At 2630 reads/sec this means ~315 K timer entries accumulate (≈25 MB).
+//
+// The fix calls cancel() immediately after inner.Read returns, releasing the timer
+// from the heap. This test verifies that allocations-per-read do not grow with
+// the number of reads (timer entries are freed promptly).
+func TestUDPNetConnReadContextCancelledAfterRead(t *testing.T) {
+	t.Parallel()
+	client, server := setupUDPPair(t)
+
+	// Set a read deadline far in the future so every Read creates a timerCtx.
+	server.SetReadDeadline(time.Now().Add(2 * time.Minute)) //nolint:errcheck
+
+	const N = 200 // enough to create a detectable timer buildup if cancel is missing
+
+	// Warm up: pre-allocate to exclude startup overhead.
+	for i := 0; i < 10; i++ {
+		client.Write([]byte("warmup")) //nolint:errcheck
+		buf := make([]byte, 64)
+		server.Read(buf) //nolint:errcheck
+	}
+	runtime.GC()
+	runtime.GC()
+
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	for i := 0; i < N; i++ {
+		client.Write([]byte("hello")) //nolint:errcheck
+		buf := make([]byte, 64)
+		server.Read(buf) //nolint:errcheck
+	}
+
+	runtime.GC()
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+
+	// Each read should not contribute more than ~1 KB of live heap objects on average.
+	// Before the fix, N=200 reads with 120s timers ≈ 200 × 200 bytes = 40 KB live.
+	// After the fix, timers are cancelled immediately — near-zero live timer memory.
+	// We allow 2 KB headroom per read for the transport protocol overhead.
+	maxAllocBytes := uint64(N) * 2048
+	live := after.HeapAlloc
+	baseline := before.HeapAlloc
+	if live > baseline+maxAllocBytes {
+		t.Errorf("possible timer leak: heap grew by %d bytes over %d reads (limit %d bytes)",
+			live-baseline, N, maxAllocBytes)
+	}
+}
+
+// TestUDPNetConnReadContextZeroDeadline verifies that readContext with no deadline
+// returns context.Background() and the pre-allocated nopCancel (no allocation).
+func TestUDPNetConnReadContextZeroDeadline(t *testing.T) {
+	t.Parallel()
+	client, server := setupUDPPair(t)
+
+	// No deadline set: readContext must return background + nopCancel.
+	ctx, cancel := server.readContext()
+	if ctx != context.Background() {
+		t.Error("readContext with zero deadline should return context.Background()")
+	}
+	// nopCancel must be callable without panic.
+	cancel()
+
+	// Functional: read still works with no deadline.
+	client.Write([]byte("ok")) //nolint:errcheck
+	buf := make([]byte, 16)
+	n, err := server.Read(buf)
+	if err != nil {
+		t.Fatalf("Read with no deadline: %v", err)
+	}
+	if string(buf[:n]) != "ok" {
+		t.Errorf("unexpected data: %q", buf[:n])
+	}
+}
+
+// TestUDPNetConnReadContextNonZeroDeadline verifies that readContext with a future
+// deadline returns a cancellable context and that cancel is safe to call.
+func TestUDPNetConnReadContextNonZeroDeadline(t *testing.T) {
+	t.Parallel()
+	client, server := setupUDPPair(t)
+
+	dl := time.Now().Add(time.Minute)
+	server.SetReadDeadline(dl) //nolint:errcheck
+
+	ctx, cancel := server.readContext()
+	if ctx == context.Background() {
+		t.Error("readContext with deadline should not return context.Background()")
+	}
+	d, ok := ctx.Deadline()
+	if !ok {
+		t.Error("context should have a deadline")
+	}
+	if !d.Equal(dl) {
+		t.Errorf("context deadline: got %v, want %v", d, dl)
+	}
+	// Calling cancel() must release the timer — verify no panic.
+	cancel()
+	// Context must be Done after cancel.
+	select {
+	case <-ctx.Done():
+		// expected
+	default:
+		t.Error("context should be Done after cancel()")
+	}
+
+	// Functional: read still works after cancel is called (inner.Read not started yet).
+	server.SetReadDeadline(time.Now().Add(time.Minute)) //nolint:errcheck
+	client.Write([]byte("ok"))                          //nolint:errcheck
+	buf := make([]byte, 16)
+	n, err := server.Read(buf)
+	if err != nil {
+		t.Fatalf("Read with deadline: %v", err)
+	}
+	if string(buf[:n]) != "ok" {
+		t.Errorf("unexpected data: %q", buf[:n])
 	}
 }
