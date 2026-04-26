@@ -4574,3 +4574,48 @@ maskOff  int    // текущий offset в 4-байтном ключе
 
 - **pprof под нагрузкой** — требует живого сервера с трафиком. После сбора профиля: анализ CPU flamegraph для выявления следующего bottleneck.
 - Потенциальные направления после pprof: BBR app-limited detection, `sync.Mutex` contention в Mux/noiseConn под нагрузкой, GSO/GRO offloading на UDP side.
+
+---
+
+## Запуск 66 — 2026-04-26 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: Аудит состояния ветки — подтверждение полноты реализации
+
+**Контекст:**
+
+Сессия стартовала с задачи реализовать последний технический долг из backlog: IPv6 ECN marking в `markECNCE`. Прочтена история (Запуски 1–65). Обнаружено:
+
+1. **Ветка `claude/reduce-vpn-bandwidth-NGVmG` опережает `claude/funny-tesla-EFASY` на 65+ коммитов.**
+2. **Все элементы исходного backlog закрыты:**
+   - ~~BBR app-limited~~ — Запуск 4
+   - ~~Mutex contention (sendMu, CwndTarget)~~ — Запуски 2, 8
+   - ~~ObfsConn double buffering~~ — Запуск 1
+   - ~~Double CC (ECN propagation)~~ — Запуск 11
+   - ~~Download < Upload asymmetry~~ — Запуски 20–23
+   - ~~API token protection~~ — Запуск 18
+   - ~~Anti-probing decoy~~ — Запуск 19
+   - ~~IPv6 inner tunnel ECN~~ — Запуск 27 (`markECNCEv4` + `markECNCEv6`)
+
+3. **Обнаружен `TestNoiseConnLazyDeadline` flaky** при запуске полного `go test ./...` (1 падение из ~5). В изоляции (`-count=5`) — 5/5 PASS. Pre-existing race под нагрузкой от параллельного suite.
+
+**Действия:**
+- Создана ветка `claude/reduce-vpn-bandwidth-NGVmG` от `claude/funny-tesla-EFASY`
+- Реализован IPv6 ECN (inline switch), запущены тесты (12/12 PASS)
+- Обнаружено совпадение с Запуском 27 на remote — `git reset --hard origin/...`
+- Актуальное состояние: Run 65 (047cd37) — всё актуально
+
+**Итоговое состояние backlog:**
+
+| Задача | Статус | Запуск |
+|---|---|---|
+| BBR app-limited fix | ✅ | 4 |
+| sendMu contention | ✅ | 2 |
+| ObfsConn buffering | ✅ | 1 |
+| Double CC (ECN) | ✅ | 11 |
+| IPv6 ECN (markECNCEv6) | ✅ | 27 |
+| Download < Upload asymmetry | ✅ | 20–23 |
+| API token protection | ✅ | 18 |
+| Anti-probing decoy | ✅ | 19 |
+| **pprof под нагрузкой** | ⏳ | требует живого сервера |
+
+**Тесты:** 7/8 пакетов PASS; `server` — 1 flaky test (pre-existing, не регрессия).
