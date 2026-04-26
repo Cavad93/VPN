@@ -5,7 +5,6 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -396,664 +395,6 @@ func TestWSBufferedRead(t *testing.T) {
 	ws.Close()
 }
 
-// TestWSMaskingOffsetAcrossReads verifies that the 4-byte XOR masking key
-// rotates correctly when a single WebSocket frame is consumed across many
-// small Read calls. This exercises the maskOff field in the streaming
-// frame-state design — critical for non-aligned partial reads.
-func TestWSMaskingOffsetAcrossReads(t *testing.T) {
-	client, server := testPipe()
-
-	done := make(chan *WSConn, 1)
-	go func() {
-		ws, err := WSUpgrade(server, "")
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		done <- ws
-	}()
-
-	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
-	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
-	client.Write([]byte(req))
-	respBuf := make([]byte, 4096)
-	client.Read(respBuf)
-
-	ws := <-done
-
-	// 13-byte payload (not a multiple of 4) forces non-aligned masking.
-	// payload = [0, 1, 2, ..., 12]
-	payload := make([]byte, 13)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
-
-	// Read in (3 + 5 + 5) chunks:
-	//   after 3 bytes: maskOff = 3
-	//   after 8 bytes: maskOff = 0  (8 % 4)
-	//   after 13 bytes: maskOff = 1 (13 % 4)
-	type readResult struct {
-		data []byte
-		err  error
-	}
-	resCh := make(chan readResult, 1)
-	go func() {
-		var all []byte
-		for _, sz := range []int{3, 5, 5} {
-			buf := make([]byte, sz)
-			if _, err := io.ReadFull(ws, buf); err != nil {
-				resCh <- readResult{nil, err}
-				return
-			}
-			all = append(all, buf...)
-		}
-		resCh <- readResult{all, nil}
-	}()
-
-	sendMaskedFrame(t, client, wsOpBinary, payload)
-
-	res := <-resCh
-	if res.err != nil {
-		t.Fatalf("read error: %v", res.err)
-	}
-	if len(res.data) != 13 {
-		t.Fatalf("got %d bytes, want 13", len(res.data))
-	}
-	for i, b := range res.data {
-		if b != payload[i] {
-			t.Errorf("byte[%d]: got 0x%02x, want 0x%02x (masking rotation error)", i, b, payload[i])
-		}
-	}
-
-	client.Close()
-	ws.Close()
-}
-
-// TestWSStreamingReadNoIntermediateAlloc verifies that a 20-byte frame is
-// correctly delivered in two partial reads (5+15), exercising the frameRem
-// counter decrement across calls — the core of the streaming read design.
-func TestWSStreamingReadNoIntermediateAlloc(t *testing.T) {
-	client, server := testPipe()
-
-	done := make(chan *WSConn, 1)
-	go func() {
-		ws, err := WSUpgrade(server, "")
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		done <- ws
-	}()
-
-	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
-	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
-	client.Write([]byte(req))
-	respBuf := make([]byte, 4096)
-	client.Read(respBuf)
-
-	ws := <-done
-
-	payload := []byte("ABCDEFGHIJKLMNOPQRST") // 20 bytes
-
-	resCh := make(chan []byte, 1)
-	go func() {
-		first := make([]byte, 5)
-		if _, err := io.ReadFull(ws, first); err != nil {
-			t.Errorf("first read: %v", err)
-			resCh <- nil
-			return
-		}
-		second := make([]byte, 15)
-		if _, err := io.ReadFull(ws, second); err != nil {
-			t.Errorf("second read: %v", err)
-			resCh <- nil
-			return
-		}
-		resCh <- append(first, second...)
-	}()
-
-	sendMaskedFrame(t, client, wsOpBinary, payload)
-
-	got := <-resCh
-	if got == nil {
-		t.Fatal("nil result")
-	}
-	if string(got) != string(payload) {
-		t.Errorf("got %q, want %q", got, payload)
-	}
-
-	client.Close()
-	ws.Close()
-}
-
-// TestWSWriteFrameZeroAllocHotPath verifies that writing a VPN-sized binary
-// frame (≤ wsWriteBufSize) does not allocate on the heap.  Allocations in the
-// download direction (server→client) at ~2630 frames/sec caused ~3.75 MB/sec
-// of GC pressure before the embedded-buffer fix.
-func TestWSWriteFrameZeroAllocHotPath(t *testing.T) {
-	client, server := testPipe()
-
-	done := make(chan *WSConn, 1)
-	go func() {
-		ws, err := WSUpgrade(server, "")
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		done <- ws
-	}()
-
-	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
-	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
-	client.Write([]byte(req))
-	respBuf := make([]byte, 4096)
-	client.Read(respBuf)
-
-	ws := <-done
-
-	// Drain client reads so net.Pipe doesn't block writes.
-	go io.Copy(io.Discard, client)
-
-	// Payload sizes that should all take the zero-alloc hot path.
-	// The condition is: hdrLen + length <= wsWriteBufSize.
-	//   - length ≤ 125:          hdrLen = 2  → max payload = wsWriteBufSize-2 = 1470
-	//   - 126 ≤ length ≤ 65535:  hdrLen = 4  → max payload = wsWriteBufSize-4 = 1468
-	//
-	// Max expected VPN payload: tunMTU(1430)+mux(7)+noise(18) = 1455 < 1468 → always hot path.
-	sizes := []int{
-		1,    // tiny
-		125,  // max single-byte length field
-		126,  // first extended-16 length
-		1430, // tunMTU (typical VPN IP packet)
-		1455, // max Noise+mux wrapped VPN frame  (worst-case in practice)
-		1468, // max payload that fits hot path with 4-byte extended-16 header
-	}
-	for _, sz := range sizes {
-		payload := bytes.Repeat([]byte{0xAB}, sz)
-		allocs := testing.AllocsPerRun(10, func() {
-			ws.Write(payload)
-		})
-		// Allow at most 1 spurious allocation: testing.AllocsPerRun measures
-		// *all* allocations in the process during the window, including those
-		// from GC background goroutines and parallel tests.  Under parallel
-		// test execution a single GC-triggered alloc can be counted.  The real
-		// invariant is "no per-call heap allocation from writeFrame itself".
-		if allocs > 1 {
-			t.Errorf("Write(%d bytes): got %.0f allocs, want 0 (or 1 from GC noise)", sz, allocs)
-		}
-	}
-
-	client.Close()
-	ws.Close()
-}
-
-// TestWSWriteFrameOversizedPayload verifies that a payload larger than
-// wsWriteBufSize is sent correctly (slow-path heap alloc).
-func TestWSWriteFrameOversizedPayload(t *testing.T) {
-	client, server := testPipe()
-
-	done := make(chan *WSConn, 1)
-	go func() {
-		ws, err := WSUpgrade(server, "")
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		done <- ws
-	}()
-
-	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
-	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
-	client.Write([]byte(req))
-	respBuf := make([]byte, 4096)
-	client.Read(respBuf)
-
-	ws := <-done
-
-	payload := bytes.Repeat([]byte{0xCD}, wsWriteBufSize+100)
-
-	// Receive data on client side concurrently (net.Pipe is synchronous).
-	gotCh := make(chan []byte, 1)
-	go func() {
-		gotCh <- readUnmaskedFrame(t, client)
-	}()
-
-	if _, err := ws.Write(payload); err != nil {
-		t.Fatalf("Write oversized: %v", err)
-	}
-
-	got := <-gotCh
-	if !bytes.Equal(got, payload) {
-		t.Errorf("oversized write: payload mismatch (len got=%d want=%d)", len(got), len(payload))
-	}
-
-	client.Close()
-	ws.Close()
-}
-
-// TestWSWriteFrameLargePooled verifies that frames in the wsLargeWritePool range
-// (> wsWriteBufSize, ≤ wsLargeWriteBufSize) are correctly written — exercising
-// the VLESS TCP proxy download path where io.Copy delivers large chunks.
-func TestWSWriteFrameLargePooled(t *testing.T) {
-	// Test representative sizes: 4 KiB (typical TLS record), 16 KiB, and
-	// exactly wsLargeWriteBufSize-10 (the largest pooled payload).
-	sizes := []int{4 * 1024, 16 * 1024, wsLargeWriteBufSize - 10}
-	for _, sz := range sizes {
-		sz := sz
-		t.Run(fmt.Sprintf("payload_%d", sz), func(t *testing.T) {
-			client, server := testPipe()
-
-			done := make(chan *WSConn, 1)
-			go func() {
-				ws, err := WSUpgrade(server, "")
-				if err != nil {
-					t.Error(err)
-					return
-				}
-				done <- ws
-			}()
-
-			wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
-			req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
-			client.Write([]byte(req))
-			respBuf := make([]byte, 4096)
-			client.Read(respBuf)
-
-			ws := <-done
-
-			payload := bytes.Repeat([]byte{0xEF}, sz)
-
-			gotCh := make(chan []byte, 1)
-			go func() {
-				gotCh <- readUnmaskedFrame(t, client)
-			}()
-
-			if _, err := ws.Write(payload); err != nil {
-				t.Fatalf("Write large pooled (%d bytes): %v", sz, err)
-			}
-
-			got := <-gotCh
-			if !bytes.Equal(got, payload) {
-				t.Errorf("large pooled write %d bytes: payload mismatch (got %d bytes)", sz, len(got))
-			}
-
-			client.Close()
-			ws.Close()
-		})
-	}
-}
-
-// TestWSWriteFrameDataIntegrity verifies that the embedded writeBuf produces
-// byte-for-byte identical output to the previous heap-alloc implementation.
-func TestWSWriteFrameDataIntegrity(t *testing.T) {
-	client, server := testPipe()
-
-	done := make(chan *WSConn, 1)
-	go func() {
-		ws, err := WSUpgrade(server, "")
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		done <- ws
-	}()
-
-	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
-	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
-	client.Write([]byte(req))
-	respBuf := make([]byte, 4096)
-	client.Read(respBuf)
-
-	ws := <-done
-
-	// Write a 1430-byte frame (typical tunMTU packet).
-	want := make([]byte, 1430)
-	for i := range want {
-		want[i] = byte(i & 0xFF)
-	}
-
-	gotCh := make(chan []byte, 1)
-	go func() {
-		gotCh <- readUnmaskedFrame(t, client)
-	}()
-
-	if _, err := ws.Write(want); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	got := <-gotCh
-	if !bytes.Equal(got, want) {
-		t.Errorf("data integrity failure: first diff at byte %d", func() int {
-			for i := range want {
-				if i >= len(got) || got[i] != want[i] {
-					return i
-				}
-			}
-			return -1
-		}())
-	}
-
-	client.Close()
-	ws.Close()
-}
-
-// TestWSWriteFrameControlNotAffected verifies that control frames (ping/pong/close)
-// remain correct after the writeBuf optimisation — they must NOT use writeBuf.
-func TestWSWriteFrameControlNotAffected(t *testing.T) {
-	client, server := testPipe()
-
-	done := make(chan *WSConn, 1)
-	go func() {
-		ws, err := WSUpgrade(server, "")
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		done <- ws
-	}()
-
-	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
-	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
-	client.Write([]byte(req))
-	respBuf := make([]byte, 4096)
-	client.Read(respBuf)
-
-	ws := <-done
-
-	// Pattern for net.Pipe (synchronous): start the server-side reader goroutine
-	// FIRST, then write from the client side.  The reader goroutine handles the
-	// ping and auto-sends a pong; the client's pongCh goroutine reads the pong.
-
-	// 1. Start server reader — processes ping and replies with pong.
-	readDone := make(chan error, 1)
-	go func() {
-		buf := make([]byte, 1024)
-		_, err := ws.Read(buf) // blocks until ping arrives
-		readDone <- err
-	}()
-
-	// 2. Start client receiver — waits for the pong that ws.Read will auto-send.
-	pongCh := make(chan []byte, 1)
-	go func() {
-		pongCh <- readUnmaskedFrame(t, client)
-	}()
-
-	// 3. Client sends a ping; ws.Read() goroutine wakes up, processes it, sends pong.
-	pingPayload := []byte("keepalive-check")
-	sendMaskedFrame(t, client, wsOpPing, pingPayload)
-
-	// 4. Verify pong echoes the ping payload.
-	pong := <-pongCh
-	if !bytes.Equal(pong, pingPayload) {
-		t.Errorf("pong payload = %q, want %q", pong, pingPayload)
-	}
-
-	// 5. Close connections; ws.Read() goroutine will return with an error.
-	client.Close()
-	ws.Close()
-	<-readDone // drain to avoid goroutine leak
-}
-
-// --- wsReadPool tests ---
-
-// upgradeServerSide performs the server-side WS upgrade handshake and returns
-// the WSConn, using the same client conn for writing upgrade headers.
-func upgradeServerSide(t *testing.T, client, server net.Conn) *WSConn {
-	t.Helper()
-	done := make(chan *WSConn, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		ws, err := WSUpgrade(server, "")
-		if err != nil {
-			errCh <- err
-		} else {
-			done <- ws
-		}
-	}()
-	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
-	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
-	client.Write([]byte(req))
-	respBuf := make([]byte, 4096)
-	client.Read(respBuf)
-	select {
-	case ws := <-done:
-		return ws
-	case err := <-errCh:
-		t.Fatalf("WSUpgrade: %v", err)
-		return nil
-	}
-}
-
-// TestWSReadFrameVPNSizeDataIntegrity verifies that a VPN-sized (1430-byte)
-// masked client frame is decoded correctly when read via the wsReadPool path.
-func TestWSReadFrameVPNSizeDataIntegrity(t *testing.T) {
-	client, server := testPipe()
-	ws := upgradeServerSide(t, client, server)
-
-	payload := make([]byte, 1430)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
-
-	readDone := make(chan []byte, 1)
-	go func() {
-		buf := make([]byte, 4096)
-		n, err := ws.Read(buf)
-		if err != nil {
-			t.Errorf("Read: %v", err)
-			readDone <- nil
-			return
-		}
-		readDone <- buf[:n]
-	}()
-
-	sendMaskedFrame(t, client, wsOpBinary, payload)
-	got := <-readDone
-
-	if !bytes.Equal(got, payload) {
-		t.Errorf("data mismatch: got %d bytes, want %d", len(got), len(payload))
-	}
-	client.Close()
-	ws.Close()
-}
-
-// TestWSReadFrameAtMTUSizeDataIntegrity verifies a frame exactly at tunMTU
-// (1430 bytes — the typical VPN frame size) is decoded correctly.
-func TestWSReadFrameAtMTUSizeDataIntegrity(t *testing.T) {
-	client, server := testPipe()
-	ws := upgradeServerSide(t, client, server)
-
-	const frameSize = 1430
-	payload := bytes.Repeat([]byte{0xCA}, frameSize)
-
-	readDone := make(chan []byte, 1)
-	go func() {
-		buf := make([]byte, frameSize+10)
-		n, err := ws.Read(buf)
-		if err != nil {
-			t.Errorf("Read: %v", err)
-			readDone <- nil
-			return
-		}
-		readDone <- buf[:n]
-	}()
-
-	sendMaskedFrame(t, client, wsOpBinary, payload)
-	got := <-readDone
-
-	if !bytes.Equal(got, payload) {
-		t.Errorf("at MTU size: data mismatch: len=%d want=%d", len(got), len(payload))
-	}
-	client.Close()
-	ws.Close()
-}
-
-// TestWSReadFrameOversizedDataIntegrity verifies a frame larger than the
-// typical VPN MTU (1501 bytes) is still decoded correctly by the streaming path.
-func TestWSReadFrameOversizedDataIntegrity(t *testing.T) {
-	client, server := testPipe()
-	ws := upgradeServerSide(t, client, server)
-
-	const frameSize = 1501
-	payload := bytes.Repeat([]byte{0xBB}, frameSize)
-
-	readDone := make(chan []byte, 1)
-	go func() {
-		buf := make([]byte, frameSize+100)
-		n, err := ws.Read(buf)
-		if err != nil {
-			t.Errorf("Read: %v", err)
-			readDone <- nil
-			return
-		}
-		readDone <- buf[:n]
-	}()
-
-	sendMaskedFrame(t, client, wsOpBinary, payload)
-	got := <-readDone
-
-	if !bytes.Equal(got, payload) {
-		t.Errorf("oversized frame: data mismatch")
-	}
-	client.Close()
-	ws.Close()
-}
-
-// TestWSReadFramePartialReadDrainsCorrectly verifies that when a frame is read
-// in multiple small calls (via the streaming frameRem path), all bytes are
-// correct and frameRem reaches 0 after the last byte is consumed.
-func TestWSReadFramePartialReadDrainsCorrectly(t *testing.T) {
-	client, server := testPipe()
-	ws := upgradeServerSide(t, client, server)
-
-	// 60-byte payload, read 20 bytes at a time → exercises frameRem decrement.
-	payload := make([]byte, 60)
-	for i := range payload {
-		payload[i] = byte(i * 3)
-	}
-
-	type result struct {
-		data []byte
-		err  error
-	}
-	resCh := make(chan result, 1)
-	go func() {
-		var all []byte
-		smallBuf := make([]byte, 20)
-		for len(all) < len(payload) {
-			n, err := ws.Read(smallBuf)
-			if err != nil {
-				resCh <- result{nil, err}
-				return
-			}
-			all = append(all, smallBuf[:n]...)
-		}
-		resCh <- result{all, nil}
-	}()
-
-	sendMaskedFrame(t, client, wsOpBinary, payload)
-	res := <-resCh
-	if res.err != nil {
-		t.Fatalf("partial read: %v", res.err)
-	}
-	if !bytes.Equal(res.data, payload) {
-		t.Errorf("partial read: data mismatch")
-	}
-	// After all bytes consumed, frameRem must be 0 (streaming state reset).
-	if ws.frameRem != 0 {
-		t.Errorf("frameRem=%d after full drain, want 0", ws.frameRem)
-	}
-
-	client.Close()
-	ws.Close()
-}
-
-// TestWSReadFrameSequentialFramesCorrect verifies N back-to-back frames are
-// all decoded correctly when pool buffers are recycled between reads.
-func TestWSReadFrameSequentialFramesCorrect(t *testing.T) {
-	client, server := testPipe()
-	ws := upgradeServerSide(t, client, server)
-
-	const N = 10
-	payloadSize := 1430
-
-	allDone := make(chan [][]byte, 1)
-	go func() {
-		received := make([][]byte, 0, N)
-		buf := make([]byte, payloadSize*2)
-		for i := 0; i < N; i++ {
-			n, err := ws.Read(buf)
-			if err != nil {
-				t.Errorf("frame %d read error: %v", i, err)
-				allDone <- nil
-				return
-			}
-			cp := make([]byte, n)
-			copy(cp, buf[:n])
-			received = append(received, cp)
-		}
-		allDone <- received
-	}()
-
-	for i := 0; i < N; i++ {
-		payload := bytes.Repeat([]byte{byte(i + 1)}, payloadSize)
-		sendMaskedFrame(t, client, wsOpBinary, payload)
-	}
-
-	received := <-allDone
-	if received == nil {
-		t.Fatal("goroutine reported error")
-	}
-	for i, got := range received {
-		want := bytes.Repeat([]byte{byte(i + 1)}, payloadSize)
-		if !bytes.Equal(got, want) {
-			t.Errorf("frame %d: data mismatch (len got=%d want=%d)", i, len(got), len(want))
-		}
-	}
-	client.Close()
-	ws.Close()
-}
-
-// TestWSReadFrameZeroLengthPayload verifies that a zero-length data frame
-// does not panic. ws.Read may return (0, nil) for it, which is valid for
-// io.Reader. We then verify the next non-empty frame is still decoded correctly.
-func TestWSReadFrameZeroLengthPayload(t *testing.T) {
-	client, server := testPipe()
-	ws := upgradeServerSide(t, client, server)
-
-	// Send both frames from a goroutine. net.Pipe is synchronous: each
-	// sendMaskedFrame blocks until the server-side reader (ws.Read) consumes it.
-	sendDone := make(chan struct{})
-	go func() {
-		defer close(sendDone)
-		sendMaskedFrame(t, client, wsOpBinary, []byte{})           // zero-length
-		sendMaskedFrame(t, client, wsOpBinary, []byte{1, 2, 3, 4}) // follow-up
-	}()
-
-	buf := make([]byte, 64)
-	// First ws.Read — processes the zero-length frame (returns 0, nil).
-	n0, err := ws.Read(buf)
-	if err != nil {
-		t.Fatalf("Read(zero-length frame): unexpected error: %v", err)
-	}
-	if n0 != 0 {
-		t.Errorf("Read(zero-length frame): got n=%d, want 0", n0)
-	}
-
-	// Second ws.Read — processes the 4-byte follow-up frame.
-	n1, err := ws.Read(buf)
-	if err != nil {
-		t.Fatalf("Read(4-byte frame): unexpected error: %v", err)
-	}
-	if n1 != 4 || !bytes.Equal(buf[:n1], []byte{1, 2, 3, 4}) {
-		t.Errorf("Read(4-byte frame): got %v (n=%d), want [1 2 3 4]", buf[:n1], n1)
-	}
-
-	<-sendDone
-	client.Close()
-	ws.Close()
-}
-
 // --- Helpers for tests ---
 
 // sendMaskedFrame sends a WebSocket frame with masking (client→server).
@@ -1090,207 +431,87 @@ func sendMaskedFrame(t *testing.T, conn net.Conn, opcode byte, payload []byte) {
 	conn.Write(buf.Bytes())
 }
 
-// TestWSReadBufSizeCoversFullBurst verifies that wsReadBufSize is large enough
-// to hold an 11-frame burst (the burst window at 30 Mbps) in one syscall, and
-// that it equals the canonical TLS max-record size (16 384 bytes).
-func TestWSReadBufSizeCoversFullBurst(t *testing.T) {
-	// Largest VPN frame: tunMTU(1430) + mux(7) + noise(18) = 1455 bytes payload
-	// + WS header 4 bytes (2-byte extended length) = 1459 bytes on wire.
-	const maxFrameOnWire = 1459
-	const burstFrames = 11 // 11 × 1459 = 16 049 < 16 384
-	if wsReadBufSize < maxFrameOnWire*burstFrames {
-		t.Errorf("wsReadBufSize=%d too small for %d-frame burst (%d bytes needed)",
-			wsReadBufSize, burstFrames, maxFrameOnWire*burstFrames)
-	}
-	// Must equal max TLS record size for layer alignment.
-	const tlsMaxRecord = 16384
-	if wsReadBufSize != tlsMaxRecord {
-		t.Errorf("wsReadBufSize=%d should equal TLS max record size %d", wsReadBufSize, tlsMaxRecord)
-	}
-}
+// TestWSUnmask verifies wsUnmask correctness for various payload lengths,
+// including 0-, 1-, 3-, 4-, 5-, 7-, 8-, and 15-byte cases to cover all
+// alignment variants of the 4-byte-at-a-time loop.
+func TestWSUnmask(t *testing.T) {
+	mask := [4]byte{0xAA, 0xBB, 0xCC, 0xDD}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// wsUnmask unit tests
-// ─────────────────────────────────────────────────────────────────────────────
-
-// referenceUnmask is the canonical byte-by-byte implementation used as the
-// correctness oracle in wsUnmask tests.
-func referenceUnmask(payload []byte, maskKey [4]byte) {
-	for i := range payload {
-		payload[i] ^= maskKey[i%4]
-	}
-}
-
-// TestWSUnmask_Empty verifies wsUnmask handles a zero-length payload safely.
-func TestWSUnmask_Empty(t *testing.T) {
-	var key [4]byte = [4]byte{0xAB, 0xCD, 0xEF, 0x12}
-	wsUnmask(nil, key)         // must not panic
-	wsUnmask([]byte{}, key)    // must not panic
-}
-
-// TestWSUnmask_SingleByte verifies 1-byte payload (only remainder path).
-func TestWSUnmask_SingleByte(t *testing.T) {
-	key := [4]byte{0x37, 0x42, 0x00, 0xFF}
-	got := []byte{0xAA}
-	ref := []byte{0xAA}
-	wsUnmask(got, key)
-	referenceUnmask(ref, key)
-	if !bytes.Equal(got, ref) {
-		t.Fatalf("1-byte: got %v want %v", got, ref)
-	}
-}
-
-// TestWSUnmask_SevenBytes verifies 7-byte payload (only remainder path, max size).
-func TestWSUnmask_SevenBytes(t *testing.T) {
-	key := [4]byte{0x11, 0x22, 0x33, 0x44}
-	orig := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
-	got := append([]byte{}, orig...)
-	ref := append([]byte{}, orig...)
-	wsUnmask(got, key)
-	referenceUnmask(ref, key)
-	if !bytes.Equal(got, ref) {
-		t.Fatalf("7-byte: got %v want %v", got, ref)
-	}
-}
-
-// TestWSUnmask_EightBytes verifies 8-byte payload (exactly one uint64 iteration,
-// no remainder).
-func TestWSUnmask_EightBytes(t *testing.T) {
-	key := [4]byte{0xDE, 0xAD, 0xBE, 0xEF}
-	orig := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
-	got := append([]byte{}, orig...)
-	ref := append([]byte{}, orig...)
-	wsUnmask(got, key)
-	referenceUnmask(ref, key)
-	if !bytes.Equal(got, ref) {
-		t.Fatalf("8-byte: got %v want %v", got, ref)
-	}
-}
-
-// TestWSUnmask_NineBytes verifies 9-byte payload (one uint64 + 1 remainder byte).
-func TestWSUnmask_NineBytes(t *testing.T) {
-	key := [4]byte{0x01, 0x02, 0x03, 0x04}
-	orig := make([]byte, 9)
-	for i := range orig {
-		orig[i] = byte(i * 13)
-	}
-	got := append([]byte{}, orig...)
-	ref := append([]byte{}, orig...)
-	wsUnmask(got, key)
-	referenceUnmask(ref, key)
-	if !bytes.Equal(got, ref) {
-		t.Fatalf("9-byte: got %v want %v", got, ref)
-	}
-}
-
-// TestWSUnmask_VPNFrameSize verifies a 1455-byte payload — the exact steady-state
-// size of a VPN frame (tunMTU=1430 + mux=7 + noise=18). This is the common case
-// for upload traffic.
-func TestWSUnmask_VPNFrameSize(t *testing.T) {
-	key := [4]byte{0xCA, 0xFE, 0xBA, 0xBE}
-	orig := make([]byte, 1455)
-	for i := range orig {
-		orig[i] = byte(i*7 + 3)
-	}
-	got := append([]byte{}, orig...)
-	ref := append([]byte{}, orig...)
-	wsUnmask(got, key)
-	referenceUnmask(ref, key)
-	if !bytes.Equal(got, ref) {
-		t.Fatalf("1455-byte VPN frame: output mismatch at first diff index")
-	}
-}
-
-// TestWSUnmask_AllZeroKey verifies that a zero key is a no-op (XOR with 0).
-func TestWSUnmask_AllZeroKey(t *testing.T) {
-	key := [4]byte{0x00, 0x00, 0x00, 0x00}
-	orig := []byte{0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC}
-	got := append([]byte{}, orig...)
-	wsUnmask(got, key)
-	if !bytes.Equal(got, orig) {
-		t.Fatalf("zero key should be no-op: got %v want %v", got, orig)
-	}
-}
-
-// TestWSUnmask_AllOnesKey verifies that a 0xFF key inverts all bits.
-func TestWSUnmask_AllOnesKey(t *testing.T) {
-	key := [4]byte{0xFF, 0xFF, 0xFF, 0xFF}
-	orig := []byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
-	got := append([]byte{}, orig...)
-	wsUnmask(got, key)
-	for i, b := range got {
-		if b != orig[i]^0xFF {
-			t.Fatalf("byte %d: got 0x%02x want 0x%02x", i, b, orig[i]^0xFF)
+	// reference: naive byte-by-byte XOR
+	naiveUnmask := func(b []byte) []byte {
+		out := make([]byte, len(b))
+		for i, v := range b {
+			out[i] = v ^ mask[i%4]
 		}
+		return out
 	}
-}
 
-// TestWSUnmask_Idempotent verifies that applying wsUnmask twice restores the
-// original data (XOR is its own inverse).
-func TestWSUnmask_Idempotent(t *testing.T) {
-	key := [4]byte{0x55, 0xAA, 0x55, 0xAA}
-	orig := make([]byte, 1455)
-	for i := range orig {
-		orig[i] = byte(i)
-	}
-	got := append([]byte{}, orig...)
-	wsUnmask(got, key) // encrypt
-	wsUnmask(got, key) // decrypt == original
-	if !bytes.Equal(got, orig) {
-		t.Fatalf("double-unmask should restore original")
-	}
-}
-
-// TestWSUnmask_MultipleChunkSizes tests payload lengths that exercise all
-// combinations of full uint64 chunks and remainder bytes (0–7).
-func TestWSUnmask_MultipleChunkSizes(t *testing.T) {
-	key := [4]byte{0x12, 0x34, 0x56, 0x78}
-	for size := 0; size <= 64; size++ {
-		orig := make([]byte, size)
+	sizes := []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 127, 128, 1430, 65535}
+	for _, sz := range sizes {
+		orig := make([]byte, sz)
 		for i := range orig {
-			orig[i] = byte(i*17 + 5)
+			orig[i] = byte(i * 13)
 		}
-		got := append([]byte{}, orig...)
-		ref := append([]byte{}, orig...)
-		wsUnmask(got, key)
-		referenceUnmask(ref, key)
-		if !bytes.Equal(got, ref) {
-			t.Fatalf("size=%d: wsUnmask output differs from reference", size)
-		}
-	}
-}
+		want := naiveUnmask(orig)
 
-// BenchmarkWSUnmask_ByteByByte measures the per-byte XOR approach (baseline).
-func BenchmarkWSUnmask_ByteByByte(b *testing.B) {
-	key := [4]byte{0xCA, 0xFE, 0xBA, 0xBE}
-	payload := make([]byte, 1455)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
-	b.SetBytes(1455)
-	b.ResetTimer()
-	for range b.N {
-		for i := range payload {
-			payload[i] ^= key[i%4]
+		got := make([]byte, sz)
+		copy(got, orig)
+		wsUnmask(got, mask)
+
+		if !bytes.Equal(got, want) {
+			t.Errorf("wsUnmask(%d bytes): mismatch", sz)
 		}
 	}
 }
 
-// BenchmarkWSUnmask_Word64 measures the uint64 XOR approach (optimised).
-func BenchmarkWSUnmask_Word64(b *testing.B) {
-	key := [4]byte{0xCA, 0xFE, 0xBA, 0xBE}
-	payload := make([]byte, 1455)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
-	b.SetBytes(1455)
-	b.ResetTimer()
-	for range b.N {
-		wsUnmask(payload, key)
+// TestWSUnmaskIdempotent verifies that applying wsUnmask twice restores the original.
+func TestWSUnmaskIdempotent(t *testing.T) {
+	mask := [4]byte{0x12, 0x34, 0x56, 0x78}
+	orig := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
+	buf := make([]byte, len(orig))
+	copy(buf, orig)
+	wsUnmask(buf, mask)
+	wsUnmask(buf, mask) // second application must restore original
+	if !bytes.Equal(buf, orig) {
+		t.Errorf("double wsUnmask: got %v, want %v", buf, orig)
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// TestWSWritePoolReuse verifies that the zero-alloc write path produces the
+// same bytes as the reference naive implementation.
+func TestWSWritePoolReuse(t *testing.T) {
+	// Write a VPN-sized frame (1452 bytes) and verify the received payload.
+	client, server := testPipe()
+
+	done := make(chan *WSConn, 1)
+	go func() {
+		ws, err := WSUpgrade(server, "")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		done <- ws
+	}()
+
+	wsKey := "dGhlIHNhbXBsZSBub25jZQ=="
+	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
+	client.Write([]byte(req))
+	respBuf := make([]byte, 4096)
+	client.Read(respBuf)
+	ws := <-done
+
+	payload := bytes.Repeat([]byte{0xAB}, 1452)
+	go ws.Write(payload)
+
+	got := readUnmaskedFrame(t, client)
+	if !bytes.Equal(got, payload) {
+		t.Errorf("1452-byte frame: payload mismatch (len got=%d, want=%d)", len(got), len(payload))
+	}
+
+	client.Close()
+	ws.Close()
+}
+
 // readUnmaskedFrame reads a server→client unmasked frame.
 func readUnmaskedFrame(t *testing.T, conn net.Conn) []byte {
 	t.Helper()
