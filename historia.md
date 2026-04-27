@@ -4910,3 +4910,51 @@ dom := domBuf[:domLen[0]]             // zero-copy slice view
 
 **Оставшиеся задачи:**
 - **pprof под нагрузкой** — требует живого сервера с реальным трафиком. CPU flamegraph недостижим в sandbox.
+
+---
+
+## Запуск 71 — 2026-04-27
+
+### Выполнено: аудит ветки + синхронизация + верификация тестов
+
+**Ветка:** `claude/reduce-vpn-bandwidth-NGVmG`
+
+**Контекст:**
+
+Сессия стартовала с `claude/funny-tesla-rmeRk` (последний коммит `a283546`). При создании `claude/reduce-vpn-bandwidth-NGVmG` обнаружилось, что эта ветка уже существует на remote и содержит **101 коммит** (Run 27 – Run 70) с опережением ~44 запуска.
+
+**Что уже сделано на remote-ветке (Run 27–70):**
+
+| Категория | Примеры |
+|---|---|
+| Pool-оптимизации | `relayChanPool`, `ioCopyBufPool`, `udpPktPool` (chan *[]byte), `mmsgStatePool`, WSConn zero-alloc read/write |
+| BBR / congestion | UDP batch receive zero-alloc, TCP_QUICKACK re-arm в noiseConn, cancel timer leak fix |
+| Transport perf | VLESS zero-alloc FormatUUID/ParseUUID/addons, domain stack buf [255]byte |
+| IPv6 support | `markECNCE` расширен до IPv6 Traffic Class (RFC 8200) |
+| Lock-free | `nextIDMu+nextID` → `atomic.Uint64`, IPv6 session lookup via `ip6ConcMap` |
+| Relay | TCP relay использует `ioCopyBufPool` + `relayChanPool`, UDP relay — `chan *[]byte` |
+
+**Что было проанализировано в этой сессии:**
+
+1. **UDP relay аллокация** — исправлено в Run 27–30 через `udpPktPool` + `chan *[]byte`. Remote использует более компактный тип чем мой `udpRelayBuf`.
+2. **WebSocket writeFrame аллокация** — исправлено через WSConn zero-alloc write path (Run 62–65).
+3. **TCP relay io.Copy buffer** — исправлено через `ioCopyBufPool` + `relayChanPool`.
+4. **BBR seed RTT (78ms)** — проверено: 78ms ≈ propagation delay для Казахстана (корректно). Loaded RTT 919ms включает queuing delay.
+5. **Asymmetry download vs upload** — 6.0 Mbps = 83% теоретического потолка (7.2 Mbps). Остаток — VPN overhead шифрования.
+
+**Верификация:** `go test ./... -count=1` — **все 8 пакетов зелёные**.
+
+**Статус задач из первоначального ТЗ:**
+
+| Задача | Статус |
+|---|---|
+| BBR app-limited — idle BtlBw | ✅ DONE (Run 4, 6, 17) |
+| Mutex contention — sendMu | ✅ DONE (Run 2, 8) |
+| ObfsConn double buffering | ✅ DONE (Run 1) |
+| Double CC — ECN CE propagation | ✅ DONE (Run 11) |
+| Download asymmetry | ✅ DONE (Runs 17–22, +71%) |
+| API auth protection | ✅ DONE (Run 18) |
+| Active scanning decoy | ✅ DONE (Run 19, cover.go) |
+| Setup guide в historia.md | ✅ DONE (Run 18, 26) |
+
+**Следующий приоритет:** pprof анализ под живой нагрузкой (требует VPN-сервера с реальным трафиком).
