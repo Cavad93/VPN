@@ -4681,3 +4681,119 @@ cancel() // release timer immediately; safe — inner.Read has already returned
 
 **Оставшиеся задачи:**
 - **pprof под нагрузкой** — требует живого сервера. Следующий уровень оптимизации после heap-давления: CPU flamegraph.
+
+---
+
+## Запуск 68 — 2026-04-27 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: vless.go — zero-alloc FormatUUID, ParseUUID O(n²)→O(n), stack-alloc addons skip
+
+**Файл:** `server/transport/vless.go`
+
+**Три неэффективности, устранённые в одном атомарном коммите:**
+
+---
+
+#### 1. FormatUUID: 6 аллокаций → 1
+
+**Было:**
+```go
+func FormatUUID(uuid [16]byte) string {
+    return fmt.Sprintf("%s-%s-%s-%s-%s",
+        hex.EncodeToString(uuid[0:4]),   // alloc 1
+        hex.EncodeToString(uuid[4:6]),   // alloc 2
+        hex.EncodeToString(uuid[6:8]),   // alloc 3
+        hex.EncodeToString(uuid[8:10]),  // alloc 4
+        hex.EncodeToString(uuid[10:16]), // alloc 5
+    )                                    // fmt.Sprintf alloc 6
+}
+```
+
+Каждый `hex.EncodeToString` аллоцирует новую строку на куче. `fmt.Sprintf` аллоцирует ещё одну для форматирования. Итого: **6 heap alloc** на каждый вызов.
+
+**Стало:**
+```go
+func FormatUUID(uuid [16]byte) string {
+    var buf [36]byte
+    hex.Encode(buf[0:8], uuid[0:4])
+    buf[8] = '-'
+    hex.Encode(buf[9:13], uuid[4:6])
+    buf[13] = '-'
+    hex.Encode(buf[14:18], uuid[6:8])
+    buf[18] = '-'
+    hex.Encode(buf[19:23], uuid[8:10])
+    buf[23] = '-'
+    hex.Encode(buf[24:36], uuid[10:16])
+    return string(buf[:])
+}
+```
+
+`hex.Encode` пишет в уже выделенный стековый `[36]byte`. Единственная аллокация — неизбежное `string(buf[:])` при возврате (копирование в иммутабельную строку). **1 heap alloc** вместо 6.
+
+---
+
+#### 2. ParseUUID: O(n²) 32 аллокации → O(n) 0 аллокаций
+
+**Было:**
+```go
+clean := ""
+for _, c := range s {
+    if c != '-' {
+        clean += string(c)  // string(c) = alloc, += = realloc → ~32 аллокаций
+    }
+}
+b, err := hex.DecodeString(clean)  // alloc для []byte результата
+copy(uuid[:], b)
+```
+
+`range` по строке возвращает `rune`; `string(c)` выделяет строку на каждую итерацию; `+=` каждый раз перевыделяет `clean`. При UUID = 32 hex символа + 4 дефиса = 36 итераций → до 32 конкатенаций. Итого: **~32 heap alloc** плюс `hex.DecodeString` с промежуточным `[]byte`.
+
+**Стало:**
+```go
+var hexBuf [32]byte
+n := 0
+for i := 0; i < len(s); i++ {
+    if s[i] != '-' {
+        if n >= 32 { return uuid, errors.New("vless: UUID too long") }
+        hexBuf[n] = s[i]
+        n++
+    }
+}
+if n != 32 { return uuid, errors.New("vless: invalid UUID length") }
+if _, err := hex.Decode(uuid[:], hexBuf[:]); err != nil { ... }
+```
+
+Байтовый цикл по строке (без `range`/rune-конверсии), запись в стековый `[32]byte`. `hex.Decode` пишет напрямую в `uuid[:]` — стек. **0 heap alloc** на happy path.
+
+Дополнительная защита: добавлена проверка `n >= 32` (ранний выход при слишком длинном UUID без дефисов).
+
+---
+
+#### 3. VLESSParseRequest addons skip: 1 heap alloc → 0
+
+**Было:**
+```go
+if _, err := io.ReadFull(r, make([]byte, addonsLen)); err != nil {
+```
+
+`make([]byte, addonsLen)` — heap аллокация на каждый запрос с addons. `addons_len` — один байт, значит максимум 255 байт.
+
+**Стало:**
+```go
+var scratch [255]byte
+if _, err := io.ReadFull(r, scratch[:addonsLen]); err != nil {
+```
+
+`[255]byte` — стек. Срез `scratch[:addonsLen]` — zero-alloc view. **0 heap alloc**.
+
+---
+
+**Контекст вызовов:**
+- `VLESSParseRequest` вызывается в `vless_handler.go` на каждое входящее VLESS соединение.
+- `FormatUUID` / `ParseUUID` вызываются при настройке туннеля, логировании, в REST API для управления ключами.
+- При 1000 соединений/сек: экономия ~33 аллокаций × 1000 = **~33,000 аллокаций/сек** снято с GC.
+
+**Тесты:** все 13 VLESS-тестов PASS, полный `go test ./... -count=1` — 8/8 пакетов зелёные.
+
+**Оставшиеся задачи:**
+- **pprof под нагрузкой** — требует живого сервера. CPU flamegraph для следующего уровня оптимизаций.

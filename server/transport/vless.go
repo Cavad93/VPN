@@ -65,9 +65,11 @@ func VLESSParseRequest(r io.Reader) (*VLESSRequest, error) {
 	copy(req.UUID[:], hdr[1:17])
 	addonsLen := int(hdr[17])
 
-	// Skip addons (we don't use them but must consume the bytes)
+	// Skip addons (we don't use them but must consume the bytes).
+	// addons_len is a single byte so max 255 — use a stack buffer to avoid heap alloc.
 	if addonsLen > 0 {
-		if _, err := io.ReadFull(r, make([]byte, addonsLen)); err != nil {
+		var scratch [255]byte
+		if _, err := io.ReadFull(r, scratch[:addonsLen]); err != nil {
 			return nil, fmt.Errorf("vless: read addons: %w", err)
 		}
 	}
@@ -131,33 +133,41 @@ func GenerateVLESSUUID() ([16]byte, error) {
 }
 
 // FormatUUID returns the standard UUID string representation.
+// Uses a stack-allocated [36]byte buffer — 1 heap alloc (string conversion) vs 6 previously.
 func FormatUUID(uuid [16]byte) string {
-	return fmt.Sprintf("%s-%s-%s-%s-%s",
-		hex.EncodeToString(uuid[0:4]),
-		hex.EncodeToString(uuid[4:6]),
-		hex.EncodeToString(uuid[6:8]),
-		hex.EncodeToString(uuid[8:10]),
-		hex.EncodeToString(uuid[10:16]),
-	)
+	var buf [36]byte
+	hex.Encode(buf[0:8], uuid[0:4])
+	buf[8] = '-'
+	hex.Encode(buf[9:13], uuid[4:6])
+	buf[13] = '-'
+	hex.Encode(buf[14:18], uuid[6:8])
+	buf[18] = '-'
+	hex.Encode(buf[19:23], uuid[8:10])
+	buf[23] = '-'
+	hex.Encode(buf[24:36], uuid[10:16])
+	return string(buf[:])
 }
 
 // ParseUUID parses a UUID string (with or without dashes) into 16 bytes.
+// Uses a stack-allocated [32]byte hex buffer — O(n) single pass, zero heap allocs.
 func ParseUUID(s string) ([16]byte, error) {
 	var uuid [16]byte
-	// Remove dashes
-	clean := ""
-	for _, c := range s {
-		if c != '-' {
-			clean += string(c)
+	var hexBuf [32]byte
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] != '-' {
+			if n >= 32 {
+				return uuid, errors.New("vless: UUID too long")
+			}
+			hexBuf[n] = s[i]
+			n++
 		}
 	}
-	if len(clean) != 32 {
+	if n != 32 {
 		return uuid, errors.New("vless: invalid UUID length")
 	}
-	b, err := hex.DecodeString(clean)
-	if err != nil {
+	if _, err := hex.Decode(uuid[:], hexBuf[:]); err != nil {
 		return uuid, fmt.Errorf("vless: invalid UUID hex: %w", err)
 	}
-	copy(uuid[:], b)
 	return uuid, nil
 }
