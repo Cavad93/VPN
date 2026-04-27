@@ -262,8 +262,9 @@ type Server struct {
 	ipIndex     sync.Map
 	// ip6Index maps [16]byte IPv6 destination address → *clientSession.
 	// Only populated when pool6 != nil (Tun6CIDR is configured).
-	// Same read-heavy access pattern as ipIndex — sync.Map is optimal.
-	ip6Index    sync.Map
+	// ip6ConcMap is used instead of sync.Map to avoid interface{} boxing of
+	// [16]byte on every Load call (see ip6ConcMap doc comment).
+	ip6Index    ip6ConcMap
 	allowedKeys map[[32]byte]struct{}
 	tun         TunDevice
 	pool        *ipPool
@@ -1171,11 +1172,13 @@ func (s *Server) routeFromTun(ctx context.Context) {
 			}
 			var dstKey [16]byte
 			copy(dstKey[:], buf[24:40])
-			val, ok := s.ip6Index.Load(dstKey)
+			// ip6ConcMap.Load takes [16]byte by value — no interface{} boxing,
+			// no heap allocation. Direct *clientSession return, no type assertion.
+			cs6, ok := s.ip6Index.Load(dstKey)
 			if !ok {
 				continue
 			}
-			target = val.(*clientSession)
+			target = cs6
 		default:
 			continue
 		}
@@ -1816,6 +1819,51 @@ func (p *ip6Pool) serverIP() net.IP { return cloneIP6(p.server) }
 func (p *ip6Pool) prefixLen() int {
 	ones, _ := p.network.Mask.Size()
 	return ones
+}
+
+// ip6ConcMap is a concurrent map from [16]byte IPv6 address → *clientSession.
+//
+// Why not sync.Map: sync.Map.Load takes an `any` key parameter.  Passing a
+// [16]byte (16 bytes > pointer size) boxes the value to the heap — causing one
+// allocation per IPv6 packet in the routeFromTun hot path (~2630 packets/sec at
+// 30 Mbps → ~2630 allocs/sec, ~42 KB/sec GC pressure).
+//
+// ip6ConcMap.Load takes [16]byte by value directly (stays on the caller's
+// stack) and returns *clientSession directly (no type assertion at the call
+// site) — zero heap allocations on the read path.
+//
+// Write pattern: one Store per client connect, one Delete per disconnect.
+// sync.RWMutex.RLock is ~2 ns on an uncontended path (no writers) — negligible
+// vs the TUN read and mux write that bracket this lookup.
+type ip6ConcMap struct {
+	mu sync.RWMutex
+	m  map[[16]byte]*clientSession
+}
+
+// Load returns the session for the given IPv6 key, or (nil, false).
+// Zero heap allocations: key stays on caller's stack.
+func (c *ip6ConcMap) Load(key [16]byte) (*clientSession, bool) {
+	c.mu.RLock()
+	v, ok := c.m[key]
+	c.mu.RUnlock()
+	return v, ok
+}
+
+// Store inserts or updates a key→session mapping.
+func (c *ip6ConcMap) Store(key [16]byte, val *clientSession) {
+	c.mu.Lock()
+	if c.m == nil {
+		c.m = make(map[[16]byte]*clientSession)
+	}
+	c.m[key] = val
+	c.mu.Unlock()
+}
+
+// Delete removes the mapping for key (no-op if absent).
+func (c *ip6ConcMap) Delete(key [16]byte) {
+	c.mu.Lock()
+	delete(c.m, key)
+	c.mu.Unlock()
 }
 
 // ipToKey16 converts an IPv6 address to a comparable [16]byte map key.

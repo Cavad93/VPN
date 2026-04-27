@@ -2406,11 +2406,10 @@ func TestHandleControlStreamDualStackIP6IndexRegistered(t *testing.T) {
 	var key [16]byte
 	copy(key[:], ip6bytes)
 
-	val, ok := srv.ip6Index.Load(key)
+	cs, ok := srv.ip6Index.Load(key)
 	if !ok {
 		t.Fatal("ip6Index does not contain the assigned IPv6 address")
 	}
-	cs := val.(*clientSession)
 	if cs.assignedIP6 == nil {
 		t.Fatal("clientSession.assignedIP6 is nil")
 	}

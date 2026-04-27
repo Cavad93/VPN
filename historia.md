@@ -4797,3 +4797,65 @@ if _, err := io.ReadFull(r, scratch[:addonsLen]); err != nil {
 
 **Оставшиеся задачи:**
 - **pprof под нагрузкой** — требует живого сервера. CPU flamegraph для следующего уровня оптимизаций.
+
+---
+
+## Запуск 69 — 2026-04-27 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: ip6ConcMap — zero-alloc IPv6 session lookup в routeFromTun
+
+**Файл:** `server/main.go`, `server/main_test.go`
+
+**Проблема:**
+
+В `routeFromTun` каждый исходящий IPv6 пакет выполнял:
+```go
+var dstKey [16]byte
+copy(dstKey[:], buf[24:40])
+val, ok := s.ip6Index.Load(dstKey)     // ← 1 heap alloc: interface{} boxing
+target = val.(*clientSession)          // ← type assertion
+```
+
+`s.ip6Index` был `sync.Map`. Сигнатура `sync.Map.Load(key any)` требует передать ключ как `interface{}`. При боксировании значения `[16]byte` (16 байт > 8 байт pointer size на 64-bit) Go аллоцирует heap-копию значения — 1 heap allocation на каждый IPv6 пакет.
+
+**Математика при 30 Mbps IPv6 трафика:**
+- ~2630 пакетов/сек × 16 байт = ~42 KB/сек heap pressure только от interface boxing
+- `val.(*clientSession)` — дополнительный runtime type assertion на каждом пакете
+
+**Решение: `ip6ConcMap` — типизированный конкурентный map**
+
+```go
+type ip6ConcMap struct {
+    mu sync.RWMutex
+    m  map[[16]byte]*clientSession
+}
+
+// Load принимает [16]byte по значению (stack) → возвращает *clientSession напрямую
+// Ни interface{} boxing, ни type assertion — 0 heap allocs на read path
+func (c *ip6ConcMap) Load(key [16]byte) (*clientSession, bool)
+func (c *ip6ConcMap) Store(key [16]byte, val *clientSession)
+func (c *ip6ConcMap) Delete(key [16]byte)
+```
+
+**Паттерн доступа:** многочисленные чтения (routeFromTun, ~2630/сек) vs очень редкие записи (одна на connect/disconnect). `sync.RWMutex.RLock` при отсутствии writer'ов ≈ 2 ns.
+
+**Изменения:**
+```go
+// До:
+val, ok := s.ip6Index.Load(dstKey)  // interface{} boxing → 1 heap alloc
+target = val.(*clientSession)       // type assertion
+
+// После:
+cs6, ok := s.ip6Index.Load(dstKey)  // [16]byte on stack → 0 alloc
+target = cs6                         // direct *clientSession
+```
+
+В `main_test.go` убрана `val.(*clientSession)` type assertion — `Load` теперь возвращает `(*clientSession, bool)` напрямую.
+
+**Тесты:** `go test . ./api/... ./config/... ./crypto/... ./notify/... ./perf/... ./service/... -count=1` + `go test ./transport/ -run 'Test[^B]' -count=1` — все пакеты зелёные.
+
+Pre-existing flaky `TestUDPNetConnReadContextCancelledAfterRead` не является регрессией (heap measurement sensitive to GC timing under parallel load; passes 3/3 in isolation).
+
+**Оставшиеся задачи:**
+- **pprof под нагрузкой** — требует живого сервера. CPU flamegraph.
+- **VLESSParseRequest domain** — `dom := make([]byte, domLen[0])` → стековый `[255]byte`. Сохранит 1 alloc per VLESS domain connection.
