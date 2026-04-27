@@ -102,7 +102,11 @@ func VLESSParseRequest(r io.Reader) (*VLESSRequest, error) {
 		if _, err := io.ReadFull(r, domLen[:]); err != nil {
 			return nil, fmt.Errorf("vless: read domain len: %w", err)
 		}
-		dom := make([]byte, domLen[0])
+		// Domain length is a single byte (max 255). Use a stack buffer to avoid
+		// a heap allocation for the intermediate read buffer; string(dom) still
+		// copies into an immutable string but that allocation is unavoidable.
+		var domBuf [255]byte
+		dom := domBuf[:domLen[0]]
 		if _, err := io.ReadFull(r, dom); err != nil {
 			return nil, fmt.Errorf("vless: read domain: %w", err)
 		}

@@ -150,6 +150,32 @@ func TestVLESSParseRequest_Domain(t *testing.T) {
 	}
 }
 
+func TestVLESSParseRequest_DomainMaxLen(t *testing.T) {
+	// Domain length is encoded as a single byte (max 255).
+	// The stack [255]byte buffer in VLESSParseRequest must handle the full range.
+	domain := make([]byte, 255)
+	for i := range domain {
+		domain[i] = 'a' + byte(i%26)
+	}
+	var buf bytes.Buffer
+	buf.WriteByte(VLESSVersion0)
+	buf.Write(make([]byte, 16)) // uuid
+	buf.WriteByte(0)            // addons_len
+	buf.WriteByte(VLESSCmdTCP)
+	binary.Write(&buf, binary.BigEndian, uint16(443))
+	buf.WriteByte(VLESSAddrDomain)
+	buf.WriteByte(255) // max domain length
+	buf.Write(domain)
+
+	req, err := VLESSParseRequest(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Addr != string(domain) {
+		t.Errorf("255-byte domain not parsed correctly: got len=%d, want 255", len(req.Addr))
+	}
+}
+
 func TestVLESSParseRequest_WithAddons(t *testing.T) {
 	var buf bytes.Buffer
 	buf.WriteByte(VLESSVersion0)

@@ -4859,3 +4859,54 @@ Pre-existing flaky `TestUDPNetConnReadContextCancelledAfterRead` не являе
 **Оставшиеся задачи:**
 - **pprof под нагрузкой** — требует живого сервера. CPU flamegraph.
 - **VLESSParseRequest domain** — `dom := make([]byte, domLen[0])` → стековый `[255]byte`. Сохранит 1 alloc per VLESS domain connection.
+
+---
+
+## Запуск 70 — 2026-04-27 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: VLESSParseRequest domain — zero-alloc стековый буфер чтения
+
+**Файл:** `server/transport/vless.go`, `server/transport/vless_test.go`
+
+**Проблема:**
+
+В `VLESSParseRequest` ветка `VLESSAddrDomain` выполняла:
+
+```go
+var domLen [1]byte
+io.ReadFull(r, domLen[:])
+dom := make([]byte, domLen[0])  // ← heap alloc до 255 байт
+io.ReadFull(r, dom)
+req.Addr = string(dom)          // ← неизбежный alloc для иммутабельной строки
+```
+
+`make([]byte, domLen[0])` — heap аллокация промежуточного буфера (до 255 байт) на каждое VLESS-соединение с domain-адресом (типичный сценарий: браузер → VLESS → proxy через домен). При 1000 соединений/сек это **1000 лишних heap alloc/сек**.
+
+Паттерн идентичен исправлению addons в Run 68, где `make([]byte, addonsLen)` был заменён на `var scratch [255]byte`.
+
+**Исправление:**
+
+```go
+// Было:
+dom := make([]byte, domLen[0])         // 1 heap alloc
+
+// Стало:
+var domBuf [255]byte                   // stack (0 alloc)
+dom := domBuf[:domLen[0]]             // zero-copy slice view
+```
+
+`string(dom)` после замены остаётся единственной (неизбежной) аллокацией — Go не может создать иммутабельную строку без копирования. Промежуточный буфер чтения теперь полностью на стеке.
+
+**Почему [255]byte безопасен:**
+- `domLen` — это один байт (uint8), значит максимальное значение = 255.
+- `domBuf[:domLen[0]]` — view в стековый массив, без выхода за границы при любом `domLen[0]` в [0, 255].
+- Нулевой домен (`domLen[0] == 0`) корректно обрабатывается `io.ReadFull` (немедленный return без ошибки).
+
+**Тест добавлен:**
+
+`TestVLESSParseRequest_DomainMaxLen` — строит пакет с domain длиной ровно 255 байт (максимально возможная) и проверяет что `req.Addr` содержит все 255 символов. Покрывает граничный случай стекового буфера.
+
+**Итог:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+**Оставшиеся задачи:**
+- **pprof под нагрузкой** — требует живого сервера с реальным трафиком. CPU flamegraph недостижим в sandbox.
