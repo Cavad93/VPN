@@ -12,9 +12,14 @@ func TestNewCollector(t *testing.T) {
 	if c == nil {
 		t.Fatal("NewCollector returned nil")
 	}
+	// Verify the stages array covers exactly stageCount entries.
+	if len(allStages) != int(stageCount) {
+		t.Errorf("allStages length %d != stageCount %d", len(allStages), stageCount)
+	}
+	// Verify every Stage has a non-empty name.
 	for _, s := range allStages {
-		if _, ok := c.stages[s]; !ok {
-			t.Errorf("stage %q missing from collector", s)
+		if s.Name() == "" || s.Name() == "unknown" {
+			t.Errorf("stage %d has missing/unknown name", int(s))
 		}
 	}
 }
@@ -26,7 +31,7 @@ func TestTrackLatency(t *testing.T) {
 	c.TrackLatency(StageNoiseEnc, 300*time.Microsecond)
 
 	snap := c.Snapshot()
-	st := snap.Stages[string(StageNoiseEnc)]
+	st := snap.Stages[StageNoiseEnc.Name()]
 	if st.Latency.Count != 3 {
 		t.Errorf("expected count=3, got %d", st.Latency.Count)
 	}
@@ -44,7 +49,7 @@ func TestTrackPacket(t *testing.T) {
 	c.TrackPacket(StageTunRead, 500)
 
 	snap := c.Snapshot()
-	st := snap.Stages[string(StageTunRead)]
+	st := snap.Stages[StageTunRead.Name()]
 	if st.Packets != 2 {
 		t.Errorf("expected packets=2, got %d", st.Packets)
 	}
@@ -85,7 +90,7 @@ func TestTimer(t *testing.T) {
 	done()
 
 	snap := c.Snapshot()
-	st := snap.Stages[string(StageObfsWrite)]
+	st := snap.Stages[StageObfsWrite.Name()]
 	if st.Latency.Count != 1 {
 		t.Errorf("expected count=1, got %d", st.Latency.Count)
 	}
@@ -150,16 +155,27 @@ func TestSnapshotJSON(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)
 	}
-	if decoded.Stages[string(StageNoiseEnc)].Packets != 1 {
+	if decoded.Stages[StageNoiseEnc.Name()].Packets != 1 {
 		t.Error("decoded packets mismatch")
 	}
 }
 
-func TestTrackUnknownStage(t *testing.T) {
+func TestTrackOutOfRangeStage(t *testing.T) {
 	c := NewCollector()
-	// Should not panic.
-	c.TrackLatency("nonexistent", time.Millisecond)
-	c.TrackPacket("nonexistent", 100)
+	// Out-of-range Stage values must not panic (bounds check in TrackLatency/TrackPacket).
+	c.TrackLatency(Stage(9999), time.Millisecond)
+	c.TrackPacket(Stage(9999), 100)
+	c.TrackLatency(Stage(-1), time.Millisecond)
+	c.TrackPacket(Stage(-1), 100)
+}
+
+func TestStageNameUnknown(t *testing.T) {
+	if Stage(9999).Name() != "unknown" {
+		t.Error("out-of-range Stage should return 'unknown'")
+	}
+	if Stage(-1).Name() != "unknown" {
+		t.Error("negative Stage should return 'unknown'")
+	}
 }
 
 func TestPercentiles(t *testing.T) {
@@ -176,7 +192,7 @@ func TestPercentiles(t *testing.T) {
 	}
 
 	snap := c.Snapshot()
-	st := snap.Stages[string(StageObfsRead)]
+	st := snap.Stages[StageObfsRead.Name()]
 	if st.Latency.Count != 1000 {
 		t.Fatalf("expected 1000, got %d", st.Latency.Count)
 	}
@@ -208,11 +224,11 @@ func TestConcurrentAccess(t *testing.T) {
 	wg.Wait()
 
 	snap := c.Snapshot()
-	if snap.Stages[string(StageNoiseEnc)].Latency.Count != 10000 {
-		t.Errorf("expected 10000, got %d", snap.Stages[string(StageNoiseEnc)].Latency.Count)
+	if snap.Stages[StageNoiseEnc.Name()].Latency.Count != 10000 {
+		t.Errorf("expected 10000, got %d", snap.Stages[StageNoiseEnc.Name()].Latency.Count)
 	}
-	if snap.Stages[string(StageTunRead)].Packets != 10000 {
-		t.Errorf("expected 10000 packets, got %d", snap.Stages[string(StageTunRead)].Packets)
+	if snap.Stages[StageTunRead.Name()].Packets != 10000 {
+		t.Errorf("expected 10000 packets, got %d", snap.Stages[StageTunRead.Name()].Packets)
 	}
 	if snap.RetransmitCount != 10000 {
 		t.Errorf("expected 10000 retransmits, got %d", snap.RetransmitCount)
@@ -246,7 +262,7 @@ func TestExpandedHistogramBuckets(t *testing.T) {
 	c.TrackLatency(StageFullIngress, 30*time.Second)
 
 	snap := c.Snapshot()
-	st := snap.Stages[string(StageFullIngress)]
+	st := snap.Stages[StageFullIngress.Name()]
 	if st.Latency.Count != 4 {
 		t.Fatalf("expected count=4, got %d", st.Latency.Count)
 	}
@@ -267,10 +283,10 @@ func TestNewStages(t *testing.T) {
 	c.TrackLatency(StageObfsReadProc, 100*time.Microsecond)
 
 	snap := c.Snapshot()
-	if snap.Stages[string(StageObfsReadWait)].Latency.Count != 1 {
+	if snap.Stages[StageObfsReadWait.Name()].Latency.Count != 1 {
 		t.Error("obfs_read_wait not tracked")
 	}
-	if snap.Stages[string(StageObfsReadProc)].Latency.Count != 1 {
+	if snap.Stages[StageObfsReadProc.Name()].Latency.Count != 1 {
 		t.Error("obfs_read_proc not tracked")
 	}
 }

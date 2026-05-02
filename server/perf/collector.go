@@ -15,34 +15,66 @@ import (
 )
 
 // Stage identifies a point in the data path where latency is measured.
-type Stage string
+//
+// Integer type (vs the previous string type) enables O(1) direct array access
+// instead of a string-hash map lookup on every hot-path Track call.
+// At 30 Mbps (~2630 packets/sec), with up to 7 Track calls per packet,
+// this eliminates ~18,000 string hash computations and map bucket scans per
+// second — replacing them with cheap bounds-checked array loads.
+type Stage int
 
 const (
-	StageObfsWrite    Stage = "obfs_write"
-	StageObfsRead     Stage = "obfs_read"
-	StageObfsReadWait Stage = "obfs_read_wait" // time spent blocked waiting for data from network
-	StageObfsReadProc Stage = "obfs_read_proc" // time spent processing/defragmenting TLS records
-	StageNoiseEnc     Stage = "noise_encrypt"
-	StageNoiseDec     Stage = "noise_decrypt"
-	StageMuxWrite     Stage = "mux_write"
-	StageMuxRead      Stage = "mux_read"
-	StageTunWrite     Stage = "tun_write"
-	StageTunRead      Stage = "tun_read"
-	StageHandshake    Stage = "handshake"
-	StageFullIngress  Stage = "full_ingress" // socket → TUN
-	StageFullEgress   Stage = "full_egress"  // TUN → socket
+	StageObfsWrite Stage = iota
+	StageObfsRead
+	StageObfsReadWait // time spent blocked waiting for data from network
+	StageObfsReadProc // time spent processing/defragmenting TLS records
+	StageNoiseEnc
+	StageNoiseDec
+	StageMuxWrite
+	StageMuxRead
+	StageTunWrite
+	StageTunRead
+	StageHandshake
+	StageFullIngress  // socket → TUN
+	StageFullEgress   // TUN → socket
+	stageCount        // sentinel — total number of stages (not a valid Stage)
 )
 
-// allStages enumerates every Stage for iteration.
-var allStages = []Stage{
-	StageObfsWrite, StageObfsRead,
-	StageObfsReadWait, StageObfsReadProc,
-	StageNoiseEnc, StageNoiseDec,
-	StageMuxWrite, StageMuxRead,
-	StageTunWrite, StageTunRead,
-	StageHandshake,
-	StageFullIngress, StageFullEgress,
+// stageName maps each Stage integer to its stable JSON/API name.
+// Index order must stay in sync with the iota constants above.
+var stageName = [stageCount]string{
+	StageObfsWrite:    "obfs_write",
+	StageObfsRead:     "obfs_read",
+	StageObfsReadWait: "obfs_read_wait",
+	StageObfsReadProc: "obfs_read_proc",
+	StageNoiseEnc:     "noise_encrypt",
+	StageNoiseDec:     "noise_decrypt",
+	StageMuxWrite:     "mux_write",
+	StageMuxRead:      "mux_read",
+	StageTunWrite:     "tun_write",
+	StageTunRead:      "tun_read",
+	StageHandshake:    "handshake",
+	StageFullIngress:  "full_ingress",
+	StageFullEgress:   "full_egress",
 }
+
+// Name returns the stable string name for this Stage (e.g. "noise_encrypt").
+// Returns "unknown" for out-of-range values.
+func (s Stage) Name() string {
+	if s >= 0 && s < stageCount {
+		return stageName[s]
+	}
+	return "unknown"
+}
+
+// allStages enumerates every valid Stage constant for iteration.
+var allStages = func() []Stage {
+	ss := make([]Stage, stageCount)
+	for i := range ss {
+		ss[i] = Stage(i)
+	}
+	return ss
+}()
 
 // histogram is a lock-free approximate latency histogram.
 // It uses fixed log2-based buckets: <1µs, <2µs, <4µs, … <~537s (30 buckets).
@@ -193,7 +225,11 @@ func (ti *TCPInfo) snapshot() TCPInfoSnapshot {
 // NewCollector() and pass it to components that need instrumentation.
 // All methods are safe for concurrent use.
 type Collector struct {
-	stages map[Stage]*stageMetrics
+	// stages is a fixed-size array indexed directly by Stage integer.
+	// Direct array access (bounds-check + load, ~2 ns) vs the previous
+	// map[Stage]*stageMetrics (string hash + bucket scan + pointer deref, ~15 ns).
+	// Memory layout: all stageMetrics contiguous — cache-friendly iteration in Snapshot/Reset.
+	stages [stageCount]stageMetrics
 
 	// Global counters.
 	ActiveSessions   atomic.Int64
@@ -207,29 +243,24 @@ type Collector struct {
 }
 
 // NewCollector creates a ready-to-use Collector.
+// The stages array is zero-value initialized — no map allocation or loop needed.
 func NewCollector() *Collector {
-	c := &Collector{
-		stages: make(map[Stage]*stageMetrics, len(allStages)),
-	}
-	for _, s := range allStages {
-		c.stages[s] = &stageMetrics{}
-	}
-	return c
+	return &Collector{}
 }
 
 // TrackLatency records a single latency observation for the given stage.
-// Designed for the hot path: no locks, no allocations.
+// Designed for the hot path: bounds-checked array access, no locks, no allocations.
 func (c *Collector) TrackLatency(stage Stage, d time.Duration) {
-	if m, ok := c.stages[stage]; ok {
-		m.hist.record(d)
+	if stage >= 0 && stage < stageCount {
+		c.stages[stage].hist.record(d)
 	}
 }
 
 // TrackPacket records one packet of the given size passing through a stage.
 func (c *Collector) TrackPacket(stage Stage, size int) {
-	if m, ok := c.stages[stage]; ok {
-		m.packets.Add(1)
-		m.bytes.Add(uint64(size))
+	if stage >= 0 && stage < stageCount {
+		c.stages[stage].packets.Add(1)
+		c.stages[stage].bytes.Add(uint64(size))
 	}
 }
 
@@ -276,7 +307,7 @@ type Snapshot struct {
 func (c *Collector) Snapshot() Snapshot {
 	s := Snapshot{
 		Timestamp:        time.Now(),
-		Stages:           make(map[string]StageSnapshot, len(allStages)),
+		Stages:           make(map[string]StageSnapshot, int(stageCount)),
 		ActiveSessions:   c.ActiveSessions.Load(),
 		TotalSessions:    c.TotalSessions.Load(),
 		RetransmitCount:  c.RetransmitCount.Load(),
@@ -284,9 +315,9 @@ func (c *Collector) Snapshot() Snapshot {
 		SSThresh:         c.SSThresh.Load(),
 		TCPInfo:          c.TCP.snapshot(),
 	}
-	for _, stage := range allStages {
-		m := c.stages[stage]
-		s.Stages[string(stage)] = StageSnapshot{
+	for i := Stage(0); i < stageCount; i++ {
+		m := &c.stages[i]
+		s.Stages[stageName[i]] = StageSnapshot{
 			Latency: m.hist.snapshot(),
 			Packets: m.packets.Load(),
 			Bytes:   m.bytes.Load(),
@@ -297,9 +328,10 @@ func (c *Collector) Snapshot() Snapshot {
 
 // Reset zeroes all counters and histograms. Useful for periodic reporting.
 func (c *Collector) Reset() {
-	for _, m := range c.stages {
-		for i := range m.hist.buckets {
-			m.hist.buckets[i].Store(0)
+	for i := range c.stages {
+		m := &c.stages[i]
+		for j := range m.hist.buckets {
+			m.hist.buckets[j].Store(0)
 		}
 		m.hist.count.Store(0)
 		m.hist.sumNs.Store(0)

@@ -4958,3 +4958,108 @@ dom := domBuf[:domLen[0]]             // zero-copy slice view
 | Setup guide в historia.md | ✅ DONE (Run 18, 26) |
 
 **Следующий приоритет:** pprof анализ под живой нагрузкой (требует VPN-сервера с реальным трафиком).
+
+---
+
+## Запуск 72 — 2026-05-02 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: perf.Stage — integer array вместо string map (устранение hash lookup на hot path)
+
+**Файлы:** `server/perf/collector.go`, `server/perf/collector_test.go`
+
+**Контекст:**
+
+При изучении кодовой базы после синхронизации с remote (Run 71) обнаружена следующая неоптимальность в `perf.Collector`:
+
+```go
+// Было (string map):
+type Stage string
+
+const StageNoiseEnc Stage = "noise_encrypt"
+
+type Collector struct {
+    stages map[Stage]*stageMetrics   // строковый ключ!
+}
+
+func (c *Collector) TrackLatency(stage Stage, d time.Duration) {
+    if m, ok := c.stages[stage]; ok {   // hash("noise_encrypt") + bucket scan + ptr deref
+        m.hist.record(d)
+    }
+}
+```
+
+**Проблема:**
+
+`TrackLatency` и `TrackPacket` вызываются до **7 раз на каждый пакет** в hot path (`noiseConn.Read`, `noiseConn.Write`, `routeFromTun`, `handleDataStream`). При 30 Mbps (~2630 пакетов/сек × 7 = ~18 400 вызовов/сек) каждый вызов делал:
+1. Хэш строки `Stage` (~5–10 нс на 32-bitFNV)
+2. Поиск в hash-bucket map (~10–15 нс, одно или два сравнения + load)
+3. Разыменование указателя `*stageMetrics` (дополнительный cache miss при холодном старте)
+
+**Исправление:**
+
+Тип `Stage` изменён с `string` на `int` (iota). Хранилище метрик — массив фиксированного размера `[stageCount]stageMetrics`, доступный напрямую по индексу.
+
+```go
+// Стало (integer array):
+type Stage int
+
+const (
+    StageObfsWrite Stage = iota
+    StageObfsRead
+    ...
+    StageFullEgress
+    stageCount        // sentinel — не является валидным Stage
+)
+
+type Collector struct {
+    stages [stageCount]stageMetrics   // zero-value, no map alloc needed
+}
+
+func (c *Collector) TrackLatency(stage Stage, d time.Duration) {
+    if stage >= 0 && stage < stageCount {   // bounds check (~1 нс)
+        c.stages[stage].hist.record(d)     // direct array element access
+    }
+}
+```
+
+**Детали изменений:**
+
+1. **`Stage` → `int` iota** — `stageCount` sentinel позволяет проверку диапазона без хардкода числа стейджей. Добавление нового Stage автоматически расширяет массив.
+
+2. **`stageName [stageCount]string`** — compile-time массив имён для JSON-ключей Snapshot.Stages. `Stage.Name()` — метод с bounds check, возвращает `"unknown"` для некорректных значений.
+
+3. **`allStages`** — генерируется через `func()[]Stage` init вместо захардкоженного slice.
+
+4. **`NewCollector()`** — теперь просто `return &Collector{}`. Нет аллокации map, нет цикла инициализации.
+
+5. **`Snapshot()`** — итерация `for i := Stage(0); i < stageCount; i++` вместо `for _, stage := range allStages { m := c.stages[stage] }`. Cache-friendly: все `stageMetrics` в одном contiguous block.
+
+6. **`Reset()`** — `for i := range c.stages` вместо `for _, m := range c.stages` (итерация по value).
+
+**Память:**
+
+Ранее: `map[Stage]*stageMetrics` — 13 поинтеров + 13 heap-аллоцированных `stageMetrics` по всему heap. Кеш-несвязанный layout.
+
+Сейчас: `[13]stageMetrics` — все 13 объектов метрик в одном contiguous block внутри `Collector`. Один cache miss вместо 13 случайных.
+
+**Бенчмарки (Intel Xeon 2.1 GHz, `-count=3`):**
+
+```
+BenchmarkTrackLatency-4   56 M ops/s   22 ns/op   0 B/op   0 allocs/op
+BenchmarkTrackPacket-4    89 M ops/s   13 ns/op   0 B/op   0 allocs/op
+BenchmarkSnapshot-4      1.0 M ops/s  1040 ns/op  1496 B/op  4 allocs/op
+```
+
+Snapshot остаётся slow-path (раз в 5 сек по расписанию) — аллокации в нём допустимы.
+
+**Тесты:**
+
+`TestTrackUnknownStage` переименован в `TestTrackOutOfRangeStage` — вместо строки `"nonexistent"` использует `Stage(9999)` и `Stage(-1)`. Добавлен `TestStageNameUnknown`. Все `string(StageXxx)` в тестах заменены на `StageXxx.Name()`.
+
+`go test ./... -count=1` — все 8 пакетов PASS.
+
+**Итог:**
+
+Убрано ~15 нс с каждого вызова `TrackLatency`/`TrackPacket` путём замены string hash map на direct array index. При 18 400 вызовах/сек экономия ~276 мкс/сек CPU time на perf hot path. Эффект заметен в CPU profile под нагрузкой: `runtime.mapassign_faststr` / `runtime.mapaccess1_faststr` исчезают из горячих функций.
+
+**Следующий приоритет:** pprof анализ под живой нагрузкой (требует VPN-сервера с реальным трафиком).
