@@ -5336,6 +5336,108 @@ BenchmarkKnockVerifierVerify_Parallel  157 ns/op   32 B/op   1 alloc/op   ← п
 
 ---
 
+---
+
+## Запуск 77 — 2026-05-03
+
+### Выполнено: handleDataStream — устранение избыточного вызова time.Now() + дедупликация tun.Write
+
+**Файл:** `server/main.go` → функция `handleDataStream`, внутренний цикл ingress
+
+**Проблема 1: двойной time.Now() на hot path**
+
+До оптимизации внутренний цикл содержал два последовательных вызова `time.Now()` без какой-либо работы между ними:
+
+```go
+// ДО:
+var ingressStart time.Time
+if pc != nil {
+    ingressStart = time.Now()   // ← первый вызов
+}
+var muxReadStart time.Time
+if pc != nil {
+    muxReadStart = time.Now()   // ← второй вызов — дублирует тот же момент времени
+}
+```
+
+Оба вызова захватывали один и тот же момент времени — работы между ними не было. `time.Now()` это VDSO-вызов (~15 нс на x86-64, ~25 нс на ARM), он не является бесплатным.
+
+**Проблема 2: дублированный вызов tun.Write**
+
+```go
+// ДО:
+if pc != nil {
+    t0 := time.Now()
+    s.tun.Write(buf[:n])    // ← в ветке "perf включён"
+    pc.TrackLatency(...)
+} else {
+    s.tun.Write(buf[:n])    // ← в ветке "perf выключен" — идентичная операция
+}
+```
+
+Тот же syscall дублировался в обоих ветках `if/else`, усложняя код и увеличивая вероятность рассинхронизации при дальнейших изменениях.
+
+**Решение:**
+
+```go
+// ПОСЛЕ:
+// ingressStart serves dual purpose:
+// 1. Marks start of StageFullIngress (stream.Read → tun.Write end-to-end latency)
+// 2. Aliases muxReadStart — StageMuxRead begins at the same instant.
+// Both stages start at the same instant, so a single time.Now() suffices.
+var ingressStart time.Time
+if pc != nil {
+    ingressStart = time.Now()
+}
+// muxReadStart aliases ingressStart: zero when pc==nil, equal when pc!=nil.
+// One time.Now() for both StageMuxRead and StageFullIngress.
+muxReadStart := ingressStart
+
+n, err := stream.Read(buf)
+if pc != nil {
+    pc.TrackLatency(perf.StageMuxRead, time.Since(muxReadStart))
+    pc.TrackPacket(perf.StageMuxRead, n)
+}
+// ...
+
+var t0 time.Time
+if pc != nil {
+    t0 = time.Now()
+}
+s.tun.Write(buf[:n]) //nolint:errcheck   // ← одиночный вызов, не дублируется
+if pc != nil {
+    pc.TrackLatency(perf.StageTunWrite, time.Since(t0))
+    pc.TrackPacket(perf.StageTunWrite, n)
+    pc.TrackLatency(perf.StageFullIngress, time.Since(ingressStart))
+    pc.TrackPacket(perf.StageFullIngress, n)
+}
+```
+
+**Эффект:**
+
+| Метрика | До | После |
+|---|---|---|
+| `time.Now()` вызовов на пакет (perf enabled) | 3 | 2 (−1) |
+| Экономия времени при 30 Mbps (~2630 pkt/sec) | — | ~39 µs/sec CPU |
+| Дубликатов `tun.Write` | 2 (в if/else) | 1 |
+| Семантическая корректность StageMuxRead vs StageFullIngress | Оба начинались в ~одинаковый момент | Гарантированно один и тот же момент |
+
+**Прецедент:** `noiseConn.Read` уже использует этот паттерн (с комментарием `"reuse — same instant, saves one time.Now()"`):
+
+```go
+now := time.Now()
+var obfsReadStart, afterRead time.Time
+if nc.perf != nil {
+    obfsReadStart = now // reuse — same instant, saves one time.Now()
+}
+```
+
+**Дополнительно:** Обновлён комментарий в проверке минимальной длины пакета: с `"Too short to be a valid IPv4 packet"` на `"Too short to be a valid IP packet (IPv4 min=20, IPv6 min=40)"` — отражает поддержку IPv6.
+
+**Тесты:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **IPv6 inner tunnel** — ~~TODO~~ `markECNCEv6` уже реализован (несколько коммитов, см. git log). Бэклог-пункт закрыт.

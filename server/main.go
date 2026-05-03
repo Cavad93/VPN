@@ -963,15 +963,22 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 		}()
 	}
 	for {
+		// Capture loop-start time once for all perf stages in this iteration.
+		// ingressStart serves dual purpose:
+		//  1. StageMuxRead: how long stream.Read blocks (mux wait + data arrival)
+		//  2. StageFullIngress: total ingress latency (mux wait + read + tun write)
+		// Both stages start at the same instant, so a single time.Now() suffices.
+		// This eliminates the redundant second time.Now() call that existed before,
+		// saving one VDSO syscall (~15 ns) per received packet on the perf-enabled path.
+		// noiseConn.Read uses the same pattern: "reuse — same instant, saves one time.Now()".
 		var ingressStart time.Time
 		if pc != nil {
 			ingressStart = time.Now()
 		}
+		// muxReadStart aliases ingressStart: zero when pc==nil (TrackLatency is gated by pc!=nil),
+		// equal to ingressStart when pc!=nil. One time.Now() for both StageMuxRead and StageFullIngress.
+		muxReadStart := ingressStart
 
-		var muxReadStart time.Time
-		if pc != nil {
-			muxReadStart = time.Now()
-		}
 		n, err := stream.Read(buf)
 		if pc != nil {
 			pc.TrackLatency(perf.StageMuxRead, time.Since(muxReadStart))
@@ -981,19 +988,20 @@ func (s *Server) handleDataStream(ctx context.Context, cs *clientSession, stream
 			return
 		}
 		if n < 20 {
-			// Too short to be a valid IPv4 packet
+			// Too short to be a valid IP packet (IPv4 min=20, IPv6 min=40).
 			continue
 		}
 
+		var t0 time.Time
 		if pc != nil {
-			t0 := time.Now()
-			s.tun.Write(buf[:n]) //nolint:errcheck
+			t0 = time.Now()
+		}
+		s.tun.Write(buf[:n]) //nolint:errcheck
+		if pc != nil {
 			pc.TrackLatency(perf.StageTunWrite, time.Since(t0))
 			pc.TrackPacket(perf.StageTunWrite, n)
 			pc.TrackLatency(perf.StageFullIngress, time.Since(ingressStart))
 			pc.TrackPacket(perf.StageFullIngress, n)
-		} else {
-			s.tun.Write(buf[:n]) //nolint:errcheck
 		}
 		cs.bytesIn.Add(uint64(n))
 	}
