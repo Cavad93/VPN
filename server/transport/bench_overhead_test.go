@@ -328,8 +328,14 @@ func TestPerPacketLatency(t *testing.T) {
 		clientObfs := NewObfsConn(clientConn)
 		serverObfs := NewObfsConn(serverConn)
 
-		go clientObfs.ClientHandshake() //nolint:errcheck
-		serverObfs.ServerHandshake()    //nolint:errcheck
+		// ClientHandshake must complete before NewMux starts its readLoop —
+		// both would read from clientObfs.bufr concurrently otherwise (data race).
+		clientHSDone := make(chan error, 1)
+		go func() { clientHSDone <- clientObfs.ClientHandshake() }()
+		serverObfs.ServerHandshake() //nolint:errcheck
+		if err := <-clientHSDone; err != nil {
+			t.Fatal("client handshake:", err)
+		}
 
 		clientMux := NewMux(clientObfs, true)
 		serverMux := NewMux(serverObfs, false)

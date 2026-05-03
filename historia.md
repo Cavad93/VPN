@@ -1558,6 +1558,46 @@ ws.maskOff = (off + n) & 3
 
 ---
 
+## Запуск 30 — 2026-05-03
+
+### Выполнено: DATA RACE устранение — relayDialTimeout / relayPipeTimeout / ObfsConn+Mux handshake
+
+**Файлы:** `server/relay.go`, `server/relay_test.go`, `server/transport/bench_overhead_test.go`, `server/transport/bbr_integration_test.go`
+
+**Обнаруженные проблемы (go test -race):**
+
+1. **DATA RACE в `relay.go`** — `relayDialTimeout` и `relayPipeTimeout` были обычными `time.Duration` переменными. Тесты временно перезаписывали их значения без синхронизации, пока `relayOne` горутина читала их для `net.DialTimeout` и `idleTimeoutConn`. Точная схема: test cleanup goroutine пишет → `relayOne` горутина читает без mutex.
+
+2. **DATA RACE в `bench_overhead_test.go`** — В `TestPerPacketLatency/ObfsConn+Mux_combined` тест запускал `go clientObfs.ClientHandshake()` и сразу после вызывал `NewMux(clientObfs, true)`. `NewMux` немедленно стартует `readLoop` горутину, которая читает из `clientObfs.bufr` (bufio.Reader), тогда как `ClientHandshake()` ещё не завершился и читал из того же `clientObfs.bufr` в `readHandshakeRecord()`. Два горутины конкурентно читали один `bufio.Reader`.
+
+3. **Flaky test `TestBBRPacingReducesBurstiness`** — Верхняя граница интервала пэйсера 10ms слишком строгая для CI под нагрузкой. Под race-детектором с параллельными тестами планировщик ОС задерживал горутину на 12-15ms между `time.NewTimer(1ms).C` и следующим `time.Now()`. Единственный случай: `interval 0 = 12.707ms > 10ms` → FAIL.
+
+**Исправления:**
+
+1. **`server/relay.go`** — Конвертированы `relayDialTimeout` и `relayPipeTimeout` из plain `time.Duration` в `atomic.Int64` (наносекунды). Паттерн идентичен `decoyReadDeadlineNs` (Запуск 25):
+   ```go
+   var relayDialTimeoutNs atomic.Int64
+   var relayPipeTimeoutNs atomic.Int64
+   func init() { relayDialTimeoutNs.Store(int64(10 * time.Second)); ... }
+   func relayDialTimeout() time.Duration     { return time.Duration(relayDialTimeoutNs.Load()) }
+   func setRelayDialTimeout(d time.Duration) { relayDialTimeoutNs.Store(int64(d)) }
+   func relayPipeTimeout() time.Duration     { return time.Duration(relayPipeTimeoutNs.Load()) }
+   func setRelayPipeTimeout(d time.Duration) { relayPipeTimeoutNs.Store(int64(d)) }
+   ```
+   Вызовы `relayDialTimeout` и `relayPipeTimeout` изменены на вызовы функций.
+
+2. **`server/relay_test.go`** — Обновлены тесты для использования `setRelayDialTimeout()`/`setRelayPipeTimeout()` вместо прямой записи в переменные.
+
+3. **`server/transport/bench_overhead_test.go`** — Добавлена синхронизация через канал: `ClientHandshake()` ожидается до создания `NewMux()`, исключая конкурентное чтение одного `bufio.Reader`.
+
+4. **`server/transport/bbr_integration_test.go`** — Верхняя граница интервала согласована с remote-веткой: 100ms + счётчик `tooLong`. Флаг ставится только если ВСЕ интервалы превысили 100ms — защита от полной поломки пэйсера без ложных срабатываний на плановщик.
+
+**Результат:**
+- `go test ./... -race -count=1`: все пакеты зелёные, 0 DATA RACE.
+- Ранее падало при параллельном запуске с race-детектором.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **IPv6 inner tunnel** — ~~РЕШЕНО~~ (Запуск 27): `markECNCE` теперь обрабатывает IPv6 Traffic Class через `markECNCEv4`/`markECNCEv6` helpers.

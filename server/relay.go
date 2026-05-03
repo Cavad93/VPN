@@ -26,18 +26,19 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cavad93/vpn/server/transport"
 )
 
-// relayDialTimeout is how long the relay waits for the upstream connection.
-// If Astana is unreachable within this window the client connection is closed.
-var relayDialTimeout = 10 * time.Second
+// relayDialTimeoutNs stores the upstream dial timeout in nanoseconds.
+// Atomic to prevent data races between relayOne goroutines and tests that
+// temporarily override the value (same pattern as decoyReadDeadlineNs).
+var relayDialTimeoutNs atomic.Int64
 
-// relayPipeTimeout is the idle timeout for relay pipes.  A connection that
-// transfers no bytes for this duration in either direction is considered dead.
-// Set to 0 to disable (no timeout).
+// relayPipeTimeoutNs stores the idle pipe timeout in nanoseconds.
+// Atomic for the same reason — tests override it to shorten the wait.
 //
 // IMPORTANT: this is an IDLE timeout, not an absolute deadline.  The deadline
 // is reset before every Read and Write via idleTimeoutConn, so active
@@ -45,7 +46,17 @@ var relayDialTimeout = 10 * time.Second
 // one-shot SetDeadline which killed active connections after exactly 5 minutes
 // regardless of traffic (see Cloudflare blog "The complete guide to Go
 // net/http timeouts" — deadlines are absolute, you must reset them per-op).
-var relayPipeTimeout = 5 * time.Minute
+var relayPipeTimeoutNs atomic.Int64
+
+func init() {
+	relayDialTimeoutNs.Store(int64(10 * time.Second))
+	relayPipeTimeoutNs.Store(int64(5 * time.Minute))
+}
+
+func relayDialTimeout() time.Duration     { return time.Duration(relayDialTimeoutNs.Load()) }
+func setRelayDialTimeout(d time.Duration) { relayDialTimeoutNs.Store(int64(d)) }
+func relayPipeTimeout() time.Duration     { return time.Duration(relayPipeTimeoutNs.Load()) }
+func setRelayPipeTimeout(d time.Duration) { relayPipeTimeoutNs.Store(int64(d)) }
 
 // idleTimeoutConn wraps a net.Conn and resets the read/write deadline before
 // every I/O operation, turning a Go absolute deadline into an idle timeout.
@@ -136,7 +147,7 @@ func relayOne(client net.Conn, target string, knockKey *transport.KnockPSK, logg
 	}
 
 	// Connect to upstream (Astana VPN server).
-	upstream, err := net.DialTimeout("tcp", target, relayDialTimeout)
+	upstream, err := net.DialTimeout("tcp", target, relayDialTimeout())
 	if err != nil {
 		logger.Warn("relay: dial upstream failed",
 			"target", target,
@@ -160,11 +171,11 @@ func relayOne(client net.Conn, target string, knockKey *transport.KnockPSK, logg
 
 	// Wrap connections with idle timeout if configured.
 	// Each Read/Write resets its own deadline — active connections survive
-	// indefinitely, but connections idle for relayPipeTimeout are killed.
+	// indefinitely, but connections idle for relayPipeTimeout() are killed.
 	var routedIO, upstreamIO net.Conn = routed, upstream
-	if relayPipeTimeout > 0 {
-		routedIO = &idleTimeoutConn{Conn: routed, timeout: relayPipeTimeout}
-		upstreamIO = &idleTimeoutConn{Conn: upstream, timeout: relayPipeTimeout}
+	if pt := relayPipeTimeout(); pt > 0 {
+		routedIO = &idleTimeoutConn{Conn: routed, timeout: pt}
+		upstreamIO = &idleTimeoutConn{Conn: upstream, timeout: pt}
 	}
 
 	// Bidirectional pipe: client ↔ upstream.

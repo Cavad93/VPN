@@ -166,9 +166,9 @@ func TestRelayClosesConnectionWhenUpstreamUnreachable(t *testing.T) {
 	// Use a port that nothing is listening on.
 	relay := startRelayWithUpstream(t, "127.0.0.1:1") // port 1 is always closed
 
-	orig := relayDialTimeout
-	relayDialTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { relayDialTimeout = orig })
+	orig := relayDialTimeout()
+	setRelayDialTimeout(200 * time.Millisecond)
+	t.Cleanup(func() { setRelayDialTimeout(orig) })
 
 	conn, err := net.DialTimeout("tcp", relay, 2*time.Second)
 	if err != nil {
@@ -406,9 +406,9 @@ func TestRelayActiveConnectionSurvivesPastTimeout(t *testing.T) {
 	// Set a short pipe timeout for the test — long enough for the relay to
 	// set up (dial echo, start pipes) but short enough to detect the old bug
 	// within a reasonable test duration.
-	orig := relayPipeTimeout
-	relayPipeTimeout = 500 * time.Millisecond
-	t.Cleanup(func() { relayPipeTimeout = orig })
+	orig := relayPipeTimeout()
+	setRelayPipeTimeout(500 * time.Millisecond)
+	t.Cleanup(func() { setRelayPipeTimeout(orig) })
 
 	echo := startEchoServer(t)
 	relay := startRelayWithUpstream(t, echo)
