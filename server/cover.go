@@ -49,18 +49,13 @@ func setCoverSiteDeadline(d time.Duration) {
 	coverSiteDeadlineNs.Store(int64(d))
 }
 
-// coverHandler returns an http.Handler that serves a static "cooking blog"
-// cover website. All HTML is embedded in the binary — no external files.
-//
-// Routes:
-//
-//	GET /           → homepage with recipe index
-//	GET /recipe1    → pork roast recipe
-//	GET /recipe2    → pulled pork recipe
-//	GET /contacts   → contact page
-//	GET /about      → about the blog
-//	GET /*          → 404 page (realistic)
-func coverHandler() http.Handler {
+// coverMux is the singleton http.Handler for the cover website.
+// Initialised once at program start; all calls to coverHandler() share it.
+// Previously coverHandler() built a new http.ServeMux on every call
+// (per probe/scanner connection), allocating a map + route registrations
+// each time.  Under active scanning (~100 HTTP probes/sec) that created
+// ~100 ServeMux + closure allocations/sec — unnecessary for a fully static site.
+var coverMux = func() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -85,7 +80,19 @@ func coverHandler() http.Handler {
 	mux.HandleFunc("/robots.txt", serveCoverRobotsTxt)
 	mux.HandleFunc("/sitemap.xml", serveCoverSitemap)
 	return mux
-}
+}()
+
+// coverHandler returns the singleton cover website handler.
+//
+// Routes:
+//
+//	GET /           → homepage with recipe index
+//	GET /recipe1    → pork roast recipe
+//	GET /recipe2    → pulled pork recipe
+//	GET /contacts   → contact page
+//	GET /about      → about the blog
+//	GET /*          → 404 page (realistic)
+func coverHandler() http.Handler { return coverMux }
 
 // serveCoverPage writes an HTML response with standard headers.
 func serveCoverPage(w http.ResponseWriter, body string, status int) {

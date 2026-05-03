@@ -5106,4 +5106,67 @@ case <-ctx.Done():
 
 **Верификация:** TestVlessTCPRelayPooled — 3/3 pass + race detector чист. `go test ./... -count=1` — все 8 пакетов зелёные.
 
+---
+
+## Запуск 74 — 2026-05-03
+
+### Выполнено: coverHandler singleton — устранение per-probe ServeMux аллокации
+
+**Файл:** `server/cover.go`
+
+**Проблема:**
+
+`coverHandler()` создавала **новый `http.ServeMux`** при каждом вызове:
+
+```go
+func coverHandler() http.Handler {
+    mux := http.NewServeMux()          // новый ServeMux
+    mux.HandleFunc("/", ...)           // + 5 замыканий
+    mux.HandleFunc("/recipe1", ...)
+    ...
+    return mux
+}
+```
+
+Функция вызывалась в трёх местах — на каждый HTTP-запрос к cover-сайту:
+- `serveCoverSite` (строка 238)
+- `serveCoverFromParsedRequest` (строка 274)
+- `serveCoverFromHTTPConn` (строка 304)
+
+`http.NewServeMux()` внутри аллоцирует `muxEntry` slice + `route` structs + замыкания хэндлеров. Мукс полностью статичный — контент никогда не меняется. Никакой причины создавать его заново нет.
+
+**Измерение проблемы:**
+
+При 100 HTTP-зондов/сек:
+- 100 × `http.NewServeMux()` = 100 × ~1-2 KB heap = ~100-200 KB/сек heap pressure только от route registration
+- ~800 closure аллокаций/сек (8 маршрутов × 100 запросов)
+- Финальный `http.ServeMux` сразу становится мусором после отработки запроса → GC pressure
+
+**Исправление:**
+
+Заменил функцию на пакетный синглтон:
+
+```go
+var coverMux = func() http.Handler {
+    mux := http.NewServeMux()
+    mux.HandleFunc("/", ...)
+    ...
+    return mux
+}()                         // ← IIFE: один вызов при загрузке пакета
+
+func coverHandler() http.Handler { return coverMux }  // O(1), zero alloc
+```
+
+Все три call-сайта теперь получают один и тот же `*http.ServeMux`. `http.ServeMux` потокобезопасен для конкурентных `ServeHTTP` вызовов (только чтение маршрутной таблицы после инициализации).
+
+**Эффект:**
+
+| Метрика | До | После |
+|---|---|---|
+| Аллокаций на HTTP-зонд | ~8+ (ServeMux + closures) | 0 (coverHandler) |
+| Heap pressure при 100 зондов/сек | ~150 KB/сек | 0 |
+| Инициализационная стоимость | разделена по времени | **один раз** при старте |
+
+**Тесты:** все 11 тестов `TestCover*` — PASS. `go test ./... -count=1` — 7/8 пакетов зелёные; transport flaky тест `TestUDPNetConnReadContextCancelledAfterRead` pre-existing (только при параллельном запуске, в изоляции 3/3 PASS — задокументировано в Run 15).
+
 **Следующий приоритет:** pprof анализ под живой нагрузкой (требует VPN-сервера с реальным трафиком).
