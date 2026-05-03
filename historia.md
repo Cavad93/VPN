@@ -5063,3 +5063,47 @@ Snapshot остаётся slow-path (раз в 5 сек по расписани�
 Убрано ~15 нс с каждого вызова `TrackLatency`/`TrackPacket` путём замены string hash map на direct array index. При 18 400 вызовах/сек экономия ~276 мкс/сек CPU time на perf hot path. Эффект заметен в CPU profile под нагрузкой: `runtime.mapassign_faststr` / `runtime.mapaccess1_faststr` исчезают из горячих функций.
 
 **Следующий приоритет:** pprof анализ под живой нагрузкой (требует VPN-сервера с реальным трафиком).
+
+---
+
+## Запуск 73 — 2026-05-03
+
+### Выполнено: vlessTCPDoneChanPool — устранение make(chan struct{}, 1) на каждое VLESS TCP соединение
+
+**Файл:** `server/vless_handler.go`
+
+**Проблема:**
+
+`vlessTCPRelay` создавал `make(chan struct{}, 1)` на каждое VLESS TCP соединение для синхронизации с фоновой горутиной копирования:
+
+```go
+done := make(chan struct{}, 1)
+go func() {
+    io.CopyBuffer(writer, target, *pb)
+    done <- struct{}{}
+}()
+io.CopyBuffer(target, reader, *pb)
+select {
+case <-done:
+case <-ctx.Done():
+}
+```
+
+При 200 VLESS TCP соединениях/сек: 200 channel аллокаций/сек → устранено.
+
+**Решение:**
+
+Добавлен `vlessTCPDoneChanPool = sync.Pool{New: func() any { return make(chan struct{}, 1) }}`.
+
+Ключевая семантика возврата в пул:
+- `<-done` case: горутина отправила ровно одно значение, мы прочитали — канал пуст → `Put(done)` безопасен.
+- `<-ctx.Done()` case: горутина может ещё работать и отправить позже → канал в пул НЕ возвращается; GC соберёт после завершения горутины.
+
+**Отличие от relayChanPool (capacity 2):**
+- relay.go: ДВЕ горутины, функция читает ДВАЖДЫ — capacity 2 обязательна.
+- vlessTCPRelay: ОДНА горутина, читаем ОДИН раз — capacity 1 достаточна.
+Отдельный пул предотвращает выдачу capacity-2 канала коду, ожидающему capacity-1.
+
+**Верификация:** TestVlessTCPRelayPooled — 3/3 pass + race detector чист. `go test ./... -count=1` — все 8 пакетов зелёные.
+
+**Следующий приоритет:** pprof анализ под живой нагрузкой (требует VPN-сервера с реальным трафиком).

@@ -25,6 +25,20 @@ import (
 	"github.com/cavad93/vpn/server/transport"
 )
 
+// vlessTCPDoneChanPool pools the one-shot done channels used in vlessTCPRelay.
+// Each TCP relay connection allocates one chan struct{}{1} to signal when the
+// upstream→client copy goroutine finishes.  At 200 VLESS connections/sec this
+// is 200 channel allocations/sec → eliminated by pooling.
+//
+// Safety: the channel is returned to the pool only on the <-done path, where
+// the goroutine has already sent exactly once and the channel is empty.
+// On the <-ctx.Done() path the goroutine may still be running and will
+// eventually send; that channel is intentionally NOT returned to the pool —
+// the goroutine holds a reference, so GC handles cleanup after it exits.
+var vlessTCPDoneChanPool = sync.Pool{
+	New: func() any { return make(chan struct{}, 1) },
+}
+
 // ioCopyBufPool pools 32 KiB buffers for io.CopyBuffer calls in vlessTCPRelay
 // and relay.go pipe goroutines.  io.Copy allocates a fresh 32 KiB buffer per
 // direction per TCP relay connection; with 50 simultaneous proxied connections
@@ -397,7 +411,7 @@ func (s *Server) vlessTCPRelay(ctx context.Context, reader io.Reader, writer io.
 		target.Write(req.Payload) //nolint:errcheck
 	}
 
-	done := make(chan struct{}, 1)
+	done := vlessTCPDoneChanPool.Get().(chan struct{})
 	go func() {
 		pb := ioCopyBufPool.Get().(*[]byte)
 		io.CopyBuffer(writer, target, *pb) //nolint:errcheck
@@ -409,7 +423,11 @@ func (s *Server) vlessTCPRelay(ctx context.Context, reader io.Reader, writer io.
 	ioCopyBufPool.Put(pb)
 	select {
 	case <-done:
+		// Goroutine finished: channel is empty, safe to reuse.
+		vlessTCPDoneChanPool.Put(done)
 	case <-ctx.Done():
+		// Context cancelled: goroutine may still be running and will send to
+		// done later. Do NOT return done to the pool — let GC collect it.
 	}
 }
 
