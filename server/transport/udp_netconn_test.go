@@ -221,8 +221,13 @@ func TestUDPNetConnLargeWrite(t *testing.T) {
 // The fix calls cancel() immediately after inner.Read returns, releasing the timer
 // from the heap. This test verifies that allocations-per-read do not grow with
 // the number of reads (timer entries are freed promptly).
+//
+// NOTE: intentionally NOT t.Parallel(). This test measures heap growth via
+// runtime.ReadMemStats which reflects the global heap — concurrent tests (e.g.
+// TestBBRDiagnoseSlowThroughput with cwnd=115K) create large transient allocations
+// that pollute the measurement window and produce false positives. Running
+// sequentially ensures the heap is stable during the before/after snapshots.
 func TestUDPNetConnReadContextCancelledAfterRead(t *testing.T) {
-	t.Parallel()
 	client, server := setupUDPPair(t)
 
 	// Set a read deadline far in the future so every Read creates a timerCtx.
