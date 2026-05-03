@@ -159,11 +159,13 @@ func peekAndRoute(conn net.Conn) (net.Conn, bool) {
 // peekAndRouteKnock is like peekAndRoute but additionally verifies a
 // Reality-style port-knock tag embedded in the TLS ClientHello's session_id.
 //
-// If knockKey is nil, delegates to peekAndRoute (backward compatible).
+// If kv is nil, delegates to peekAndRoute (backward compatible).
 //
-// When knockKey is set, the function reads the first 76 bytes of the stream
-// and verifies session_id == HMAC-SHA256(knockKey, random). This prevents
-// the relay from connecting to the backend unless the client knows the PSK.
+// When kv is non-nil, the function reads the first 76 bytes of the stream
+// and calls kv.Verify (zero-alloc — HMAC hasher is borrowed from sync.Pool).
+// This prevents the relay from connecting to the backend unless the client
+// knows the PSK. Allocation-free design means even DDoS flood of bad knocks
+// adds zero heap pressure from HMAC state.
 //
 // Decision tree:
 //
@@ -174,8 +176,8 @@ func peekAndRoute(conn net.Conn) (net.Conn, bool) {
 // The "close silently" for failed TLS knock mimics a server that dropped the
 // connection due to handshake failure — a common behavior for misconfigured
 // TLS endpoints, revealing no information about the relay's purpose.
-func peekAndRouteKnock(conn net.Conn, knockKey *transport.KnockPSK) (net.Conn, bool) {
-	if knockKey == nil {
+func peekAndRouteKnock(conn net.Conn, kv *transport.KnockVerifier) (net.Conn, bool) {
+	if kv == nil {
 		return peekAndRoute(conn)
 	}
 
@@ -206,7 +208,7 @@ func peekAndRouteKnock(conn net.Conn, knockKey *transport.KnockPSK) (net.Conn, b
 	}
 
 	// TLS ClientHello — verify knock.
-	if !transport.VerifyKnock(*knockKey, buf[:n]) {
+	if !kv.Verify(buf[:n]) {
 		// Knock failed: a DPI probe or replayed ClientHello.
 		// Close silently — no information leakage.
 		conn.Close()

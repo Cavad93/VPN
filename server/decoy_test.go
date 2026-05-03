@@ -462,7 +462,7 @@ func TestPeekAndRouteKnockValidKnock(t *testing.T) {
 		cConn.Write([]byte{0xFF}) //nolint:errcheck
 	}()
 
-	routed, ok := peekAndRouteKnock(sConn, &psk)
+	routed, ok := peekAndRouteKnock(sConn, transport.NewKnockVerifier(psk))
 	if !ok {
 		t.Fatal("expected VPN path for valid knock")
 	}
@@ -505,7 +505,7 @@ func TestPeekAndRouteKnockInvalidKnock_TLS(t *testing.T) {
 	}()
 
 	// Verify with the correct PSK — should fail.
-	routed, ok := peekAndRouteKnock(sConn, &psk)
+	routed, ok := peekAndRouteKnock(sConn, transport.NewKnockVerifier(psk))
 	if ok || routed != nil {
 		t.Fatal("expected reject for invalid knock (wrong PSK)")
 	}
@@ -530,7 +530,7 @@ func TestPeekAndRouteKnockHTTPGetsCoverSite(t *testing.T) {
 		cConn.Write([]byte(httpReq)) //nolint:errcheck
 	}()
 
-	routed, ok := peekAndRouteKnock(sConn, &psk)
+	routed, ok := peekAndRouteKnock(sConn, transport.NewKnockVerifier(psk))
 	if ok || routed != nil {
 		t.Fatal("expected cover site path for HTTP request")
 	}
@@ -556,7 +556,7 @@ func TestPeekAndRouteKnockTimeoutSilentClose(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		routed, ok := peekAndRouteKnock(sConn, &psk)
+		routed, ok := peekAndRouteKnock(sConn, transport.NewKnockVerifier(psk))
 		if ok || routed != nil {
 			t.Errorf("expected reject on timeout")
 		}

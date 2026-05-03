@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"sync"
 	"testing"
 )
 
@@ -270,4 +271,119 @@ func BenchmarkVerifyKnock(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		VerifyKnock(psk, data)
 	}
+}
+
+// TestKnockVerifier_ValidKnock verifies that KnockVerifier accepts a correctly
+// computed knock tag.
+func TestKnockVerifier_ValidKnock(t *testing.T) {
+	var psk KnockPSK
+	rand.Read(psk[:])
+	kv := NewKnockVerifier(psk)
+
+	var random [32]byte
+	rand.Read(random[:])
+	sessionID := ComputeKnockTag(psk, random)
+	data := buildTestClientHello(random, sessionID)
+
+	if !kv.Verify(data) {
+		t.Fatal("KnockVerifier.Verify should accept valid knock")
+	}
+}
+
+// TestKnockVerifier_WrongPSK verifies that KnockVerifier rejects a tag
+// computed with a different PSK.
+func TestKnockVerifier_WrongPSK(t *testing.T) {
+	var psk1, psk2 KnockPSK
+	rand.Read(psk1[:])
+	rand.Read(psk2[:])
+	kv := NewKnockVerifier(psk1) // verifier keyed to psk1
+
+	var random [32]byte
+	rand.Read(random[:])
+	sessionID := ComputeKnockTag(psk2, random) // tag computed with psk2
+	data := buildTestClientHello(random, sessionID)
+
+	if kv.Verify(data) {
+		t.Fatal("KnockVerifier.Verify should reject wrong PSK")
+	}
+}
+
+// TestKnockVerifier_TooShort verifies that KnockVerifier rejects short data.
+func TestKnockVerifier_TooShort(t *testing.T) {
+	var psk KnockPSK
+	kv := NewKnockVerifier(psk)
+	if kv.Verify(make([]byte, KnockMinBytes-1)) {
+		t.Fatal("KnockVerifier.Verify should reject data shorter than KnockMinBytes")
+	}
+}
+
+// TestKnockVerifier_Concurrent verifies that KnockVerifier is safe for
+// concurrent use — the pool must not corrupt shared HMAC state across goroutines.
+func TestKnockVerifier_Concurrent(t *testing.T) {
+	var psk KnockPSK
+	rand.Read(psk[:])
+	kv := NewKnockVerifier(psk)
+
+	const goroutines = 8
+	const iters = 200
+
+	errs := make(chan string, goroutines*iters)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				var random [32]byte
+				rand.Read(random[:])
+				sessionID := ComputeKnockTag(psk, random)
+				data := buildTestClientHello(random, sessionID)
+				if !kv.Verify(data) {
+					errs <- "Verify returned false for valid knock"
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for msg := range errs {
+		t.Error(msg)
+	}
+}
+
+// BenchmarkKnockVerifierVerify benchmarks the pooled zero-alloc path.
+// Compare against BenchmarkVerifyKnock to see the alloc savings.
+func BenchmarkKnockVerifierVerify(b *testing.B) {
+	var psk KnockPSK
+	rand.Read(psk[:])
+	kv := NewKnockVerifier(psk)
+
+	var random [32]byte
+	rand.Read(random[:])
+	sessionID := ComputeKnockTag(psk, random)
+	data := buildTestClientHello(random, sessionID)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		kv.Verify(data)
+	}
+}
+
+// BenchmarkKnockVerifierVerify_Parallel benchmarks concurrent access to the pool.
+func BenchmarkKnockVerifierVerify_Parallel(b *testing.B) {
+	var psk KnockPSK
+	rand.Read(psk[:])
+	kv := NewKnockVerifier(psk)
+
+	var random [32]byte
+	rand.Read(random[:])
+	sessionID := ComputeKnockTag(psk, random)
+	data := buildTestClientHello(random, sessionID)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			kv.Verify(data)
+		}
+	})
 }

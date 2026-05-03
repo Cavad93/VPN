@@ -2021,7 +2021,9 @@ func main() {
 		defer stop()
 
 		// Parse knock key if provided.
-		var knockKey *transport.KnockPSK
+		// KnockVerifier pools HMAC-SHA256 hashers for zero-alloc verification:
+		// at 10 000 rejected knocks/sec this saves ~80 000 allocs/sec vs VerifyKnock.
+		var kv *transport.KnockVerifier
 		if knockKeyHex != "" {
 			kb, err := hex.DecodeString(knockKeyHex)
 			if err != nil || len(kb) != 32 {
@@ -2030,7 +2032,7 @@ func main() {
 			}
 			var k transport.KnockPSK
 			copy(k[:], kb)
-			knockKey = &k
+			kv = transport.NewKnockVerifier(k)
 			logger.Info("port knocking enabled (Reality-style session_id HMAC)")
 		}
 
@@ -2053,7 +2055,7 @@ func main() {
 		}
 		// TCP relay: handles CavadVPN TCP transport + decoy for scanners.
 		go func() {
-			if err := runRelay(ctx, cfg.ListenAddr, relayTo, knockKey, logger); err != nil {
+			if err := runRelay(ctx, cfg.ListenAddr, relayTo, kv, logger); err != nil {
 				logger.Error("TCP relay error", "err", err)
 			}
 		}()

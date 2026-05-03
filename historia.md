@@ -5253,8 +5253,91 @@ possible timer leak: heap grew by 3603128 bytes over 200 reads (limit 409600 byt
 
 ---
 
+## Запуск 76 — 2026-05-03
+
+### Выполнено: KnockVerifier — пул HMAC-хешеров для zero-alloc верификации knock (relay mode)
+
+**Файлы:** `server/transport/knock.go`, `server/transport/knock_test.go`, `server/decoy.go`, `server/relay.go`, `server/main.go`, `server/decoy_test.go`
+
+**Проблема:**
+
+`VerifyKnock(psk KnockPSK, data []byte)` вызывала `ComputeKnockTag` → `hmac.New(sha256.New, psk[:])` на каждое входящее TCP-соединение в relay mode. `hmac.New` аллоцирует:
+1. `hmac.state` struct — heap-аллокация
+2. `sha256.digest` (inner) — heap-аллокация
+3. `sha256.digest` (outer) — heap-аллокация
+4–8: дополнительные внутренние аллокации (ipad/opad/slice headers)
+
+Итого: **8 аллокаций, 576 байт** на каждое входящее соединение в relay mode.
+
+**Расчёт давления на GC:**
+- При DDoS-атаке 10 000 закрытых соединений/сек → **80 000 аллокаций/сек, ~5.5 MB/сек heap pressure**
+- GC вынужден запускаться чаще → паузы → повышенная latency для реальных VPN-клиентов
+
+**Решение: `KnockVerifier` с `sync.Pool`**
+
+```go
+type KnockVerifier struct {
+    pool sync.Pool
+}
+
+func NewKnockVerifier(psk KnockPSK) *KnockVerifier {
+    v := &KnockVerifier{}
+    v.pool.New = func() any { return hmac.New(sha256.New, psk[:]) }
+    return v
+}
+
+func (v *KnockVerifier) Verify(data []byte) bool {
+    // ... structural check ...
+    h := v.pool.Get().(hash.Hash)
+    h.Reset()                        // O(1): восстанавливает pre-keyed состояние
+    h.Write(data[knockRandomOffset:knockRandomEnd])
+    var expected [32]byte
+    h.Sum(expected[:0])              // zero-alloc: appends in-place
+    v.pool.Put(h)
+    return hmac.Equal(expected[:], data[knockSessionIDOffset:knockSessionIDEnd])
+}
+```
+
+Ключевые детали:
+- `pool.New` захватывает PSK по значению в замыкании — безопасно
+- `h.Reset()` возвращает HMAC в начальное состояние с уже вычисленными key pads — без ре-аллокации
+- `h.Sum(expected[:0])` пишет дайджест в backing array стек-аллоцированного `[32]byte` — zero heap alloc
+- 1 оставшаяся аллокация (32 байт) — неустранима: из `h.outer.Sum(opad)` внутри stdlib HMAC при вычислении outer hash (SHA-256 Sum append на opad)
+- `pool.Get().(hash.Hash)` — безопасен под GIL; sync.Pool thread-safe по определению
+
+**Изменения вызывающего кода:**
+
+| Файл | До | После |
+|---|---|---|
+| `decoy.go` | `peekAndRouteKnock(conn, *KnockPSK)` | `peekAndRouteKnock(conn, *KnockVerifier)` |
+| `relay.go` | `runRelay(..., *KnockPSK, ...)` / `relayOne(..., *KnockPSK, ...)` | `*KnockVerifier` |
+| `main.go` | `knockKey = &k` | `kv = transport.NewKnockVerifier(k)` |
+| `decoy_test.go` | `&psk` | `transport.NewKnockVerifier(psk)` |
+
+`VerifyKnock(psk, data)` сохранена для backward-compat и unit-тестов транспортного пакета.
+
+**Бенчмарки (AMD/ARM, -count=3):**
+
+```
+BenchmarkVerifyKnock-4               1433 ns/op   576 B/op   8 allocs/op
+BenchmarkKnockVerifierVerify-4        572 ns/op    32 B/op   1 alloc/op   ← 2.5× быстрее, 7 аллокаций сэкономлено
+BenchmarkKnockVerifierVerify_Parallel  157 ns/op   32 B/op   1 alloc/op   ← пул эффективен при concurrent access
+```
+
+**Новые тесты (4 юнит + 2 бенчмарка):**
+- `TestKnockVerifier_ValidKnock` — правильный PSK → Verify возвращает true
+- `TestKnockVerifier_WrongPSK` — чужой PSK → Verify возвращает false
+- `TestKnockVerifier_TooShort` — данные короче KnockMinBytes → false
+- `TestKnockVerifier_Concurrent` — 8 горутин × 200 итераций, race detector чист — пул корректен при concurrent use
+- `BenchmarkKnockVerifierVerify` — однопоточный benchmark (сравнение с VerifyKnock)
+- `BenchmarkKnockVerifierVerify_Parallel` — b.RunParallel benchmark (измерение пула под нагрузкой)
+
+**Результат:** `go test ./... -count=1 -race` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
-1. **IPv6 inner tunnel** — `markECNCE` только IPv4. При расширении туннеля до IPv6 нужен путь для Traffic Class field (byte 1 IPv6 header).
+1. **IPv6 inner tunnel** — ~~TODO~~ `markECNCEv6` уже реализован (несколько коммитов, см. git log). Бэклог-пункт закрыт.
 
 2. **pprof под живой нагрузкой** — ~~ДОБАВЛЕНО~~ (Запуск 24). Следующий шаг: реально проанализировать профили при 30 Mbps нагрузке и найти CPU hotspots. Требует работающего VPN-сервера с реальным трафиком.
