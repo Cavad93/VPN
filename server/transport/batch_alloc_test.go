@@ -70,15 +70,6 @@ func TestBatchReaderPlatformFields(t *testing.T) {
 	if got := len(p.sockaddrs); got != maxBatchSize {
 		t.Errorf("sockaddrs len = %d, want %d", got, maxBatchSize)
 	}
-	if got := len(p.results); got != maxBatchSize {
-		t.Errorf("results len = %d, want %d", got, maxBatchSize)
-	}
-	if got := len(p.resultAddrs); got != maxBatchSize {
-		t.Errorf("resultAddrs len = %d, want %d", got, maxBatchSize)
-	}
-	if got := len(p.resultIPs); got != maxBatchSize {
-		t.Errorf("resultIPs len = %d, want %d", got, maxBatchSize)
-	}
 }
 
 // TestBatchWriterPlatformFields verifies the pre-allocated arrays in

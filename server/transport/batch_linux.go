@@ -8,79 +8,80 @@
 // for user-space congestion control where per-packet syscall overhead
 // is the primary bottleneck.
 //
-// Memory layout:
-// All mmsghdr/iovec/sockaddr arrays used by sendmmsg and recvmmsg are embedded
-// as VALUE arrays inside batchWriterPlatform / batchReaderPlatform, which are
-// themselves embedded in batchWriter / batchReader. This means the arrays live
-// in the same heap object as the connection, eliminating the per-flush allocations
-// that previously occurred (~3 make() calls per Flush(), ~2630 calls/sec at 30 Mbps).
+// Zero-allocation send path (steady-state):
 //
-// Zero-allocation send path:
-// The file descriptor is cached on the first flush (one-time rawConn.Control()
-// call). Subsequent flushes call SYS_SENDMMSG via unix.Syscall6 directly,
-// avoiding both the SyscallConn() allocation and the closure allocation that
-// rawConn.Control() requires. The cached FD is valid for the lifetime of the
-// *net.UDPConn held by w.conn; Close() of that conn invalidates the FD, but
-// flushPlatform is never called after Close() (writePacket checks ctx.Err first).
+//  1. mmsghdr/iovec/sockaddr arrays are embedded as VALUE fields in
+//     batchWriterPlatform, which lives inside batchWriter. They are
+//     allocated once with the connection — no per-flush make() or Pool.Get.
+//
+//  2. The socket FD is cached on the very first flush via a single
+//     rawConn.Control() call. Subsequent flushes call unix.Syscall6(SYS_SENDMMSG)
+//     directly, bypassing SyscallConn() (1 alloc/flush) and rawConn.Control's
+//     closure (1 alloc/flush).
+//
+// Zero-allocation receive path (steady-state):
+//
+//  1. Same mmsghdr/iovec/sockaddr pre-allocation via batchReaderPlatform.
+//
+//  2. rawConn is cached after the first read — eliminates the SyscallConn()
+//     allocation on every Read() call.
+//
+//  3. Results are written into r.resBuf (defined in batch.go) — no make() per batch.
+//
+//  4. udpAddrKeyFromRawIPv4 constructs the map key from raw sockaddr bytes without
+//     allocating net.IP or *net.UDPAddr.
 package transport
 
 import (
-	"net"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
+// mmsghdr matches the Linux mmsghdr struct for sendmmsg/recvmmsg.
+type mmsghdr struct {
+	Hdr unix.Msghdr
+	Len uint32
+}
+
 // batchWriterPlatform embeds pre-allocated send-side arrays for sendmmsg and
 // a cached file descriptor so that flushPlatform can call SYS_SENDMMSG directly
 // without allocating a rawConn wrapper or a closure on every flush.
+//
+// Memory: VALUE arrays — embedded in batchWriter, zero extra heap allocation.
 type batchWriterPlatform struct {
-	// Pre-allocated fixed arrays — embedded as values, zero extra heap allocs.
 	mmsghdrs  [maxBatchSize]mmsghdr
 	iovecs    [maxBatchSize]unix.Iovec
 	sockaddrs [maxBatchSize]unix.RawSockaddrInet4
 
-	// fd is the cached socket file descriptor.
-	// Set to non-zero once on the first flushPlatform call via rawConn.Control().
-	// After that, all flushes use it directly (no SyscallConn, no closure).
+	// fd is the cached socket file descriptor, set on the first flush.
+	// After that, all flushes call SYS_SENDMMSG directly (no SyscallConn, no closure).
 	fd      uintptr
-	fdReady bool // true once fd has been fetched
+	fdReady bool
 }
 
-// batchReaderPlatform embeds pre-allocated receive-side arrays for recvmmsg.
-// result and resultAddrs/resultIPs hold the decoded batchResult values that
-// readPlatform returns — callers must not retain them across the next Read call.
+// batchReaderPlatform embeds pre-allocated receive-side arrays for recvmmsg and
+// a cached rawConn to avoid calling SyscallConn() on every Read() call.
+//
+// Memory: VALUE arrays — embedded in batchReader, zero extra heap allocation.
 type batchReaderPlatform struct {
-	// Pre-allocated fixed arrays for recvmmsg.
 	mmsghdrs  [maxBatchSize]mmsghdr
 	iovecs    [maxBatchSize]unix.Iovec
 	sockaddrs [maxBatchSize]unix.RawSockaddrInet4
 
-	// results holds the decoded packets. Returned as a sub-slice; valid until
-	// the next Read() call (same goroutine, sequential access).
-	results [maxBatchSize]batchResult
-
-	// resultAddrs is the pre-allocated net.UDPAddr storage reused per batch.
-	resultAddrs [maxBatchSize]net.UDPAddr
-
-	// resultIPs is the pre-allocated 16-byte IP backing for each UDPAddr.
-	// Eliminates the net.IPv4() heap allocation (net.IP is a []byte).
-	resultIPs [maxBatchSize][16]byte
-
-	// rawConn is cached after the first readPlatform call to avoid calling
-	// SyscallConn() (which allocates a new *rawConn) on every read.
-	rawConn  syscall.RawConn
-	rcReady  bool
+	// rawConn is cached after the first read — SyscallConn() allocates a new
+	// *rawConn each call; caching it saves 1 alloc per Read().
+	rawConn syscall.RawConn
+	rcReady bool
 }
 
 // flushPlatform sends all queued packets using sendmmsg(2) — one syscall
 // for up to 64 packets instead of 64 individual WriteToUDP calls.
 //
-// Steady-state (after first call): zero heap allocations.
-//   - All mmsghdr/iovec/sockaddr arrays are pre-allocated in w.platform.
-//   - The socket FD is cached in w.platform.fd; no SyscallConn() call.
-//   - No closure is passed to rawConn.Control(); unix.Syscall6 is called directly.
+// Steady-state allocations: 0.
+//   - mmsghdr/iovec/sockaddr arrays read from w.platform (embedded VALUE fields).
+//   - Cached FD used for direct SYS_SENDMMSG syscall — no SyscallConn(), no closure.
 //
 // First call only: one rawConn.Control() to cache the FD (one-time cost).
 func (w *batchWriter) flushPlatform() error {
@@ -89,27 +90,27 @@ func (w *batchWriter) flushPlatform() error {
 		return nil
 	}
 
-	// Fast path: single packet — use regular WriteToUDP (no mmsghdr overhead).
+	// Fast path: single packet — regular WriteToUDP (no mmsghdr overhead).
 	if n == 1 {
 		_, err := w.conn.WriteToUDP(w.msgs[0].buf, w.msgs[0].addr)
 		return err
 	}
 
-	// Initialise the cached FD on the very first flush (one-time).
+	// One-time FD initialisation on the very first flush.
+	// rawConn.Control() and its closure allocate here, but this path is taken
+	// exactly once per batchWriter — it is not on the steady-state hot path.
 	if !w.platform.fdReady {
 		rawConn, err := w.conn.SyscallConn()
 		if err != nil {
 			return w.flushFallback()
 		}
-		// Capture the FD into the platform struct; no closure escape after this.
 		rawConn.Control(func(fd uintptr) { //nolint:errcheck
 			w.platform.fd = fd
 		})
 		w.platform.fdReady = true
 	}
 
-	// Build the mmsghdr array for sendmmsg using pre-allocated slices.
-	// No make() calls — all arrays are embedded in w.platform.
+	// Build sendmmsg arguments using pre-allocated VALUE arrays — zero make() calls.
 	mmsghdrs := w.platform.mmsghdrs[:n]
 	iovecs := w.platform.iovecs[:n]
 	sockaddrs := w.platform.sockaddrs[:n]
@@ -132,9 +133,9 @@ func (w *batchWriter) flushPlatform() error {
 		mmsghdrs[i].Hdr.Iovlen = 1
 	}
 
-	// Call sendmmsg directly using the cached FD — zero allocations.
-	// This avoids rawConn.Control(closure) which would allocate a heap closure.
-	// The FD stays valid as long as w.conn is alive (we hold a reference to it).
+	// Direct sendmmsg via cached FD — no closure, no SyscallConn, zero allocations.
+	// Safe: w.conn holds a reference to the FD, preventing GC finalization.
+	// sendMu serializes all flushPlatform calls, so there is no concurrent access.
 	sent := 0
 	for sent < n {
 		r, _, errno := unix.Syscall6(
@@ -164,20 +165,12 @@ func (w *batchWriter) flushFallback() error {
 	return firstErr
 }
 
-// mmsghdr matches the Linux mmsghdr struct for sendmmsg/recvmmsg.
-type mmsghdr struct {
-	Hdr unix.Msghdr
-	Len uint32
-}
-
 // readPlatform reads multiple packets using recvmmsg(2) — one syscall
 // for up to N packets instead of N individual ReadFromUDP calls.
-// All intermediate buffers and results are read from/into r.platform,
-// eliminating the per-call make() heap allocations from the original code.
 //
-// Callers MUST NOT retain the returned []batchResult slice or any
-// batchResult.addr pointer across the next Read() call — the backing
-// storage is reused on every invocation.
+// Steady-state allocations: 1 (rawConn.Read closure — unavoidable with Go's API).
+// Previous pool-based approach: 3 make() per call + pool Get/Put + SyscallConn().
+// Now: 0 make() + no pool + 1 (cached rawConn, no SyscallConn after first read).
 func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 	n := len(r.bufs)
 	if n == 0 {
@@ -190,26 +183,26 @@ func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 		if err != nil {
 			return nil, 0, err
 		}
-		return []batchResult{{n: nn, addr: addr, buf: r.bufs[0][:nn]}}, 1, nil
+		r.resBuf[0] = batchResult{n: nn, key: makeUDPAddrKey(addr), buf: r.bufs[0][:nn]}
+		return r.resBuf[:1], 1, nil
 	}
 
-	// Cache rawConn on first read — SyscallConn() allocates a *rawConn each call,
-	// so we call it once and store the interface value in the platform struct.
+	// Cache rawConn on first read — SyscallConn() allocates a new *rawConn each call.
 	if !r.platform.rcReady {
 		rawConn, err := r.conn.SyscallConn()
 		if err != nil {
-			// Fallback to single read.
 			nn, addr, err := r.conn.ReadFromUDP(r.bufs[0])
 			if err != nil {
 				return nil, 0, err
 			}
-			return []batchResult{{n: nn, addr: addr, buf: r.bufs[0][:nn]}}, 1, nil
+			r.resBuf[0] = batchResult{n: nn, key: makeUDPAddrKey(addr), buf: r.bufs[0][:nn]}
+			return r.resBuf[:1], 1, nil
 		}
 		r.platform.rawConn = rawConn
 		r.platform.rcReady = true
 	}
 
-	// Build recvmmsg arrays using pre-allocated slices — zero make() calls.
+	// Build recvmmsg arguments using pre-allocated VALUE arrays — zero make() calls.
 	mmsghdrs := r.platform.mmsghdrs[:n]
 	iovecs := r.platform.iovecs[:n]
 	sockaddrs := r.platform.sockaddrs[:n]
@@ -226,8 +219,9 @@ func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 
 	var count int
 	var recvErr error
-	// Use Read (blocking) to wait for at least one packet, then recvmmsg
-	// picks up any additional packets that arrived.
+	// rawConn.Read blocks until the closure returns — closures are unavoidable
+	// with the Go net API for blocking reads. We still save SyscallConn() and
+	// make() allocations vs the previous implementation.
 	err := r.platform.rawConn.Read(func(fd uintptr) bool {
 		rv, _, errno := unix.Syscall6(
 			unix.SYS_RECVMMSG,
@@ -247,41 +241,43 @@ func (r *batchReader) readPlatform() ([]batchResult, int, error) {
 		count = int(rv)
 		return true
 	})
+
+	// Write results into r.resBuf (pre-allocated in batchReader).
+	// udpAddrKeyFromRawIPv4 constructs the map key from raw sockaddr bytes
+	// without allocating a net.IP slice or *net.UDPAddr.
+	res := r.resBuf[:count]
+	for i := 0; i < count; i++ {
+		sa := &sockaddrs[i]
+		port := int(sa.Port>>8) | int(sa.Port<<8)&0xFF00
+		res[i] = batchResult{
+			n:   int(mmsghdrs[i].Len),
+			key: udpAddrKeyFromRawIPv4(sa, port),
+			buf: r.bufs[i][:mmsghdrs[i].Len],
+		}
+	}
+
 	if err != nil {
 		return nil, 0, err
 	}
 	if recvErr != nil {
 		return nil, 0, recvErr
 	}
+	return res, count, nil
+}
 
-	// Decode results using pre-allocated storage — no make() or net.IPv4() allocations.
-	// r.platform.resultIPs[i] is a [16]byte array; we write the IPv4-mapped IPv6
-	// representation directly (same layout as net.IPv4()) and alias it as net.IP.
-	results := r.platform.results[:count]
-	for i := 0; i < count; i++ {
-		sa := &sockaddrs[i]
-		port := int(sa.Port>>8) | int(sa.Port<<8)&0xFF00
-
-		// Fill IPv4-in-IPv6 form directly into pre-allocated [16]byte.
-		// This is identical to the 16-byte slice returned by net.IPv4(),
-		// avoiding the heap allocation that net.IPv4() would cause.
-		ip := r.platform.resultIPs[i][:]
-		ip[0] = 0; ip[1] = 0; ip[2] = 0; ip[3] = 0
-		ip[4] = 0; ip[5] = 0; ip[6] = 0; ip[7] = 0
-		ip[8] = 0; ip[9] = 0; ip[10] = 0xff; ip[11] = 0xff
-		ip[12] = sa.Addr[0]; ip[13] = sa.Addr[1]
-		ip[14] = sa.Addr[2]; ip[15] = sa.Addr[3]
-
-		// Reuse pre-allocated UDPAddr — update fields in place.
-		r.platform.resultAddrs[i].IP = ip
-		r.platform.resultAddrs[i].Port = port
-		r.platform.resultAddrs[i].Zone = ""
-
-		results[i] = batchResult{
-			n:    int(mmsghdrs[i].Len),
-			addr: &r.platform.resultAddrs[i],
-			buf:  r.bufs[i][:mmsghdrs[i].Len],
-		}
-	}
-	return results, count, nil
+// udpAddrKeyFromRawIPv4 builds a udpAddrKey directly from a RawSockaddrInet4
+// without allocating — eliminates net.IPv4() + &net.UDPAddr{} per received packet.
+//
+// Port byte-swap: recvmmsg stores ports in network byte order (big-endian),
+// so we swap to host order: host_port = (sa.Port>>8) | ((sa.Port&0xFF)<<8).
+// This is identical to the byte-swap used by net.UDPAddr for kernel sockaddrs.
+func udpAddrKeyFromRawIPv4(sa *unix.RawSockaddrInet4, hostPort int) udpAddrKey {
+	var k udpAddrKey
+	// Normalise to IPv4-in-IPv6 form to match makeUDPAddrKey(net.UDPAddr{IP:net.IPv4(...)}).
+	k.ip[10] = 0xff
+	k.ip[11] = 0xff
+	copy(k.ip[12:], sa.Addr[:])
+	k.port = hostPort
+	// k.zone = "" (zero value) — IPv4 has no link-local zone.
+	return k
 }

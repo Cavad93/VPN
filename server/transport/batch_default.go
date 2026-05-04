@@ -8,12 +8,12 @@
 // kernel-level batching.
 package transport
 
-// batchWriterPlatform holds pre-allocated send-side arrays for flushPlatform.
-// On non-Linux platforms there is nothing to pre-allocate — this is a zero-size stub.
+// batchWriterPlatform holds pre-allocated send-side state for flushPlatform.
+// On non-Linux platforms there is nothing to pre-allocate — zero-size stub.
 type batchWriterPlatform struct{}
 
-// batchReaderPlatform holds pre-allocated receive-side arrays for readPlatform.
-// On non-Linux platforms there is nothing to pre-allocate — this is a zero-size stub.
+// batchReaderPlatform holds pre-allocated receive-side state for readPlatform.
+// On non-Linux platforms there is nothing to pre-allocate — zero-size stub.
 type batchReaderPlatform struct{}
 
 // flushPlatform sends all queued packets using individual WriteToUDP calls.
