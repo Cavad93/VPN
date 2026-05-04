@@ -9,10 +9,24 @@ import (
 // BBR estimator constants.
 const (
 	// rtpropFilterLen is the time window for the minimum RTT filter.
-	// BBR paper: 10 seconds. We use RTprop as the propagation delay —
-	// the minimum RTT observed in this window with high probability
-	// reflects the true propagation delay without queuing.
-	rtpropFilterLen = 10 * time.Second
+	// BBR paper uses 10 seconds. We use 30 seconds for the following reasons:
+	//
+	// 1. On stable VPN routes (fixed relay topology), true RTprop changes rarely
+	//    — route RTT may drift by ±5 ms/hour but not jump 20+ ms unexpectedly.
+	//    A 30-second window captures any such drift while still detecting genuine
+	//    route changes within one ProbeRTT cycle.
+	//
+	// 2. ProbeRTT duty cycle: with 10 s window, ProbeRTT fires every ~10 s and
+	//    holds at min-cwnd for 200 ms = 2% downtime. At 30 s the same hold is
+	//    0.67% — a 3× reduction in ProbeRTT overhead (~0.1 Mbps recovered on a
+	//    7.6 Mbps uplink at 78 ms RTT).
+	//
+	// 3. The 200 ms ProbeRTT hold is ≫ RTT (78 ms), so each ProbeRTT still
+	//    measures true propagation delay accurately regardless of filter length.
+	//
+	// Drawback: if a new route with lower RTT appears, it takes up to 30 s to
+	// refresh RTprop. Acceptable for VPN tunnels on fixed server addresses.
+	rtpropFilterLen = 30 * time.Second
 
 	// btlbwFilterLen is the number of round-trips for the max bandwidth filter.
 	btlbwFilterLen = 10

@@ -5438,8 +5438,51 @@ if nc.perf != nil {
 
 ---
 
+## Запуск 78 — 2026-05-04 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: rtpropFilterLen 10s → 30s — снижение частоты ProbeRTT в 3×
+
+**Файлы:** `server/transport/bbr_estimator.go`, `server/transport/bbr_estimator_test.go`, `server/transport/bbr_state_test.go`
+
+**Контекст:**
+
+BBR ProbeRTT enters whenever RTprop hasn't been refreshed for `rtpropFilterLen`. With the previous 10-second window, ProbeRTT fired approximately every 10 seconds, holding cwnd at 4 packets for 200 ms — a 2% duty cycle that limits throughput on an already-constrained uplink.
+
+**Проблема:**
+
+```
+duty_cycle = probeRTTDuration / rtpropFilterLen = 200ms / 10s = 2.0%
+throughput_loss = 2.0% × 7.2 Mbps uplink = 0.144 Mbps
+```
+
+На стабильных VPN-маршрутах (MacBook → СПб relay → Астана, RTT ≈ 78 мс) истечение RTprop происходило каждые ~10 секунд — RTprop-фильтр не обновлялся в ProbeBW (drain фаза 0.75× снижает inflight лишь частично, не до нуля).
+
+**Решение: `rtpropFilterLen = 30 * time.Second`**
+
+```
+duty_cycle = 200ms / 30s = 0.67%
+throughput_loss = 0.67% × 7.2 Mbps = 0.048 Mbps
+savings = 1.33% × 7.2 Mbps ≈ 0.096 Mbps (~+1.5% throughput)
+```
+
+Почему 30 секунд безопасно:
+1. SPB→Astana — фиксированный relay, RTT дрейфует ±2-5 мс/час, не прыгает.
+2. 200 мс hold ≫ RTT (78 мс) — каждый ProbeRTT точно измеряет propagation delay.
+3. Route change detection: ProbeBW drain-фаза (0.75× gain, каждые ~600 мс) даёт RTT-сэмплы близкие к минимуму при любом улучшении маршрута.
+
+**Обновлённые тесты:**
+- `TestBBRProbeRTT`, `TestBBRProbeRTTRestoresCwnd`: stamp изменён с `-15s` → `-35s` (> 30s порог)
+- `TestRTpropNotExpiredAt15Seconds` (новый): 15s stamp НЕ вызывает expiry при 30s окне — регрессионный guard
+- `TestRTpropExpiredAt35Seconds` (новый): 35s stamp вызывает expiry — позитивный тест
+
+**Тесты:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **IPv6 inner tunnel** — ~~TODO~~ `markECNCEv6` уже реализован (несколько коммитов, см. git log). Бэклог-пункт закрыт.
 
 2. **pprof под живой нагрузкой** — ~~ДОБАВЛЕНО~~ (Запуск 24). Следующий шаг: реально проанализировать профили при 30 Mbps нагрузке и найти CPU hotspots. Требует работающего VPN-сервера с реальным трафиком.
+
+3. **probeRTTDuration 200ms → 100ms** — Следующий шаг после Запуска 78. При RTT=78 мс: 100ms ≥ 1.3 RTT, достаточно для точного измерения RTprop. Duty cycle: 200ms/30s = 0.67% → 100ms/30s = 0.33% → экономия ещё ~0.048 Мбит/с.

@@ -385,6 +385,50 @@ func TestEstimatorRTpropExpired(t *testing.T) {
 	}
 }
 
+// TestRTpropNotExpiredAt15Seconds verifies that the 30-second filter window
+// does not expire a sample that is only 15 seconds old (half the window).
+// With the old 10-second window this sample would have been stale, causing
+// an unnecessary ProbeRTT cycle every ~10 s; with 30 s the cycle is ~3×
+// less frequent, recovering ~0.1 Mbps on a 7.6 Mbps VPN uplink.
+func TestRTpropNotExpiredAt15Seconds(t *testing.T) {
+	e := newBBREstimator()
+	now := time.Now()
+
+	// Seed RTprop.
+	e.OnACK(50*time.Millisecond, 1400, 0, now.Add(-50*time.Millisecond), now.Add(-50*time.Millisecond), false)
+
+	// Wind the stamp back 15 seconds (less than the 30 s filter window).
+	e.mu.Lock()
+	stamp15 := time.Now().Add(-15 * time.Second)
+	e.rtpropFilter.stamp = stamp15
+	e.rtpropStampNano.Store(stamp15.UnixNano())
+	e.mu.Unlock()
+
+	if e.RTpropExpired() {
+		t.Fatal("RTprop should not expire at 15 s with a 30 s filter window (was 10 s before this fix)")
+	}
+}
+
+// TestRTpropExpiredAt35Seconds verifies that a 35-second-old stamp triggers
+// RTprop expiry with the 30-second filter window.
+func TestRTpropExpiredAt35Seconds(t *testing.T) {
+	e := newBBREstimator()
+	now := time.Now()
+
+	e.OnACK(50*time.Millisecond, 1400, 0, now.Add(-50*time.Millisecond), now.Add(-50*time.Millisecond), false)
+
+	// Wind the stamp back 35 seconds (beyond the 30 s filter window).
+	e.mu.Lock()
+	stamp35 := time.Now().Add(-35 * time.Second)
+	e.rtpropFilter.stamp = stamp35
+	e.rtpropStampNano.Store(stamp35.UnixNano())
+	e.mu.Unlock()
+
+	if !e.RTpropExpired() {
+		t.Fatal("RTprop should expire at 35 s with a 30 s filter window")
+	}
+}
+
 func TestEstimatorConcurrentAccess(t *testing.T) {
 	e := newBBREstimator()
 	now := time.Now()

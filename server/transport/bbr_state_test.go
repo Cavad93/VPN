@@ -160,9 +160,10 @@ func TestBBRProbeRTT(t *testing.T) {
 	simulateNACKs(s, 5, 50*time.Millisecond, 14000)
 
 	// Force RTprop to expire by manipulating the filter and its atomic mirror.
+	// Use -35s (> 30s filter window) to reliably trigger expiry.
 	s.mu.Lock()
 	s.estimator.mu.Lock()
-	expiredStamp := time.Now().Add(-15 * time.Second)
+	expiredStamp := time.Now().Add(-35 * time.Second)
 	s.estimator.rtpropFilter.stamp = expiredStamp // expired
 	s.estimator.rtpropStampNano.Store(expiredStamp.UnixNano())
 	s.estimator.mu.Unlock()
@@ -192,7 +193,7 @@ func TestBBRProbeRTTRestoresCwnd(t *testing.T) {
 
 	s.mu.Lock()
 	s.estimator.mu.Lock()
-	expiredStamp2 := time.Now().Add(-15 * time.Second)
+	expiredStamp2 := time.Now().Add(-35 * time.Second)
 	s.estimator.rtpropFilter.stamp = expiredStamp2
 	s.estimator.rtpropStampNano.Store(expiredStamp2.UnixNano())
 	s.estimator.mu.Unlock()
