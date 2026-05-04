@@ -258,6 +258,28 @@ func TestProbeRTTDurationExpiredAt120ms(t *testing.T) {
 	t.Logf("phase after 120 ms hold: %v (probeRTTDuration=%v)", s.Phase(), probeRTTDuration)
 }
 
+// TestProbeRTTCwndIs8 is a regression guard: if probeRTTCwndPackets reverts to
+// the BBR paper's original 4, this test catches the regression. We use 8 to
+// halve the throughput dip (73→147 KB/s at RTT=78ms) while keeping the RTprop
+// bias small (< 8% cwnd inflation vs true BDP).
+func TestProbeRTTCwndIs8(t *testing.T) {
+	if probeRTTCwndPackets != 8 {
+		t.Fatalf("probeRTTCwndPackets=%d, want 8 (see bbr_state.go comment for rationale)",
+			probeRTTCwndPackets)
+	}
+}
+
+// TestProbeRTTCwndIsLowerThanMinCwnd verifies that probeRTTCwndPackets remains
+// strictly below minCwndPackets. If they were equal, ProbeRTT could not drain
+// the queue below the normal operating floor — RTprop measurements would be
+// permanently biased by residual queuing delay.
+func TestProbeRTTCwndIsLowerThanMinCwnd(t *testing.T) {
+	if probeRTTCwndPackets >= minCwndPackets {
+		t.Fatalf("probeRTTCwndPackets=%d must be < minCwndPackets=%d to allow queue drain",
+			probeRTTCwndPackets, minCwndPackets)
+	}
+}
+
 func TestBBROnLossLowRate(t *testing.T) {
 	s := newTestBBR()
 

@@ -52,16 +52,29 @@ const (
 	probeBWCwndGain = 2.0
 
 	// probeRTTCwndPackets: cwnd during the ProbeRTT drain/hold phase.
-	// BBR v1 paper (Cardwell et al., 2016) specifies 4 segments.
-	// This deliberately bypasses the minCwndPackets=32 floor: ProbeRTT NEEDS
-	// to drain the queue aggressively so that the measured RTT reflects true
-	// propagation delay, not queuing delay. Using max(4, 32)=32 would leave
-	// ~28 packets queued at the bottleneck, biasing RTprop upwards by
-	// 28 × bytes_per_packet / bottleneck_bps and causing BBR to overestimate
-	// BDP → inflated cwnd → more queuing. The 100 ms hold at cwnd=4 causes a
-	// throughput dip (~28 KB/s at RTT=78 ms) but produces an accurate RTprop
-	// measurement that guides all subsequent ProbeBW cycles.
-	probeRTTCwndPackets = 4
+	// BBR v1 paper (Cardwell et al., 2016) specifies 4 segments; we use 8.
+	//
+	// Why not 4: at cwnd=4 the throughput dip is ~73 KB/s for 100ms — a
+	// near-complete blackout visible to interactive traffic (VoIP, gaming).
+	//
+	// Why 8 is accurate enough: the RTprop bias from 8 queued packets is
+	//   8 × 1430 bytes / bottleneck_bps ≈ 12.6 ms at 7.2 Mbps
+	// BDP error: 12.6ms × 7.2Mbps / 8 bits ≈ 11.3 KB — about 8 packets of
+	// cwnd inflation above the true BDP. With typical cwnd=100-200 packets
+	// this is a 4–8% bias: acceptable for a VPN tunnel where RTT stability
+	// is more important than sub-percent BDP precision.
+	//
+	// Why not 32 (minCwndPackets): that would leave 24 MORE packets than 8
+	// in the bottleneck queue, biasing RTprop by ~48ms and inflating cwnd
+	// by ~60 packets — a significant and compounding error. ProbeRTT must
+	// still drain aggressively; 8 is the sweet spot between accuracy and UX.
+	//
+	// Throughput during hold (RTT=78ms): 4→8 pkts doubles 73→147 KB/s.
+	// Average throughput loss (duty-cycle 0.33%, 7.2 Mbps uplink):
+	//   4 pkts: 7.2 Mbps × 0.33% ≈ 24 KB/s  |  8 pkts: 7.2 Mbps × 0.33% × (1-147/7200) ≈ 23.5 KB/s
+	// Net gain: ~0.5 KB/s average — small, but the p99 latency spike is
+	// halved: 100ms with 73KB/s → 100ms with 147KB/s.
+	probeRTTCwndPackets = 8
 
 	// probeRTTDuration: how long to hold minimum cwnd in ProbeRTT.
 	// 100 ms is safe for our VPN route (RTT ≈ 78 ms): 100 ms ≥ 1.28 × RTT,
