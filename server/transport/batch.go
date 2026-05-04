@@ -23,23 +23,22 @@ type batchMsg struct {
 }
 
 // batchResult holds one received packet from a batch read.
-//
-// key replaces the previous addr *net.UDPAddr field. Pre-computing the
-// udpAddrKey inside readPlatform (from raw sockaddr on Linux, or from the
-// ReadFromUDP result on other platforms) eliminates net.IPv4() + &net.UDPAddr{}
-// heap allocations on the hot receive path (~2630 allocs/sec at 30 Mbps).
-// The key is used directly for the O(1) map lookup in readLoop; a *net.UDPAddr
-// is reconstructed via key.toUDPAddr() only for new connections (infrequent).
 type batchResult struct {
-	n   int
-	key udpAddrKey // pre-computed remote address key; no heap allocation
-	buf []byte     // slice into the pre-allocated buffer
+	n    int
+	addr *net.UDPAddr
+	buf  []byte // slice into the pre-allocated buffer
 }
 
 // batchWriter accumulates outgoing packets and flushes them in one batch.
 type batchWriter struct {
 	conn *net.UDPConn
 	msgs []batchMsg
+
+	// platform holds pre-allocated send-side arrays (mmsghdr, iovec, sockaddr).
+	// On Linux, these are maxBatchSize-element fixed arrays embedded here so that
+	// flushPlatform() can build the sendmmsg argument list with zero heap allocations.
+	// On other platforms this is an empty struct (zero size).
+	platform batchWriterPlatform
 }
 
 // newBatchWriter creates a batch writer for the given UDP connection.
@@ -94,9 +93,13 @@ func (w *batchWriter) Reset() {
 
 // batchReader reads multiple packets from a UDP socket in one operation.
 type batchReader struct {
-	conn   *net.UDPConn
-	bufs   [][]byte                  // pre-allocated receive buffers
-	resBuf [maxBatchSize]batchResult // persistent results buffer — avoids make() per batch
+	conn *net.UDPConn
+	bufs [][]byte // pre-allocated receive buffers
+
+	// platform holds pre-allocated receive-side arrays (mmsghdr, iovec, sockaddr,
+	// results, UDPAddr backing). On Linux, readPlatform() uses recvmmsg and fills
+	// results with zero heap allocations. On other platforms this is empty.
+	platform batchReaderPlatform
 }
 
 // newBatchReader creates a batch reader with pre-allocated buffers.
