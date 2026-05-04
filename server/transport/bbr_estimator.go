@@ -17,12 +17,12 @@ const (
 	//    route changes within one ProbeRTT cycle.
 	//
 	// 2. ProbeRTT duty cycle: with 10 s window, ProbeRTT fires every ~10 s and
-	//    holds at min-cwnd for 200 ms = 2% downtime. At 30 s the same hold is
-	//    0.67% — a 3× reduction in ProbeRTT overhead (~0.1 Mbps recovered on a
+	//    holds at min-cwnd for 100 ms = 1% downtime. At 30 s the same hold is
+	//    0.33% — a 3× reduction in ProbeRTT overhead (~0.1 Mbps recovered on a
 	//    7.6 Mbps uplink at 78 ms RTT).
 	//
-	// 3. The 200 ms ProbeRTT hold is ≫ RTT (78 ms), so each ProbeRTT still
-	//    measures true propagation delay accurately regardless of filter length.
+	// 3. The 100 ms ProbeRTT hold is ≥ 1.28 × RTT (78 ms), so each ProbeRTT
+	//    still measures true propagation delay accurately regardless of filter length.
 	//
 	// Drawback: if a new route with lower RTT appears, it takes up to 30 s to
 	// refresh RTprop. Acceptable for VPN tunnels on fixed server addresses.

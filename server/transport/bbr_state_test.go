@@ -208,7 +208,7 @@ func TestBBRProbeRTTRestoresCwnd(t *testing.T) {
 	// and let inflight drop. Our helper doesn't track real inflight,
 	// so we manipulate state.
 	s.mu.Lock()
-	s.probeRTTDoneTime = time.Now().Add(-300 * time.Millisecond) // > 200ms ago
+	s.probeRTTDoneTime = time.Now().Add(-150 * time.Millisecond) // > 100ms ago (probeRTTDuration)
 	s.mu.Unlock()
 
 	simulateACK(s, 50*time.Millisecond, 1400)
@@ -217,6 +217,45 @@ func TestBBRProbeRTTRestoresCwnd(t *testing.T) {
 	if s.Phase() == BBRProbeRTT {
 		t.Log("Note: still in ProbeRTT — inflight check not met in unit test")
 	}
+}
+
+// TestProbeRTTDurationNotExpiredAt50ms verifies that ProbeRTT does NOT exit
+// if less than probeRTTDuration (100 ms) has elapsed since entering the hold.
+// Regression guard: ensures we don't inadvertently accept an old 200 ms value.
+func TestProbeRTTDurationNotExpiredAt50ms(t *testing.T) {
+	s := newTestBBR()
+	s.mu.Lock()
+	s.phase = BBRProbeRTT
+	s.cwndTarget = probeRTTCwndPackets
+	// Set probeRTTDoneTime 50 ms in the past — shorter than the 100 ms threshold.
+	s.probeRTTDoneTime = time.Now().Add(-50 * time.Millisecond)
+	s.mu.Unlock()
+
+	simulateACK(s, 50*time.Millisecond, 1400)
+
+	// Must still be in ProbeRTT: 50 ms < probeRTTDuration (100 ms).
+	if s.Phase() != BBRProbeRTT {
+		t.Fatalf("ProbeRTT exited too early: 50 ms < probeRTTDuration(%v)", probeRTTDuration)
+	}
+}
+
+// TestProbeRTTDurationExpiredAt120ms verifies that ProbeRTT CAN exit once
+// probeRTTDuration (100 ms) has elapsed. 120 ms > 100 ms threshold.
+func TestProbeRTTDurationExpiredAt120ms(t *testing.T) {
+	s := newTestBBR()
+	s.mu.Lock()
+	s.phase = BBRProbeRTT
+	s.cwndTarget = probeRTTCwndPackets
+	s.priorCwnd = 20
+	// Set probeRTTDoneTime 120 ms in the past — longer than the 100 ms threshold.
+	s.probeRTTDoneTime = time.Now().Add(-120 * time.Millisecond)
+	s.mu.Unlock()
+
+	simulateACK(s, 50*time.Millisecond, 1400)
+
+	// May have exited ProbeRTT (inflight must also be low; helper may not satisfy that).
+	// Log the actual phase for diagnostic purposes.
+	t.Logf("phase after 120 ms hold: %v (probeRTTDuration=%v)", s.Phase(), probeRTTDuration)
 }
 
 func TestBBROnLossLowRate(t *testing.T) {

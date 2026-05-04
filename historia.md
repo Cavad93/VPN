@@ -5479,10 +5479,78 @@ savings = 1.33% × 7.2 Mbps ≈ 0.096 Mbps (~+1.5% throughput)
 
 ---
 
+---
+
+## Запуск 79 — 2026-05-04 (ветка: claude/reduce-vpn-bandwidth-NGVmG)
+
+### Выполнено: probeRTTDuration 200ms → 100ms — снижение duty cycle ProbeRTT в 2×
+
+**Файлы:** `server/transport/bbr_state.go`, `server/transport/bbr_state_test.go`, `server/transport/bbr_estimator.go`
+
+**Контекст:**
+
+Запуск 78 снизил частоту ProbeRTT в 3× (rtpropFilterLen 10s → 30s). Запуск 79 дополнительно вдвое сокращает длительность каждого цикла ProbeRTT: 200ms → 100ms.
+
+**Проблема:**
+
+Во время ProbeRTT cwnd опускается до 4 пакетов на всё время `probeRTTDuration`. При RTT=78 мс и cwnd=4:
+```
+throughput_during_probe = 4 × 1460 bytes / 0.078 s ≈ 75 KB/s  (vs 7.2 Mbps normal)
+throughput_loss = (7.2 Mbps - 0.6 Mbps) × 200ms / 30s ≈ 0.044 Mbps per-cycle
+```
+
+200 мс — значение из оригинальной BBR статьи (Cardwell et al., 2016), которое авторы обосновывают для типичного интернет-маршрута с RTT до 150–200 мс. На нашем VPN-маршруте (MacBook → СПб relay → Астана, RTT ≈ 78 мс) это избыточно.
+
+**Расчёт безопасности порога:**
+
+```
+required_hold ≥ 1 RTT  (BBR paper requirement для измерения RTprop)
+100 ms / 78 ms = 1.28 RTT  — достаточно для точного измерения
+```
+
+1.28 RTT гарантирует полный цикл drain + measurement. Даже при временных RTT-spike до 90 мс: 100ms / 90ms = 1.11 RTT — всё ещё выше порога 1.0 RTT.
+
+**Изменение:**
+
+```go
+// bbr_state.go
+// ДО:
+probeRTTDuration = 200 * time.Millisecond
+
+// ПОСЛЕ:
+probeRTTDuration = 100 * time.Millisecond
+// 100 ms ≥ 1.28 × RTT (78 ms), duty-cycle 200ms/30s=0.67% → 100ms/30s=0.33%
+```
+
+**Эффект:**
+
+| Метрика | До (200ms) | После (100ms) |
+|---|---|---|
+| Длительность ProbeRTT hold | 200 ms | 100 ms |
+| Throughput dip при RTT=78ms | ~75 KB/s × 0.2s = 15 KB/cycle | ~75 KB/s × 0.1s = 7.5 KB/cycle |
+| Duty cycle (при 30s window) | 0.67% | 0.33% |
+| Среднее снижение throughput | ~0.044 Mbps | ~0.022 Mbps |
+| **Экономия от 78→79** | — | **~0.022 Mbps** |
+
+**Обновлённые комментарии:**
+- `bbr_state.go:61` — "The 100 ms hold at cwnd=4..." + обоснование безопасности 100ms
+- `bbr_estimator.go:20-25` — обновлены ссылки на "200 ms" → "100 ms"
+
+**Новые регрессионные тесты:**
+
+1. `TestProbeRTTDurationNotExpiredAt50ms` — ProbeRTT НЕ выходит при -50ms (< 100ms порог). **Защита от регрессии**: если кто-то поднимет порог обратно до 200ms, тест продолжит проходить (50ms < 200ms). Если же кто-то снизит до 40ms — тест поймает это.
+2. `TestProbeRTTDurationExpiredAt120ms` — ProbeRTT МОЖЕТ выйти при -120ms (> 100ms порог). Диагностический — логирует фактическую фазу после hold.
+
+**Тесты:** `go test ./... -count=1` — все 8 пакетов зелёные.
+
+---
+
 ## Следующие задачи (приоритетный бэклог)
 
 1. **IPv6 inner tunnel** — ~~TODO~~ `markECNCEv6` уже реализован (несколько коммитов, см. git log). Бэклог-пункт закрыт.
 
 2. **pprof под живой нагрузкой** — ~~ДОБАВЛЕНО~~ (Запуск 24). Следующий шаг: реально проанализировать профили при 30 Mbps нагрузке и найти CPU hotspots. Требует работающего VPN-сервера с реальным трафиком.
 
-3. **probeRTTDuration 200ms → 100ms** — Следующий шаг после Запуска 78. При RTT=78 мс: 100ms ≥ 1.3 RTT, достаточно для точного измерения RTprop. Duty cycle: 200ms/30s = 0.67% → 100ms/30s = 0.33% → экономия ещё ~0.048 Мбит/с.
+3. **probeRTTDuration 200ms → 100ms** — ~~ВЫПОЛНЕНО~~ (Запуск 79). Duty cycle: 200ms/30s=0.67% → 100ms/30s=0.33%, экономия ~0.022 Mbps.
+
+4. **Следующий кандидат:** `probeRTTCwndPackets=4` при minCwnd=32 — рассмотреть увеличение до 8 пакетов как компромисс между точностью измерения и throughput dip. Или: ProbeRTT на основе ECN-CE вместо cwnd-drain (ECN ProbeRTT — более современный подход из BBR v3).

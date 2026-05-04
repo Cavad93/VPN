@@ -58,13 +58,18 @@ const (
 	// propagation delay, not queuing delay. Using max(4, 32)=32 would leave
 	// ~28 packets queued at the bottleneck, biasing RTprop upwards by
 	// 28 × bytes_per_packet / bottleneck_bps and causing BBR to overestimate
-	// BDP → inflated cwnd → more queuing. The 200 ms hold at cwnd=4 causes a
-	// throughput dip (~56 KB/s at RTT=102 ms) but produces an accurate RTprop
+	// BDP → inflated cwnd → more queuing. The 100 ms hold at cwnd=4 causes a
+	// throughput dip (~28 KB/s at RTT=78 ms) but produces an accurate RTprop
 	// measurement that guides all subsequent ProbeBW cycles.
 	probeRTTCwndPackets = 4
 
 	// probeRTTDuration: how long to hold minimum cwnd in ProbeRTT.
-	probeRTTDuration = 200 * time.Millisecond
+	// 100 ms is safe for our VPN route (RTT ≈ 78 ms): 100 ms ≥ 1.28 × RTT,
+	// which gives the pipe enough time to drain and produce an unbiased RTprop
+	// sample. Halving from 200 ms reduces the per-cycle throughput dip duration
+	// by 50%, cutting the duty-cycle from 0.67% to 0.33% and recovering
+	// ~0.024 Mbps on a 7.2 Mbps uplink.
+	probeRTTDuration = 100 * time.Millisecond
 
 	// fullBwThreshold: BtlBw must grow by at least 25% to count as "still growing".
 	fullBwThreshold = 1.25
