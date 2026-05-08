@@ -463,6 +463,97 @@ func TestPickTLSHostnameFallbackIsCDN(t *testing.T) {
 	}
 }
 
+// TestPickTLSHostnameFromExistingCert verifies that when a cert exists on
+// disk, its SAN/CN is the source of truth — overriding both random pool
+// pick and explicit -vless-sni. This is what stabilises the printed VLESS
+// URL across server restarts.
+func TestPickTLSHostnameFromExistingCert(t *testing.T) {
+	dir := t.TempDir()
+	notAfter := time.Now().Add(30 * 24 * time.Hour)
+	certPath, _ := generateTestCertWithExpiry(t, dir, notAfter)
+
+	// Even with a different TLSHostname configured, the cert must win.
+	cfg := VLESSConfig{
+		TLSCert:     certPath,
+		TLSHostname: "operator.set.this",
+	}
+	got := pickTLSHostname(cfg)
+	if got != "test.example.com" {
+		t.Errorf("pickTLSHostname: got %q, want cert SAN %q", got, "test.example.com")
+	}
+}
+
+// TestHostnameFromCertEmptyPath returns empty for empty input.
+func TestHostnameFromCertEmptyPath(t *testing.T) {
+	if got := hostnameFromCert(""); got != "" {
+		t.Errorf("hostnameFromCert(\"\"): got %q, want empty", got)
+	}
+}
+
+// TestHostnameFromCertMissingFile returns empty for non-existent files.
+func TestHostnameFromCertMissingFile(t *testing.T) {
+	if got := hostnameFromCert(filepath.Join(t.TempDir(), "nope.pem")); got != "" {
+		t.Errorf("hostnameFromCert(missing): got %q, want empty", got)
+	}
+}
+
+// TestHostnameFromCertCorruptFile returns empty for non-PEM content.
+func TestHostnameFromCertCorruptFile(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "bad.pem")
+	if err := os.WriteFile(bad, []byte("not a PEM block"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := hostnameFromCert(bad); got != "" {
+		t.Errorf("hostnameFromCert(corrupt): got %q, want empty", got)
+	}
+}
+
+// TestGenerateVLESSLinksMatchesExample verifies the URL format matches the
+// expected V2Ray-family format documented in the user-facing example:
+//
+//	vless://<uuid>@<ip>:<port>?type=ws&security=tls&allowInsecure=1&path=%2Ftunnel&sni=<host>&host=<host>#CavadVPN
+//
+// In particular: path must be percent-encoded and sni/host parameters must
+// be present so the client sends the correct SNI to the server.
+func TestGenerateVLESSLinksMatchesExample(t *testing.T) {
+	uuid := [16]byte{
+		0x4a, 0x4a, 0x52, 0x33, 0x55, 0x4b, 0x4d, 0xd2,
+		0xab, 0x83, 0xe9, 0xda, 0xb3, 0x7e, 0xf9, 0xa8,
+	}
+	tcp, ws := generateVLESSLinks(uuid, "45.8.228.67", 8444, "/tunnel", "pork-kitchen.xyz")
+
+	wantWS := "vless://4a4a5233-554b-4dd2-ab83-e9dab37ef9a8@45.8.228.67:8444" +
+		"?type=ws&security=tls&allowInsecure=1&path=%2Ftunnel" +
+		"&sni=pork-kitchen.xyz&host=pork-kitchen.xyz#CavadVPN"
+	if ws != wantWS {
+		t.Errorf("WS link mismatch:\n got:  %s\n want: %s", ws, wantWS)
+	}
+
+	wantTCP := "vless://4a4a5233-554b-4dd2-ab83-e9dab37ef9a8@45.8.228.67:8444" +
+		"?security=tls&allowInsecure=1&fp=chrome" +
+		"&sni=pork-kitchen.xyz&host=pork-kitchen.xyz#CavadVPN"
+	if tcp != wantTCP {
+		t.Errorf("TCP link mismatch:\n got:  %s\n want: %s", tcp, wantTCP)
+	}
+}
+
+// TestGenerateVLESSLinksWithoutSNI verifies the URL does not append empty
+// sni/host parameters when the SNI is unknown — keeps the link clean.
+func TestGenerateVLESSLinksWithoutSNI(t *testing.T) {
+	tcp, ws := generateVLESSLinks([16]byte{}, "1.2.3.4", 443, "/tunnel", "")
+	if strings.Contains(tcp, "sni=") || strings.Contains(tcp, "host=") {
+		t.Errorf("TCP link must not include sni/host when empty: %s", tcp)
+	}
+	if strings.Contains(ws, "sni=") || strings.Contains(ws, "host=") {
+		t.Errorf("WS link must not include sni/host when empty: %s", ws)
+	}
+	// Path is still percent-encoded.
+	if !strings.Contains(ws, "path=%2Ftunnel") {
+		t.Errorf("WS path not percent-encoded: %s", ws)
+	}
+}
+
 // --- helpers ---------------------------------------------------------------
 
 // parseCertFromFile reads certPath, decodes the first PEM block, and parses

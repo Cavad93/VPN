@@ -2215,9 +2215,14 @@ func main() {
 			TLSKey:      vlessKey,
 			TLSHostname: vlessSNI,
 		}
+		// Resolve the SNI: extract from existing cert when present, else
+		// fall back to operator-supplied -vless-sni, else random CDN domain.
+		// This is the same domain the TLS handshake will serve, so the URL
+		// always matches the cert across restarts.
+		resolvedSNI := pickTLSHostname(vlessCfg)
 		// Print VLESS links for easy import into V2Ray clients.
 		host, port := splitVLESSHostPort(vlessAddr)
-		tcpLink, wsLink := generateVLESSLinks(uuid, host, port, vlessPath)
+		tcpLink, wsLink := generateVLESSLinks(uuid, host, port, vlessPath, resolvedSNI)
 
 		// Register VLESS link in the REST API (use TCP link as primary).
 		if apiSrv != nil {

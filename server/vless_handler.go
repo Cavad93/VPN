@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -114,9 +115,23 @@ var tlsCoverDomains = []string{
 	"cdn.bootcdn.net",
 }
 
-// pickTLSHostname returns cfg.TLSHostname if set, otherwise selects a random
-// entry from tlsCoverDomains.  The result is always a non-empty string.
+// pickTLSHostname returns the TLS hostname to use for both certificate
+// generation and the printed VLESS URL.
+//
+// Priority order:
+//  1. cfg.CertPath has an existing cert on disk → extract CN/SAN[0] from it.
+//     This is the authoritative source: whatever name is baked into the cert
+//     is what TLS will serve, so the URL must match it. Any other choice
+//     causes SNI mismatch on the client side and silent connection failures.
+//  2. cfg.TLSHostname (operator-supplied via -vless-sni) → use it.
+//  3. Random pick from tlsCoverDomains → blends the cert with legitimate
+//     CDN traffic for passive fingerprinting (JA3, p0f).
+//
+// The result is always a non-empty string.
 func pickTLSHostname(cfg VLESSConfig) string {
+	if h := hostnameFromCert(cfg.TLSCert); h != "" {
+		return h
+	}
 	if cfg.TLSHostname != "" {
 		return cfg.TLSHostname
 	}
@@ -125,6 +140,35 @@ func pickTLSHostname(cfg VLESSConfig) string {
 		return tlsCoverDomains[0] // fallback on rand failure (should never happen)
 	}
 	return tlsCoverDomains[n.Int64()]
+}
+
+// hostnameFromCert extracts the primary hostname from an existing TLS
+// certificate file. Returns the first DNS SAN if present, otherwise the
+// Subject CommonName, otherwise "" when the file is missing/invalid.
+//
+// This lets the VLESS URL always advertise the SNI that the cert actually
+// serves, even after random pickTLSHostname() picks a different cover
+// domain on subsequent startups.
+func hostnameFromCert(certPath string) string {
+	if certPath == "" {
+		return ""
+	}
+	data, err := os.ReadFile(certPath)
+	if err != nil {
+		return ""
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return ""
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return ""
+	}
+	if len(cert.DNSNames) > 0 {
+		return cert.DNSNames[0]
+	}
+	return cert.Subject.CommonName
 }
 
 // tlsCertCheckInterval is how often the VLESS listener polls the on-disk cert
@@ -521,12 +565,28 @@ func forwardUDPFromStream(data []byte, conn *net.UDPConn) {
 }
 
 // generateVLESSLinks builds vless:// URIs for both TCP and WS modes.
-func generateVLESSLinks(uuid [16]byte, host string, port int, wsPath string) (tcpLink, wsLink string) {
+//
+// When sni is non-empty, both URIs append "&sni=<sni>&host=<sni>" so that
+// V2Ray-family clients (v2rayN, v2rayNG, NekoBox, Shadowrocket, Streisand,
+// Karing) send the SNI that matches the server's TLS certificate. Without
+// these parameters the client uses the connection host (raw IP) as SNI and
+// the TLS handshake fails because the self-signed cert is issued for a
+// CDN-style domain, not for the IP.
+//
+// wsPath is URL-encoded so that the parser on the client side does not
+// stop at the literal "/" when chained after other query parameters.
+func generateVLESSLinks(uuid [16]byte, host string, port int, wsPath, sni string) (tcpLink, wsLink string) {
 	uuidStr := transport.FormatUUID(uuid)
-	tcpLink = fmt.Sprintf("vless://%s@%s:%d?security=tls&allowInsecure=1&fp=chrome#CavadVPN",
-		uuidStr, host, port)
-	wsLink = fmt.Sprintf("vless://%s@%s:%d?type=ws&security=tls&allowInsecure=1&path=%s#CavadVPN",
-		uuidStr, host, port, wsPath)
+
+	suffix := ""
+	if sni != "" {
+		suffix = "&sni=" + url.QueryEscape(sni) + "&host=" + url.QueryEscape(sni)
+	}
+
+	tcpLink = fmt.Sprintf("vless://%s@%s:%d?security=tls&allowInsecure=1&fp=chrome%s#CavadVPN",
+		uuidStr, host, port, suffix)
+	wsLink = fmt.Sprintf("vless://%s@%s:%d?type=ws&security=tls&allowInsecure=1&path=%s%s#CavadVPN",
+		uuidStr, host, port, url.QueryEscape(wsPath), suffix)
 	return
 }
 
@@ -641,7 +701,11 @@ func ensureTLSCert(certPath, keyPath, domain string, logger *slog.Logger) error 
 }
 
 // splitVLESSHostPort splits "host:port" for the VLESS link.
-// If host is 0.0.0.0 or ::, returns empty host (user must replace with real IP).
+// When the listen host is a wildcard (0.0.0.0 / :: / empty), tries to
+// auto-detect the server's public IPv4 via ipify; falls back to the
+// "YOUR_SERVER_IP" placeholder when detection fails (offline, ipify down,
+// firewall blocking outbound 443) so the printed URL stays syntactically
+// valid for manual editing.
 func splitVLESSHostPort(addr string) (string, int) {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -650,9 +714,44 @@ func splitVLESSHostPort(addr string) (string, int) {
 	port := 443
 	fmt.Sscanf(portStr, "%d", &port)
 	if host == "0.0.0.0" || host == "::" || host == "" {
-		host = "YOUR_SERVER_IP"
+		if ip := detectPublicIP(); ip != "" {
+			host = ip
+		} else {
+			host = "YOUR_SERVER_IP"
+		}
 	}
 	return host, port
+}
+
+// publicIPClient is the HTTP client used by detectPublicIP. 3-second total
+// timeout (DNS + connect + read) keeps server startup snappy even when
+// outbound 443 is blocked.
+var publicIPClient = &http.Client{Timeout: 3 * time.Second}
+
+// detectPublicIP returns the server's public IPv4 by querying ipify.
+// Empty string on any failure — callers must fall back to a placeholder.
+//
+// ipify is chosen because it is free, has no rate limit for low-volume
+// callers, returns plain text (no JSON parsing), and supports HTTPS so
+// the result cannot be tampered with on the wire.
+func detectPublicIP() string {
+	resp, err := publicIPClient.Get("https://api.ipify.org")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return ""
+	}
+	ip := strings.TrimSpace(string(body))
+	if net.ParseIP(ip) == nil {
+		return ""
+	}
+	return ip
 }
 
 // readFileBytes reads the trimmed contents of a file.
