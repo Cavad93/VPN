@@ -920,6 +920,117 @@ func TestLoadOrGenerateKeyPair(t *testing.T) {
 	}
 }
 
+// TestResolveStatePath verifies that absolute paths pass through unchanged
+// while relative paths are anchored to the executable directory — the
+// invariant that keeps server_privkey.hex / allowed_keys.txt / vless_uuid.txt
+// stable across service restarts regardless of CWD.
+func TestResolveStatePath(t *testing.T) {
+	t.Parallel()
+
+	// Empty input — pass through.
+	if got := resolveStatePath(""); got != "" {
+		t.Errorf("empty path: got %q, want empty", got)
+	}
+
+	// Absolute path — unchanged.
+	abs := filepath.Join(t.TempDir(), "key.hex")
+	if got := resolveStatePath(abs); got != abs {
+		t.Errorf("absolute path mutated: got %q, want %q", got, abs)
+	}
+
+	// Relative path — anchored to executable directory (or unchanged when
+	// os.Executable() is unavailable).
+	got := resolveStatePath("server_privkey.hex")
+	if got == "" {
+		t.Fatal("relative path resolved to empty string")
+	}
+	if exeDir := executableDir(); exeDir != "" {
+		want := filepath.Join(exeDir, "server_privkey.hex")
+		if got != want {
+			t.Errorf("relative path: got %q, want %q", got, want)
+		}
+		if !filepath.IsAbs(got) {
+			t.Errorf("expected absolute path, got %q", got)
+		}
+	}
+}
+
+// TestLoadOrGenerateKeyPairCWDIndependent simulates a Windows service whose
+// working directory changes between restarts (sc.exe → System32; reboot →
+// somewhere else). The key file must remain the same because the path is
+// anchored to the executable, not CWD. This is the exact scenario that was
+// regenerating the public key on every reboot.
+func TestLoadOrGenerateKeyPairCWDIndependent(t *testing.T) {
+	// Not parallel: mutates process-wide CWD via t.Chdir.
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "key.hex")
+	logger := newTestLogger()
+
+	cwd1 := t.TempDir()
+	cwd2 := t.TempDir()
+
+	// First start: CWD #1.
+	t.Chdir(cwd1)
+	kp1, err := loadOrGenerateKeyPair(keyPath, logger)
+	if err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+
+	// Second start: CWD #2 — but absolute keyPath must still resolve to the
+	// same file.
+	t.Chdir(cwd2)
+	kp2, err := loadOrGenerateKeyPair(keyPath, logger)
+	if err != nil {
+		t.Fatalf("second start: %v", err)
+	}
+
+	if kp1.PublicKey != kp2.PublicKey {
+		t.Fatal("public key changed across CWD switch — persistence is broken")
+	}
+
+	// And verify nothing was written into either CWD (no stray relative
+	// resolution leaked through).
+	for _, c := range []string{cwd1, cwd2} {
+		if _, err := os.Stat(filepath.Join(c, "key.hex")); !os.IsNotExist(err) {
+			t.Errorf("unexpected key file in CWD %s: err=%v", c, err)
+		}
+	}
+}
+
+// TestLoadOrGenerateKeyPairRelativePathAnchored verifies that a relative
+// path resolves against the executable directory, not CWD — so a relative
+// default like "server_privkey.hex" lands next to the binary regardless of
+// where the process was started from.
+func TestLoadOrGenerateKeyPairRelativePathAnchored(t *testing.T) {
+	exeDir := executableDir()
+	if exeDir == "" {
+		t.Skip("os.Executable() unavailable on this platform")
+	}
+	// Use a unique filename so a parallel/repeat run can't collide.
+	relName := fmt.Sprintf("test_anchored_%d.hex", time.Now().UnixNano())
+	expected := filepath.Join(exeDir, relName)
+	t.Cleanup(func() { _ = os.Remove(expected) })
+
+	logger := newTestLogger()
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+
+	kp, err := loadOrGenerateKeyPair(relName, logger)
+	if err != nil {
+		t.Fatalf("loadOrGenerateKeyPair: %v", err)
+	}
+	if kp == nil {
+		t.Fatal("nil keypair")
+	}
+	if _, err := os.Stat(expected); err != nil {
+		t.Fatalf("key not written to executable dir (%s): %v", expected, err)
+	}
+	// And NOT in CWD.
+	if _, err := os.Stat(filepath.Join(cwd, relName)); !os.IsNotExist(err) {
+		t.Errorf("key was written to CWD instead of exec dir: err=%v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // TestFullClientHandshake (integration)
 // ---------------------------------------------------------------------------

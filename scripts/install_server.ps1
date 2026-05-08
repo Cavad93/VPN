@@ -361,10 +361,20 @@ function Install-Service {
     <#
     .SYNOPSIS
     Регистрирует Windows Service через sc.exe.
+
+    Передаёт абсолютные пути для state-файлов (-privkey, -allowed-keys-file)
+    через CLI флаги, чтобы статический ключ сервера и список разрешённых
+    ключей всегда жили в $InstallDir и переживали перезагрузку независимо
+    от рабочей директории (Windows-сервисы стартуют в %SystemRoot%\System32).
     #>
     param(
         [string]$BinaryPath,
-        [string]$ConfigPath
+        [string]$KeyFilePath,
+        [string]$AllowedKeysPath,
+        [string]$ListenAddrArg,
+        [string]$TunCIDRArg,
+        [string]$ApiAddrArg,
+        [string]$ApiTokenArg
     )
 
     # Удаляем старый сервис если есть
@@ -381,7 +391,13 @@ function Install-Service {
     }
 
     Write-Log "Регистрация сервиса $Script:ServiceName..."
-    $binPathQuoted = "`"$BinaryPath`" -config `"$ConfigPath`""
+    $binPathQuoted = "`"$BinaryPath`"" `
+        + " -addr `"$ListenAddrArg`"" `
+        + " -tun-cidr `"$TunCIDRArg`"" `
+        + " -privkey `"$KeyFilePath`"" `
+        + " -allowed-keys-file `"$AllowedKeysPath`"" `
+        + " -api-addr `"$ApiAddrArg`"" `
+        + " -api-token `"$ApiTokenArg`""
     sc.exe create $Script:ServiceName `
         binPath= $binPathQuoted `
         start= auto `
@@ -735,8 +751,16 @@ function Main {
     Enable-IPRouting
 
     # 9. Установка Windows Service
+    $allowedKeysPath = Join-Path $InstallDir "allowed_keys.txt"
     if ($PSCmdlet.ShouldProcess($Script:ServiceName, "Install Windows Service")) {
-        Install-Service -BinaryPath $binaryPath -ConfigPath $configPath
+        Install-Service `
+            -BinaryPath       $binaryPath `
+            -KeyFilePath      $keyFilePath `
+            -AllowedKeysPath  $allowedKeysPath `
+            -ListenAddrArg    $ListenAddr `
+            -TunCIDRArg       $TunCIDR `
+            -ApiAddrArg       $APIAddr `
+            -ApiTokenArg      $Script:token
     }
 
     # 10. Правила фаервола

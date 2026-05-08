@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -1898,13 +1899,58 @@ func cloneIP6(ip net.IP) net.IP {
 // Key pair loading / generation
 // ---------------------------------------------------------------------------
 
+// executableDir returns the directory containing the running executable.
+// Falls back to the current working directory when os.Executable() fails
+// (extremely rare — only on broken /proc on Linux or symlink-resolution
+// errors). The fallback preserves the legacy CWD-relative behavior so the
+// server still starts in development environments.
+func executableDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	resolved, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		resolved = exe
+	}
+	return filepath.Dir(resolved)
+}
+
+// resolveStatePath turns a possibly-relative state-file path into an absolute
+// path anchored to the executable directory. Absolute paths pass through
+// unchanged.
+//
+// Rationale: the VPN server runs as a Windows service / systemd unit whose
+// working directory is unstable (Windows services default to %SystemRoot%\
+// System32). A relative default such as "server_privkey.hex" therefore
+// resolves to a different location depending on how the process was launched,
+// causing the static key file to be silently re-created on each restart and
+// invalidating every distributed client config.
+//
+// Anchoring relative paths to the executable directory makes the resolution
+// deterministic regardless of CWD: the key, allowlist and VLESS UUID always
+// live next to the binary.
+func resolveStatePath(path string) string {
+	if path == "" || filepath.IsAbs(path) {
+		return path
+	}
+	dir := executableDir()
+	if dir == "" {
+		return path
+	}
+	return filepath.Join(dir, path)
+}
+
 // loadOrGenerateKeyPair loads a hex-encoded private key from path, or generates
-// and saves a new one if the file does not exist.
+// and saves a new one if the file does not exist. Relative paths are resolved
+// against the executable directory so the key persists across service
+// restarts regardless of the working directory.
 func loadOrGenerateKeyPair(path string, logger *slog.Logger) (*crypto.KeyPair, error) {
-	data, err := os.ReadFile(path)
+	resolved := resolveStatePath(path)
+	data, err := os.ReadFile(resolved)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("loadOrGenerateKeyPair: read %s: %w", path, err)
+			return nil, fmt.Errorf("loadOrGenerateKeyPair: read %s: %w", resolved, err)
 		}
 
 		// Generate new key pair.
@@ -1913,12 +1959,22 @@ func loadOrGenerateKeyPair(path string, logger *slog.Logger) (*crypto.KeyPair, e
 			return nil, fmt.Errorf("loadOrGenerateKeyPair: generate: %w", genErr)
 		}
 
-		hexKey := hex.EncodeToString(kp.PrivateKey[:])
-		if writeErr := os.WriteFile(path, []byte(hexKey), 0600); writeErr != nil {
-			return nil, fmt.Errorf("loadOrGenerateKeyPair: write %s: %w", path, writeErr)
+		if dir := filepath.Dir(resolved); dir != "" && dir != "." {
+			if mkErr := os.MkdirAll(dir, 0o700); mkErr != nil {
+				return nil, fmt.Errorf("loadOrGenerateKeyPair: mkdir %s: %w", dir, mkErr)
+			}
 		}
 
-		logger.Info("generated new key pair", "path", path, "public_key", hex.EncodeToString(kp.PublicKey[:]))
+		hexKey := hex.EncodeToString(kp.PrivateKey[:])
+		if writeErr := os.WriteFile(resolved, []byte(hexKey), 0600); writeErr != nil {
+			return nil, fmt.Errorf("loadOrGenerateKeyPair: write %s: %w", resolved, writeErr)
+		}
+
+		// Loud WARN — every regeneration invalidates all distributed client
+		// configs, so it must never go unnoticed in the journal.
+		logger.Warn("generated NEW key pair — distributed client configs will stop working until updated",
+			"path", resolved,
+			"public_key", hex.EncodeToString(kp.PublicKey[:]))
 		return kp, nil
 	}
 
@@ -1926,7 +1982,7 @@ func loadOrGenerateKeyPair(path string, logger *slog.Logger) (*crypto.KeyPair, e
 	hexStr := strings.TrimSpace(string(data))
 	privBytes, err := hex.DecodeString(hexStr)
 	if err != nil {
-		return nil, fmt.Errorf("loadOrGenerateKeyPair: decode hex from %s: %w", path, err)
+		return nil, fmt.Errorf("loadOrGenerateKeyPair: decode hex from %s: %w", resolved, err)
 	}
 	if len(privBytes) != crypto.KeySize {
 		return nil, fmt.Errorf("loadOrGenerateKeyPair: private key must be %d bytes, got %d", crypto.KeySize, len(privBytes))
@@ -1941,7 +1997,7 @@ func loadOrGenerateKeyPair(path string, logger *slog.Logger) (*crypto.KeyPair, e
 	}
 	copy(kp.PublicKey[:], pub)
 
-	logger.Info("loaded key pair", "path", path, "public_key", hex.EncodeToString(kp.PublicKey[:]))
+	logger.Info("loaded key pair", "path", resolved, "public_key", hex.EncodeToString(kp.PublicKey[:]))
 	return kp, nil
 }
 
@@ -2004,6 +2060,12 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
+
+	// Anchor relative state-file paths to the executable directory so they
+	// survive service restarts regardless of CWD (Windows services start in
+	// %SystemRoot%\System32). Absolute paths pass through unchanged.
+	cfg.PrivKeyFile = resolveStatePath(cfg.PrivKeyFile)
+	cfg.AllowedKeysFile = resolveStatePath(cfg.AllowedKeysFile)
 
 	kp, err := loadOrGenerateKeyPair(cfg.PrivKeyFile, logger)
 	if err != nil {
@@ -2140,7 +2202,7 @@ func main() {
 
 	// Start VLESS+WS+TLS listener if configured.
 	if vlessAddr != "" {
-		uuid, err := loadOrGenerateVLESSUUID(vlessUUIDFile, logger)
+		uuid, err := loadOrGenerateVLESSUUID(resolveStatePath(vlessUUIDFile), logger)
 		if err != nil {
 			logger.Error("failed to load VLESS UUID", "err", err)
 			os.Exit(1)
