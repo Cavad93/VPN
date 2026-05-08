@@ -9,12 +9,16 @@ import Crypto
 import CavadVPNCrypto
 import CavadVPNTransport
 
-// MARK: - Control protocol constants (must match Go server)
+// MARK: - Control protocol constants (must match Go server main.go)
 
-private let ctlHello:  UInt8 = 0x01
-private let ctlAssign: UInt8 = 0x02
-private let ctlError:  UInt8 = 0xFF
-private let ctlAssignPayloadLen = 9  // ip(4) + prefixLen(1) + gateway(4)
+private let ctlHello:      UInt8 = 0x01
+private let ctlAssign:     UInt8 = 0x02  // IPv4-only assignment (10 bytes total)
+private let ctlAssignDual: UInt8 = 0x05  // IPv4+IPv6 dual-stack (43 bytes total)
+private let ctlError:      UInt8 = 0xFF
+private let ctlAssignPayloadLen = 9       // ip4(4) + pfxLen4(1) + gw4(4)
+// CTL_ASSIGN_DUAL payload after the type byte:
+//   ip4(4) + pfxLen4(1) + gw4(4) + ip6(16) + pfxLen6(1) + gw6(16) = 42 bytes
+private let ctlAssignDualPayloadLen = 42
 
 // MARK: - VpnClient
 
@@ -88,8 +92,15 @@ public final class VpnClient {
             setsockopt(rawSocket, SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
         }
 
-        // 2. TLS obfuscation
-        let obfsConn = ObfsConn(inputStream: ins, outputStream: outs)
+        // 2. TLS obfuscation. Pass the knock key (when configured) so the
+        // synthetic ClientHello carries HMAC-SHA256(key, random) in the
+        // session_id field — the relay rejects connections without it,
+        // proxying probes to a cover site instead.
+        let obfsConn = ObfsConn(
+            inputStream: ins,
+            outputStream: outs,
+            knockKey: config.knockKeyBytes()
+        )
         try obfsConn.clientHandshake()
         obfs = obfsConn
 
@@ -214,26 +225,84 @@ public final class VpnClient {
         let ctl = try muxConn.openStream()
         defer { ctl.close() }
 
-        // Send ctlHello: single byte 0x01 (must match server protocol)
+        // Send ctlHello: single byte 0x01 (must match server protocol).
         try ctl.write(Data([ctlHello]))
 
-        // Receive ctlAssign: [0x02, ip(4), prefixLen(1), gateway(4)] = 10 bytes
-        let resp = try ctl.readExactly(1 + ctlAssignPayloadLen)
-        switch resp[0] {
+        // Read the 1-byte type first; payload length depends on which
+        // assignment variant the server picked. Modern servers respond
+        // with ctlAssignDual (0x05, 43 bytes total) when dual-stack is
+        // configured, otherwise the legacy ctlAssign (0x02, 10 bytes).
+        let typeByte = try ctl.readExactly(1)[0]
+        switch typeByte {
+        case ctlAssign:
+            let payload = try ctl.readExactly(ctlAssignPayloadLen)
+            return Self.parseCtlAssign(payload)
+        case ctlAssignDual:
+            let payload = try ctl.readExactly(ctlAssignDualPayloadLen)
+            return try Self.parseCtlAssignDual(payload)
         case ctlError:
             throw VpnClientError.serverReturnedError
-        case ctlAssign:
-            break
         default:
-            throw VpnClientError.unexpectedControlResponse(resp[0])
+            throw VpnClientError.unexpectedControlResponse(typeByte)
         }
+    }
 
-        let ip = "\(resp[1]).\(resp[2]).\(resp[3]).\(resp[4])"
-        let prefixLen = Int(resp[5])
-        let gateway = "\(resp[6]).\(resp[7]).\(resp[8]).\(resp[9])"
+    // MARK: Control payload parsers (internal so tests can verify wire format)
 
+    /// Parse a CTL_ASSIGN payload (9 bytes): ip4(4) + pfxLen4(1) + gw4(4).
+    static func parseCtlAssign(_ payload: Data) -> RouteInfo {
+        precondition(payload.count == ctlAssignPayloadLen,
+                     "ctlAssign payload must be \(ctlAssignPayloadLen) bytes")
+        let p = Array(payload)
+        let ip = "\(p[0]).\(p[1]).\(p[2]).\(p[3])"
+        let prefixLen = Int(p[4])
+        let gateway = "\(p[5]).\(p[6]).\(p[7]).\(p[8])"
         return RouteInfo(assignedIP: ip, prefixLen: prefixLen, gateway: gateway)
     }
+
+    /// Parse a CTL_ASSIGN_DUAL payload (42 bytes):
+    ///   ip4(4) + pfxLen4(1) + gw4(4) + ip6(16) + pfxLen6(1) + gw6(16)
+    static func parseCtlAssignDual(_ payload: Data) throws -> RouteInfo {
+        guard payload.count == ctlAssignDualPayloadLen else {
+            throw VpnClientError.unexpectedControlResponse(ctlAssignDual)
+        }
+        let p = Array(payload)
+        let ip4 = "\(p[0]).\(p[1]).\(p[2]).\(p[3])"
+        let pfx4 = Int(p[4])
+        let gw4 = "\(p[5]).\(p[6]).\(p[7]).\(p[8])"
+        let ip6 = formatIPv6(Data(p[9..<25]))
+        let pfx6 = Int(p[25])
+        let gw6 = formatIPv6(Data(p[26..<42]))
+        return RouteInfo(
+            assignedIP:  ip4, prefixLen:  pfx4, gateway:  gw4,
+            assignedIP6: ip6, prefixLen6: pfx6, gateway6: gw6
+        )
+    }
+}
+
+// MARK: - IPv6 formatting
+
+/// Format a 16-byte big-endian IPv6 address using RFC 5952 notation
+/// (e.g. "fc00::1" rather than "fc00:0:0:0:0:0:0:1"). Falls back to a
+/// raw colon-separated form when inet_ntop is unavailable.
+func formatIPv6(_ bytes: Data) -> String {
+    precondition(bytes.count == 16, "IPv6 address must be 16 bytes")
+    #if canImport(Darwin)
+    var addr = in6_addr()
+    _ = withUnsafeMutableBytes(of: &addr) { buf in
+        bytes.copyBytes(to: buf)
+    }
+    var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+    let result = inet_ntop(AF_INET6, &addr, &buffer, socklen_t(INET6_ADDRSTRLEN))
+    if result != nil { return String(cString: buffer) }
+    #endif
+    // Fallback: pure-Swift formatter (also keeps Linux test runners working).
+    var groups: [String] = []
+    for i in stride(from: 0, to: 16, by: 2) {
+        let v = (UInt16(bytes[i]) << 8) | UInt16(bytes[i + 1])
+        groups.append(String(format: "%x", v))
+    }
+    return groups.joined(separator: ":")
 }
 
 // MARK: - Errors

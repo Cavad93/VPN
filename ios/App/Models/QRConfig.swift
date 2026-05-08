@@ -13,8 +13,14 @@ public enum QRConfigError: Error, Equatable {
 /// Parses VPN configuration from a QR code string.
 ///
 /// Supported formats:
-/// 1. JSON:  `{"host":"1.2.3.4","port":443,"private_key":"aabb…","server_key":"ccdd…"}`
-/// 2. URI:   `cavadvpn://config?host=1.2.3.4&port=443&private_key=aabb…&server_key=ccdd…`
+/// 1. JSON:  `{"host":"1.2.3.4","port":443,"private_key":"aabb…","server_key":"ccdd…","knock_key":"eeff…"}`
+/// 2. URI:   `cavadvpn://config?host=1.2.3.4&port=443&private_key=aabb…&server_key=ccdd…&knock_key=eeff…`
+///
+/// `knock_key` is a 64-char hex (32-byte) port-knock PSK; when present the
+/// client embeds HMAC-SHA256(knock_key, clientHelloRandom) in the TLS
+/// session_id field so the server's relay can authenticate the connection
+/// before forwarding (Reality-style port knocking). Omit it to disable
+/// knock — backwards-compatible with non-knock servers.
 public struct QRConfig {
 
     // MARK: - Parse
@@ -46,6 +52,7 @@ public struct QRConfig {
         let port = try requireInt(obj, key: "port")
         let privateKey = obj["private_key"] as? String
         let serverKey  = obj["server_key"]  as? String
+        let knockKey   = obj["knock_key"]   as? String
         let dns        = obj["dns"]         as? String ?? "1.1.1.1"
         let mtu        = obj["mtu"]         as? Int    ?? 1420
 
@@ -53,10 +60,11 @@ public struct QRConfig {
         try validatePort(port)
         if let pk = privateKey { try validateHexKey(pk, field: "private_key") }
         if let sk = serverKey  { try validateHexKey(sk, field: "server_key")  }
+        if let kk = knockKey   { try validateHexKey(kk, field: "knock_key")   }
 
         return ParsedConfig(
             host: host, port: port,
-            privateKey: privateKey, serverKey: serverKey,
+            privateKey: privateKey, serverKey: serverKey, knockKey: knockKey,
             dns: dns, mtu: mtu
         )
     }
@@ -85,6 +93,7 @@ public struct QRConfig {
 
         let privateKey = q("private_key")
         let serverKey  = q("server_key")
+        let knockKey   = q("knock_key")
         let dns        = q("dns") ?? "1.1.1.1"
         let mtu        = q("mtu").flatMap(Int.init) ?? 1420
 
@@ -92,10 +101,11 @@ public struct QRConfig {
         try validatePort(port)
         if let pk = privateKey { try validateHexKey(pk, field: "private_key") }
         if let sk = serverKey  { try validateHexKey(sk, field: "server_key")  }
+        if let kk = knockKey   { try validateHexKey(kk, field: "knock_key")   }
 
         return ParsedConfig(
             host: host, port: port,
-            privateKey: privateKey, serverKey: serverKey,
+            privateKey: privateKey, serverKey: serverKey, knockKey: knockKey,
             dns: dns, mtu: mtu
         )
     }
@@ -105,12 +115,13 @@ public struct QRConfig {
     /// Serialise a config back to QR JSON.
     public static func toQRJson(
         host: String, port: Int,
-        privateKey: String? = nil, serverKey: String? = nil,
+        privateKey: String? = nil, serverKey: String? = nil, knockKey: String? = nil,
         dns: String = "1.1.1.1", mtu: Int = 1420
     ) -> String {
         var obj: [String: Any] = ["host": host, "port": port, "dns": dns, "mtu": mtu]
         if let pk = privateKey { obj["private_key"] = pk }
         if let sk = serverKey  { obj["server_key"]  = sk }
+        if let kk = knockKey   { obj["knock_key"]   = kk }
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
               let str  = String(data: data, encoding: .utf8)
         else { return "{}" }
@@ -120,7 +131,7 @@ public struct QRConfig {
     /// Serialise a config to cavadvpn:// URI.
     public static func toQRUri(
         host: String, port: Int,
-        privateKey: String? = nil, serverKey: String? = nil,
+        privateKey: String? = nil, serverKey: String? = nil, knockKey: String? = nil,
         dns: String = "1.1.1.1", mtu: Int = 1420
     ) -> String {
         var items = [URLQueryItem]()
@@ -128,6 +139,7 @@ public struct QRConfig {
         items.append(URLQueryItem(name: "port", value: "\(port)"))
         if let pk = privateKey { items.append(URLQueryItem(name: "private_key", value: pk)) }
         if let sk = serverKey  { items.append(URLQueryItem(name: "server_key",  value: sk)) }
+        if let kk = knockKey   { items.append(URLQueryItem(name: "knock_key",   value: kk)) }
         items.append(URLQueryItem(name: "dns", value: dns))
         items.append(URLQueryItem(name: "mtu", value: "\(mtu)"))
         var comps = URLComponents()
@@ -177,18 +189,21 @@ public struct ParsedConfig: Equatable {
     public let port: Int
     public let privateKey: String?
     public let serverKey: String?
+    /// Optional 64-char hex (32-byte) port-knock PSK; nil for non-knock servers.
+    public let knockKey: String?
     public let dns: String
     public let mtu: Int
 
     public init(
         host: String, port: Int,
-        privateKey: String?, serverKey: String?,
+        privateKey: String?, serverKey: String?, knockKey: String? = nil,
         dns: String, mtu: Int
     ) {
         self.host = host
         self.port = port
         self.privateKey = privateKey
         self.serverKey  = serverKey
+        self.knockKey   = knockKey
         self.dns = dns
         self.mtu = mtu
     }

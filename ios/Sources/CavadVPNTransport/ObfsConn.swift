@@ -11,6 +11,7 @@
 //   bytes 5..N  — payload
 
 import Foundation
+import Crypto
 import CavadVPNCrypto
 
 // MARK: - TLS constants
@@ -30,11 +31,26 @@ private let maxObfsPayload = 16383  // 2^14 - 1
 public final class ObfsConn {
     private let inputStream:  InputStream
     private let outputStream: OutputStream
+    /// Optional 32-byte port-knock PSK. When non-nil, the synthetic
+    /// ClientHello carries `session_id = HMAC-SHA256(knockKey, random)`
+    /// so the relay can authenticate the VPN client before forwarding.
+    /// Wire-compatible with the Android `ObfsConn(knockKey)` constructor
+    /// and the Go relay verifier in `server/transport/knock_test.go`.
+    private let knockKey: Data?
     private var readBuf = Data()
 
-    public init(inputStream: InputStream, outputStream: OutputStream) {
+    public init(
+        inputStream: InputStream,
+        outputStream: OutputStream,
+        knockKey: Data? = nil
+    ) {
         self.inputStream  = inputStream
         self.outputStream = outputStream
+        // Reject malformed knock keys silently so a partial/empty hex
+        // string in the user config falls back to the regular random
+        // session_id rather than producing an invalid HMAC the server
+        // would reject.
+        self.knockKey = (knockKey?.count == 32) ? knockKey : nil
     }
 
     // MARK: Handshake
@@ -142,8 +158,22 @@ public final class ObfsConn {
     // MARK: TLS record builders
 
     private func buildClientHello() -> Data {
-        let random    = generateRandomData(count: 32)
-        let sessionId = generateRandomData(count: 32)
+        let random = generateRandomData(count: 32)
+        // Reality-style port knocking: when knockKey is configured, the
+        // session_id field carries HMAC-SHA256(knockKey, random) so the
+        // relay can authenticate the client before forwarding. Without
+        // a knock key we fall back to a random session_id, which works
+        // unchanged against non-knock servers.
+        let sessionId: Data
+        if let key = knockKey {
+            let mac = HMAC<SHA256>.authenticationCode(
+                for: random,
+                using: SymmetricKey(data: key)
+            )
+            sessionId = Data(mac)
+        } else {
+            sessionId = generateRandomData(count: 32)
+        }
 
         var body = Data()
         body.append(contentsOf: [0x03, 0x03])  // legacy_version = TLS 1.2

@@ -14,6 +14,7 @@ public struct ConfigStore {
         static let serverPort       = "com.cavadvpn.serverPort"
         static let privateKeyHex    = "com.cavadvpn.privateKeyHex"
         static let serverPublicKey  = "com.cavadvpn.serverPublicKey"
+        static let knockKey         = "com.cavadvpn.knockKey"
         static let dnsServer        = "com.cavadvpn.dnsServer"
         static let mtu              = "com.cavadvpn.mtu"
     }
@@ -27,6 +28,7 @@ public struct ConfigStore {
         port: Int,
         privateKeyHex: String?,
         serverPublicKeyHex: String?,
+        knockKeyHex: String? = nil,
         dnsServer: String,
         mtu: Int
     ) {
@@ -34,6 +36,7 @@ public struct ConfigStore {
         defaults.set(port,             forKey: Key.serverPort)
         defaults.set(privateKeyHex,    forKey: Key.privateKeyHex)
         defaults.set(serverPublicKeyHex, forKey: Key.serverPublicKey)
+        defaults.set(knockKeyHex,      forKey: Key.knockKey)
         defaults.set(dnsServer,        forKey: Key.dnsServer)
         defaults.set(mtu,              forKey: Key.mtu)
     }
@@ -52,6 +55,7 @@ public struct ConfigStore {
             port: effectivePort,
             privateKeyHex: defaults.string(forKey: Key.privateKeyHex),
             serverPublicKeyHex: defaults.string(forKey: Key.serverPublicKey),
+            knockKeyHex: defaults.string(forKey: Key.knockKey),
             dnsServer: defaults.string(forKey: Key.dnsServer) ?? "1.1.1.1",
             mtu: {
                 let v = defaults.integer(forKey: Key.mtu)
@@ -65,7 +69,7 @@ public struct ConfigStore {
     /// Remove all stored configuration from UserDefaults.
     public static func clear(from defaults: UserDefaults = .standard) {
         [Key.serverHost, Key.serverPort, Key.privateKeyHex,
-         Key.serverPublicKey, Key.dnsServer, Key.mtu].forEach {
+         Key.serverPublicKey, Key.knockKey, Key.dnsServer, Key.mtu].forEach {
             defaults.removeObject(forKey: $0)
         }
     }
@@ -80,6 +84,7 @@ public struct ConfigStore {
             port: config.port,
             privateKeyHex: config.privateKey,
             serverPublicKeyHex: config.serverKey,
+            knockKeyHex: config.knockKey,
             dnsServer: config.dns,
             mtu: config.mtu
         )
@@ -94,6 +99,8 @@ public struct StoredConfig: Equatable {
     public let port: Int
     public let privateKeyHex: String?
     public let serverPublicKeyHex: String?
+    /// Hex-encoded 32-byte port-knock PSK; nil for non-knock servers.
+    public let knockKeyHex: String?
     public let dnsServer: String
     public let mtu: Int
 }

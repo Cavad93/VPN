@@ -21,7 +21,12 @@ let package = Package(
         ),
         .target(
             name: "CavadVPNTransport",
-            dependencies: ["CavadVPNCrypto"]
+            dependencies: [
+                "CavadVPNCrypto",
+                // swift-crypto provides HMAC<SHA256> used by the
+                // Reality-style port-knock implementation in ObfsConn.
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
         ),
         .target(
             name: "CavadVPNClient",

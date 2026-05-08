@@ -39,6 +39,8 @@ class ParsedConfig:
     server_key: Optional[str]
     dns: str
     mtu: int
+    # Optional 64-char hex (32-byte) port-knock PSK; nil for non-knock servers.
+    knock_key: Optional[str] = None
 
 
 def _validate_host(host: str) -> None:
@@ -77,6 +79,7 @@ def parse_qr_json(text: str) -> ParsedConfig:
 
     private_key = obj.get("private_key")
     server_key  = obj.get("server_key")
+    knock_key   = obj.get("knock_key")
     dns         = obj.get("dns", "1.1.1.1")
     mtu         = int(obj.get("mtu", 1420))
 
@@ -84,9 +87,11 @@ def parse_qr_json(text: str) -> ParsedConfig:
     _validate_port(port)
     if private_key: _validate_hex_key(private_key, "private_key")
     if server_key:  _validate_hex_key(server_key,  "server_key")
+    if knock_key:   _validate_hex_key(knock_key,   "knock_key")
 
     return ParsedConfig(host=host, port=port, private_key=private_key,
-                        server_key=server_key, dns=dns, mtu=mtu)
+                        server_key=server_key, knock_key=knock_key,
+                        dns=dns, mtu=mtu)
 
 
 def parse_qr_uri(text: str) -> ParsedConfig:
@@ -113,6 +118,7 @@ def parse_qr_uri(text: str) -> ParsedConfig:
 
     private_key = q("private_key")
     server_key  = q("server_key")
+    knock_key   = q("knock_key")
     dns         = q("dns") or "1.1.1.1"
     mtu         = int(q("mtu") or 1420)
 
@@ -120,9 +126,11 @@ def parse_qr_uri(text: str) -> ParsedConfig:
     _validate_port(port)
     if private_key: _validate_hex_key(private_key, "private_key")
     if server_key:  _validate_hex_key(server_key,  "server_key")
+    if knock_key:   _validate_hex_key(knock_key,   "knock_key")
 
     return ParsedConfig(host=host, port=port, private_key=private_key,
-                        server_key=server_key, dns=dns, mtu=mtu)
+                        server_key=server_key, knock_key=knock_key,
+                        dns=dns, mtu=mtu)
 
 
 def parse_qr(text: str) -> ParsedConfig:
@@ -138,18 +146,20 @@ def parse_qr(text: str) -> ParsedConfig:
 
 
 def to_qr_json(host: str, port: int, private_key=None, server_key=None,
-               dns="1.1.1.1", mtu=1420) -> str:
+               dns="1.1.1.1", mtu=1420, *, knock_key=None) -> str:
     obj: dict = {"dns": dns, "host": host, "mtu": mtu, "port": port}
     if private_key: obj["private_key"] = private_key
     if server_key:  obj["server_key"]  = server_key
+    if knock_key:   obj["knock_key"]   = knock_key
     return json.dumps(obj, sort_keys=True)
 
 
 def to_qr_uri(host: str, port: int, private_key=None, server_key=None,
-              dns="1.1.1.1", mtu=1420) -> str:
+              dns="1.1.1.1", mtu=1420, *, knock_key=None) -> str:
     params = [("host", host), ("port", str(port))]
     if private_key: params.append(("private_key", private_key))
     if server_key:  params.append(("server_key",  server_key))
+    if knock_key:   params.append(("knock_key",   knock_key))
     params += [("dns", dns), ("mtu", str(mtu))]
     return "cavadvpn://config?" + urllib.parse.urlencode(params)
 
@@ -190,6 +200,7 @@ class StoredConfig:
     server_public_key_hex: Optional[str]
     dns_server: str
     mtu: int
+    knock_key_hex: Optional[str] = None
 
 
 class MockDefaults:
@@ -215,6 +226,7 @@ _KEYS = {
     "port":       "com.cavadvpn.serverPort",
     "private":    "com.cavadvpn.privateKeyHex",
     "server_pub": "com.cavadvpn.serverPublicKey",
+    "knock":      "com.cavadvpn.knockKey",
     "dns":        "com.cavadvpn.dnsServer",
     "mtu":        "com.cavadvpn.mtu",
 }
@@ -222,11 +234,13 @@ _KEYS = {
 
 def config_store_save(defaults: MockDefaults, host: str, port: int,
                       private_key_hex=None, server_public_key_hex=None,
-                      dns_server="1.1.1.1", mtu=1420) -> None:
+                      dns_server="1.1.1.1", mtu=1420,
+                      *, knock_key_hex=None) -> None:
     defaults.set(_KEYS["host"],       host)
     defaults.set(_KEYS["port"],       port)
     defaults.set(_KEYS["private"],    private_key_hex)
     defaults.set(_KEYS["server_pub"], server_public_key_hex)
+    defaults.set(_KEYS["knock"],      knock_key_hex)
     defaults.set(_KEYS["dns"],        dns_server)
     defaults.set(_KEYS["mtu"],        mtu)
 
@@ -243,6 +257,7 @@ def config_store_load(defaults: MockDefaults) -> Optional[StoredConfig]:
         port=port,
         private_key_hex=defaults.get(_KEYS["private"]),
         server_public_key_hex=defaults.get(_KEYS["server_pub"]),
+        knock_key_hex=defaults.get(_KEYS["knock"]),
         dns_server=defaults.get(_KEYS["dns"], "1.1.1.1"),
         mtu=defaults.get(_KEYS["mtu"], 1420) or 1420,
     )
@@ -259,6 +274,7 @@ def config_store_apply(defaults: MockDefaults, cfg: ParsedConfig) -> None:
         host=cfg.host, port=cfg.port,
         private_key_hex=cfg.private_key,
         server_public_key_hex=cfg.server_key,
+        knock_key_hex=cfg.knock_key,
         dns_server=cfg.dns, mtu=cfg.mtu,
     )
 
@@ -696,3 +712,285 @@ class TestVpnConnectionState:
 
     def test_can_disconnect_false(self):
         assert not VpnConnectionStateSimulator("disconnected").can_disconnect()
+
+
+# ===========================================================================
+# Tests — Knock-key support (Reality-style port knocking)
+#
+# These tests cover the new knock_key field added to QRConfig, ParsedConfig
+# and ConfigStore. The key is an optional 32-byte (64 hex char) PSK; when
+# present the client embeds HMAC-SHA256(key, clientHelloRandom) into the
+# TLS session_id field of the synthetic ClientHello so a Reality-style
+# relay can authenticate the client before forwarding traffic.
+# ===========================================================================
+
+FAKE_KNOCK = "c" * 64
+
+
+class TestKnockKeyJSON:
+
+    def test_parse_knock_key(self):
+        text = json.dumps({
+            "host": "1.2.3.4", "port": 443,
+            "knock_key": FAKE_KNOCK,
+        })
+        cfg = parse_qr(text)
+        assert cfg.knock_key == FAKE_KNOCK
+
+    def test_knock_key_optional(self):
+        text = json.dumps({"host": "1.2.3.4", "port": 443})
+        cfg = parse_qr(text)
+        assert cfg.knock_key is None
+
+    def test_knock_key_invalid_short(self):
+        text = json.dumps({
+            "host": "1.2.3.4", "port": 443,
+            "knock_key": "deadbeef",  # only 8 hex chars
+        })
+        with pytest.raises(QRConfigError, match="knock_key"):
+            parse_qr(text)
+
+    def test_knock_key_invalid_non_hex(self):
+        text = json.dumps({
+            "host": "1.2.3.4", "port": 443,
+            "knock_key": "z" * 64,  # not hex
+        })
+        with pytest.raises(QRConfigError, match="knock_key"):
+            parse_qr(text)
+
+    def test_serialize_with_knock(self):
+        s = to_qr_json("1.2.3.4", 443, knock_key=FAKE_KNOCK)
+        obj = json.loads(s)
+        assert obj["knock_key"] == FAKE_KNOCK
+
+    def test_serialize_without_knock(self):
+        s = to_qr_json("1.2.3.4", 443)
+        obj = json.loads(s)
+        assert "knock_key" not in obj
+
+    def test_roundtrip_with_knock(self):
+        original = json.dumps({
+            "dns": "1.1.1.1", "host": "10.0.0.1", "mtu": 1420,
+            "port": 443, "private_key": FAKE_KEY,
+            "knock_key": FAKE_KNOCK,
+        }, sort_keys=True)
+        cfg  = parse_qr(original)
+        back = to_qr_json(cfg.host, cfg.port, cfg.private_key, cfg.server_key,
+                          cfg.dns, cfg.mtu, knock_key=cfg.knock_key)
+        assert json.loads(back) == json.loads(original)
+
+
+class TestKnockKeyURI:
+
+    def test_parse_knock_key(self):
+        uri = f"cavadvpn://config?host=1.2.3.4&port=443&knock_key={FAKE_KNOCK}"
+        cfg = parse_qr(uri)
+        assert cfg.knock_key == FAKE_KNOCK
+
+    def test_knock_key_invalid(self):
+        uri = "cavadvpn://config?host=1.2.3.4&port=443&knock_key=tooshort"
+        with pytest.raises(QRConfigError, match="knock_key"):
+            parse_qr(uri)
+
+    def test_serialize_with_knock(self):
+        uri = to_qr_uri("1.2.3.4", 443, knock_key=FAKE_KNOCK)
+        assert f"knock_key={FAKE_KNOCK}" in uri
+
+    def test_roundtrip_with_knock(self):
+        uri = to_qr_uri("vpn.example.com", 8443,
+                        private_key=FAKE_KEY, server_key=FAKE_SRVKEY,
+                        knock_key=FAKE_KNOCK)
+        cfg = parse_qr(uri)
+        assert cfg.host       == "vpn.example.com"
+        assert cfg.port       == 8443
+        assert cfg.private_key == FAKE_KEY
+        assert cfg.server_key  == FAKE_SRVKEY
+        assert cfg.knock_key   == FAKE_KNOCK
+
+
+class TestKnockKeyConfigStore:
+
+    def test_save_and_load_knock(self):
+        d = MockDefaults()
+        config_store_save(d, "1.2.3.4", 443, knock_key_hex=FAKE_KNOCK)
+        loaded = config_store_load(d)
+        assert loaded.knock_key_hex == FAKE_KNOCK
+
+    def test_save_without_knock(self):
+        d = MockDefaults()
+        config_store_save(d, "1.2.3.4", 443)
+        loaded = config_store_load(d)
+        assert loaded.knock_key_hex is None
+
+    def test_apply_qr_with_knock(self):
+        d = MockDefaults()
+        cfg = ParsedConfig(host="1.2.3.4", port=443,
+                           private_key=None, server_key=None,
+                           dns="1.1.1.1", mtu=1420, knock_key=FAKE_KNOCK)
+        config_store_apply(d, cfg)
+        loaded = config_store_load(d)
+        assert loaded.knock_key_hex == FAKE_KNOCK
+
+    def test_clear_removes_knock(self):
+        d = MockDefaults()
+        config_store_save(d, "1.2.3.4", 443, knock_key_hex=FAKE_KNOCK)
+        config_store_clear(d)
+        assert config_store_load(d) is None
+
+
+# ===========================================================================
+# Tests — CTL_ASSIGN_DUAL parser (dual-stack IPv4+IPv6 assignment)
+#
+# Mirrors the Swift `VpnClient.parseCtlAssignDual` and Android
+# `VpnClient.parseCtlAssignDual` parsers. The wire format must match the
+# Go server byte-for-byte: 42 bytes after the type byte, layout
+#   ip4(4) + pfxLen4(1) + gw4(4) + ip6(16) + pfxLen6(1) + gw6(16).
+# ===========================================================================
+
+import ipaddress
+import struct
+
+CTL_ASSIGN      = 0x02
+CTL_ASSIGN_DUAL = 0x05
+CTL_ASSIGN_PAYLOAD_LEN      = 9
+CTL_ASSIGN_DUAL_PAYLOAD_LEN = 42
+
+
+@dataclass
+class RouteInfo:
+    assigned_ip: str
+    prefix_len: int
+    gateway: str
+    assigned_ip6: Optional[str] = None
+    prefix_len6: Optional[int] = None
+    gateway6: Optional[str] = None
+
+    @property
+    def is_dual_stack(self) -> bool:
+        return self.assigned_ip6 is not None
+
+
+def _ipv4_to_str(b: bytes) -> str:
+    return f"{b[0]}.{b[1]}.{b[2]}.{b[3]}"
+
+
+def _ipv6_to_str(b: bytes) -> str:
+    return str(ipaddress.IPv6Address(b))
+
+
+def parse_ctl_assign(payload: bytes) -> RouteInfo:
+    assert len(payload) == CTL_ASSIGN_PAYLOAD_LEN, \
+        f"ctlAssign payload must be {CTL_ASSIGN_PAYLOAD_LEN} bytes"
+    ip = _ipv4_to_str(payload[0:4])
+    pfx = payload[4]
+    gw = _ipv4_to_str(payload[5:9])
+    return RouteInfo(assigned_ip=ip, prefix_len=pfx, gateway=gw)
+
+
+def parse_ctl_assign_dual(payload: bytes) -> RouteInfo:
+    assert len(payload) == CTL_ASSIGN_DUAL_PAYLOAD_LEN, \
+        f"ctlAssignDual payload must be {CTL_ASSIGN_DUAL_PAYLOAD_LEN} bytes"
+    ip4 = _ipv4_to_str(payload[0:4])
+    pfx4 = payload[4]
+    gw4 = _ipv4_to_str(payload[5:9])
+    ip6 = _ipv6_to_str(payload[9:25])
+    pfx6 = payload[25]
+    gw6 = _ipv6_to_str(payload[26:42])
+    return RouteInfo(assigned_ip=ip4, prefix_len=pfx4, gateway=gw4,
+                     assigned_ip6=ip6, prefix_len6=pfx6, gateway6=gw6)
+
+
+class TestCtlAssign:
+    def test_parse_payload(self):
+        payload = bytes([10, 8, 0, 2, 24,    # 10.8.0.2/24
+                         10, 8, 0, 1])       # gw 10.8.0.1
+        r = parse_ctl_assign(payload)
+        assert r.assigned_ip == "10.8.0.2"
+        assert r.prefix_len == 24
+        assert r.gateway == "10.8.0.1"
+        assert not r.is_dual_stack
+
+
+class TestCtlAssignDual:
+    def test_parse_payload(self):
+        # 10.8.0.2/24 gw 10.8.0.1; fc00::2/120 gw fc00::1
+        ip4 = bytes([10, 8, 0, 2])
+        pfx4 = bytes([24])
+        gw4 = bytes([10, 8, 0, 1])
+        ip6 = ipaddress.IPv6Address("fc00::2").packed
+        pfx6 = bytes([120])
+        gw6 = ipaddress.IPv6Address("fc00::1").packed
+        payload = ip4 + pfx4 + gw4 + ip6 + pfx6 + gw6
+        assert len(payload) == 42
+        r = parse_ctl_assign_dual(payload)
+        assert r.assigned_ip  == "10.8.0.2"
+        assert r.prefix_len   == 24
+        assert r.gateway      == "10.8.0.1"
+        assert r.assigned_ip6 == "fc00::2"
+        assert r.prefix_len6  == 120
+        assert r.gateway6     == "fc00::1"
+        assert r.is_dual_stack
+
+    def test_wrong_length_rejected(self):
+        with pytest.raises(AssertionError):
+            parse_ctl_assign_dual(b"\x00" * 41)
+
+    def test_ipv6_compression(self):
+        """RFC 5952 compression: fc00:0:0:0:0:0:0:1 → fc00::1."""
+        ip6 = ipaddress.IPv6Address("fc00::1").packed
+        payload = (bytes([1, 2, 3, 4, 24, 1, 2, 3, 1])
+                   + ip6 + bytes([120]) + ip6)
+        r = parse_ctl_assign_dual(payload)
+        assert r.assigned_ip6 == "fc00::1"
+        assert r.gateway6     == "fc00::1"
+
+
+# ===========================================================================
+# Tests — HMAC-SHA256 knock signature (wire-compatible with Android/Go)
+# ===========================================================================
+
+import hmac
+import hashlib
+
+
+def compute_knock_session_id(knock_key: bytes, client_random: bytes) -> bytes:
+    """Mirrors Android `Mac.getInstance("HmacSHA256")` and Go relay verifier."""
+    return hmac.new(knock_key, client_random, hashlib.sha256).digest()
+
+
+class TestKnockHMAC:
+    def test_session_id_is_32_bytes(self):
+        key = b"\x01" * 32
+        random = b"\x02" * 32
+        sid = compute_knock_session_id(key, random)
+        assert len(sid) == 32
+
+    def test_deterministic(self):
+        key = b"\x01" * 32
+        random = b"\x02" * 32
+        a = compute_knock_session_id(key, random)
+        b = compute_knock_session_id(key, random)
+        assert a == b
+
+    def test_different_random_different_sid(self):
+        key = b"\x01" * 32
+        a = compute_knock_session_id(key, b"\x02" * 32)
+        b = compute_knock_session_id(key, b"\x03" * 32)
+        assert a != b
+
+    def test_different_key_different_sid(self):
+        random = b"\x02" * 32
+        a = compute_knock_session_id(b"\x01" * 32, random)
+        b = compute_knock_session_id(b"\x09" * 32, random)
+        assert a != b
+
+    def test_known_vector(self):
+        """Hard-coded vector — if this changes, Android/Go/iOS knock breaks."""
+        key = bytes.fromhex("00" * 32)
+        random = bytes.fromhex("00" * 32)
+        sid = compute_knock_session_id(key, random)
+        # Known HMAC-SHA256(zero32, zero32) value — wire-locked across
+        # iOS/Android/Go. If this changes, the relay will reject all
+        # connections from clients still using the old algorithm.
+        expected = "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"
+        assert sid.hex() == expected

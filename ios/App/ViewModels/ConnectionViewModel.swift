@@ -36,12 +36,14 @@ public final class ConnectionViewModel: ObservableObject {
     public func saveConfig(
         host: String, port: Int,
         privateKeyHex: String?, serverPublicKeyHex: String?,
+        knockKeyHex: String? = nil,
         dnsServer: String, mtu: Int
     ) {
         ConfigStore.save(
             host: host, port: port,
             privateKeyHex: privateKeyHex,
             serverPublicKeyHex: serverPublicKeyHex,
+            knockKeyHex: knockKeyHex,
             dnsServer: dnsServer, mtu: mtu
         )
         loadConfig()
@@ -120,6 +122,9 @@ public final class ConnectionViewModel: ObservableObject {
             ]
             if let pk = cfg.privateKeyHex    { settings["privateKeyHex"]      = pk }
             if let sk = cfg.serverPublicKeyHex { settings["serverPublicKeyHex"] = sk }
+            // Forward knock-key PSK so the tunnel extension can apply
+            // Reality-style port knocking inside the synthetic ClientHello.
+            if let kk = cfg.knockKeyHex      { settings["knockKeyHex"]       = kk }
             proto.providerConfiguration = settings
         }
         manager.protocolConfiguration = proto

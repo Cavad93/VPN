@@ -40,11 +40,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // Parse host:port from serverAddress
         let (host, port) = parseHostPort(serverAddr, defaultPort: 443)
 
+        // Read provider config — knockKeyHex is passed from the host app
+        // through NETunnelProviderProtocol.providerConfiguration so the
+        // extension can apply Reality-style port knocking inside ObfsConn.
         let config = VpnConfig(
             serverHost: host,
             serverPort: port,
             privateKeyHex:      proto.providerConfiguration?["privateKeyHex"] as? String,
             serverPublicKeyHex: proto.providerConfiguration?["serverPublicKeyHex"] as? String,
+            knockKeyHex:        proto.providerConfiguration?["knockKeyHex"]   as? String,
             dnsServer:          proto.providerConfiguration?["dnsServer"]     as? String ?? "1.1.1.1",
             mtu:               (proto.providerConfiguration?["mtu"]           as? Int)    ?? 1420
         )
@@ -126,6 +130,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         ipv4.excludedRoutes = excluded
         settings.ipv4Settings = ipv4
+
+        // IPv6 configuration (only when the server returned a dual-stack
+        // assignment via CTL_ASSIGN_DUAL — modern servers do this when
+        // configured with -tun6-cidr). Without this block iOS would not
+        // route any IPv6 traffic through the tunnel even though the
+        // server is willing to forward it.
+        if let ip6 = route.assignedIP6,
+           let pfx6 = route.prefixLen6 {
+            let ipv6 = NEIPv6Settings(
+                addresses: [ip6],
+                networkPrefixLengths: [NSNumber(value: pfx6)]
+            )
+            // Route all IPv6 traffic through the tunnel.
+            ipv6.includedRoutes = [NEIPv6Route.default()]
+            settings.ipv6Settings = ipv6
+        }
 
         // DNS — use the VPN gateway to prevent DNS leaks
         let dns = NEDNSSettings(servers: [config.dnsServer])

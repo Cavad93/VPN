@@ -13,6 +13,7 @@ struct SettingsView: View {
     @State private var portStr    = "443"
     @State private var privateKey = ""
     @State private var serverKey  = ""
+    @State private var knockKey   = ""
     @State private var dnsServer  = "1.1.1.1"
     @State private var mtuStr     = "1420"
 
@@ -65,6 +66,14 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Server Public Key (hex, optional)").font(.caption).foregroundStyle(.secondary)
                         TextField("64 hex characters", text: $serverKey)
+                            .font(.caption.monospaced())
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Knock Key (hex, optional — bypass DPI relays)")
+                            .font(.caption).foregroundStyle(.secondary)
+                        TextField("64 hex characters", text: $knockKey)
                             .font(.caption.monospaced())
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
@@ -126,6 +135,7 @@ struct SettingsView: View {
         portStr   = "\(cfg.port)"
         privateKey = cfg.privateKeyHex         ?? ""
         serverKey  = cfg.serverPublicKeyHex    ?? ""
+        knockKey   = cfg.knockKeyHex           ?? ""
         dnsServer  = cfg.dnsServer
         mtuStr     = "\(cfg.mtu)"
     }
@@ -138,6 +148,7 @@ struct SettingsView: View {
             port: port,
             privateKeyHex: privateKey.isEmpty ? nil : privateKey,
             serverPublicKeyHex: serverKey.isEmpty ? nil : serverKey,
+            knockKeyHex: knockKey.isEmpty ? nil : knockKey,
             dnsServer: dnsServer.isEmpty ? "1.1.1.1" : dnsServer,
             mtu: mtu
         )
