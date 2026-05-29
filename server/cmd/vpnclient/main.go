@@ -829,6 +829,14 @@ func run() error {
 				secWg.Add(1)
 				go func() {
 					defer secWg.Done()
+					// Stagger secondary connections by 80ms per index to avoid
+					// triggering per-IP rate limiters on the server or relay.
+					stagger := time.Duration(i-1) * 80 * time.Millisecond
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(stagger):
+					}
 					var sc *secondaryConn
 					var lastErr error
 					for attempt := 0; attempt < secondaryMaxRetries; attempt++ {
