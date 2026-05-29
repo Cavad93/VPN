@@ -11,6 +11,7 @@
 //   bytes 5..N  — payload
 
 import Foundation
+import Security
 import Crypto
 import CavadVPNCrypto
 
@@ -136,15 +137,28 @@ public final class ObfsConn {
     }
 
     private func readRecord(wantType: UInt8) throws -> Data {
-        let hdr = try readFully(obfsHeaderSize)
-        guard hdr[0] == wantType else {
-            throw ObfsError.unexpectedRecordType(got: hdr[0], want: wantType)
+        while true {
+            let hdr = try readFully(obfsHeaderSize)
+            let gotType = hdr[0]
+            // Skip ChangeCipherSpec records (TLS 1.3 middlebox compat, RFC 8446 §5.1).
+            // The Go server sends CCS immediately after ServerHello in one write;
+            // without this skip the first read() after handshake would throw.
+            if gotType == 0x14 {
+                let length = Int(hdr[3]) << 8 | Int(hdr[4])
+                if length > 0, length <= maxObfsPayload {
+                    _ = try readFully(length)
+                }
+                continue
+            }
+            guard gotType == wantType else {
+                throw ObfsError.unexpectedRecordType(got: gotType, want: wantType)
+            }
+            let length = Int(hdr[3]) << 8 | Int(hdr[4])
+            guard length > 0, length <= maxObfsPayload else {
+                throw ObfsError.invalidRecordLength(length)
+            }
+            return try readFully(length)
         }
-        let length = Int(hdr[3]) << 8 | Int(hdr[4])
-        guard length > 0, length <= maxObfsPayload else {
-            throw ObfsError.invalidRecordLength(length)
-        }
-        return try readFully(length)
     }
 
     private func readHandshakeRecord(wantMsgType: UInt8) throws {
@@ -155,49 +169,166 @@ public final class ObfsConn {
         }
     }
 
+    // MARK: - Chrome-120 ClientHello builder
+
+    // 16 GREASE pseudo-values (RFC 8701). Browsers insert these into cipher
+    // suite lists, extension type fields, and named group lists to prevent
+    // protocol ossification. TSPU uses JA3/JA4 fingerprinting to detect VPN
+    // clients; matching Chrome's GREASE pattern defeats it.
+    private let greaseTable: [UInt16] = [
+        0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A,
+        0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A,
+        0x8A8A, 0x9A9A, 0xAAAA, 0xBABA,
+        0xCACA, 0xDADA, 0xEAEA, 0xFAFA,
+    ]
+
+    private func pickGrease() -> UInt16 {
+        var b: UInt8 = 0
+        SecRandomCopyBytes(kSecRandomDefault, 1, &b)
+        return greaseTable[Int(b & 0x0F)]
+    }
+
+    private func u16(_ v: UInt16) -> [UInt8] { [UInt8(v >> 8), UInt8(v & 0xFF)] }
+
+    private func buildExt(_ type: UInt16, _ data: [UInt8] = []) -> [UInt8] {
+        u16(type) + u16(UInt16(data.count)) + data
+    }
+
+    private func buildSupportedGroupsExt(_ grease: UInt16) -> [UInt8] {
+        buildExt(0x000A, [0x00, 0x08] + u16(grease) + [0x00, 0x1D, 0x00, 0x17, 0x00, 0x18])
+    }
+
+    private func buildALPNExt() -> [UInt8] {
+        buildExt(0x0010, [
+            0x00, 0x0E,
+            0x00, 0x02, 0x68, 0x32,
+            0x00, 0x08, 0x68, 0x74, 0x74, 0x70, 0x2F, 0x31, 0x2E, 0x31,
+        ])
+    }
+
+    private func buildSigAlgsExt() -> [UInt8] {
+        buildExt(0x000D, [
+            0x00, 0x10,
+            0x04, 0x03, 0x08, 0x04, 0x04, 0x01,
+            0x05, 0x03, 0x08, 0x05, 0x05, 0x01,
+            0x08, 0x06, 0x06, 0x01,
+        ])
+    }
+
+    private func buildKeyShareExt(_ grease: UInt16) -> [UInt8] {
+        let x25519Key = Array(generateRandomData(count: 32))
+        var entries = u16(grease) + [0x00, 0x01, 0x00]
+        entries += [0x00, 0x1D, 0x00, 0x20] + x25519Key
+        return buildExt(0x0033, u16(UInt16(entries.count)) + entries)
+    }
+
+    private func buildSupportedVersionsClientExt(_ grease: UInt16) -> [UInt8] {
+        buildExt(0x002B, [0x06] + u16(grease) + [0x03, 0x04, 0x03, 0x03])
+    }
+
+    private func buildCompressCertExt() -> [UInt8] {
+        buildExt(0x001B, [0x02, 0x00, 0x02, 0x00, 0x01])
+    }
+
     // MARK: TLS record builders
 
+    /// Builds a Chrome-120-equivalent ClientHello.
+    ///
+    /// Record header uses 0x0301 (legacy TLS 1.0) — Chrome/Firefox/Safari behavior
+    /// per RFC 8446 §5.1. Using 0x0303 here is a known non-browser JA3 signal.
     private func buildClientHello() -> Data {
         let random = generateRandomData(count: 32)
-        // Reality-style port knocking: when knockKey is configured, the
-        // session_id field carries HMAC-SHA256(knockKey, random) so the
-        // relay can authenticate the client before forwarding. Without
-        // a knock key we fall back to a random session_id, which works
-        // unchanged against non-knock servers.
         let sessionId: Data
         if let key = knockKey {
-            let mac = HMAC<SHA256>.authenticationCode(
-                for: random,
-                using: SymmetricKey(data: key)
-            )
+            let mac = HMAC<SHA256>.authenticationCode(for: random, using: SymmetricKey(data: key))
             sessionId = Data(mac)
         } else {
             sessionId = generateRandomData(count: 32)
         }
 
-        var body = Data()
-        body.append(contentsOf: [0x03, 0x03])  // legacy_version = TLS 1.2
-        body.append(random)
-        body.append(0x20)                       // session_id length = 32
-        body.append(sessionId)
-        // cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256
-        body.append(contentsOf: [0x00, 0x06, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03])
-        body.append(contentsOf: [0x01, 0x00])  // compression_methods: length=1, null
+        let greaseCS  = pickGrease()
+        let greaseE1  = pickGrease()
+        let greaseE2  = pickGrease()
+        let greaseGrp = pickGrease()
+        let greaseVer = pickGrease()
+        let greaseKS  = pickGrease()
 
-        return wrapHandshakeRecord(msgType: tlsHelloClient, body: body)
+        var cipherSuites: [UInt8] = u16(greaseCS) + [
+            0x13, 0x01, 0x13, 0x02, 0x13, 0x03,
+            0xC0, 0x2B, 0xC0, 0x2F, 0xC0, 0x2C, 0xC0, 0x30,
+            0xCC, 0xA9, 0xCC, 0xA8,
+            0xC0, 0x13, 0xC0, 0x14,
+            0x00, 0x9C, 0x00, 0x9D,
+            0x00, 0x2F, 0x00, 0x35,
+        ]
+
+        var exts: [UInt8] = []
+        exts += buildExt(greaseE1, [0x00, 0x00])
+        exts += buildExt(0x0017)
+        exts += buildExt(0xFF01, [0x00])
+        exts += buildSupportedGroupsExt(greaseGrp)
+        exts += buildExt(0x000B, [0x01, 0x00])
+        exts += buildExt(0x0023)
+        exts += buildALPNExt()
+        exts += buildExt(0x0005, [0x01, 0x00, 0x00, 0x00, 0x00])
+        exts += buildSigAlgsExt()
+        exts += buildExt(0x0012)
+        exts += buildKeyShareExt(greaseKS)
+        exts += buildExt(0x002D, [0x01, 0x01])
+        exts += buildSupportedVersionsClientExt(greaseVer)
+        exts += buildCompressCertExt()
+        exts += buildExt(greaseE2, [0x00, 0x00])
+
+        var body = Data()
+        body.append(contentsOf: [0x03, 0x03])
+        body.append(random)
+        body.append(0x20)
+        body.append(sessionId)
+        body.append(contentsOf: u16(UInt16(cipherSuites.count)))
+        body.append(contentsOf: cipherSuites)
+        body.append(contentsOf: [0x01, 0x00])
+        body.append(contentsOf: u16(UInt16(exts.count)))
+        body.append(contentsOf: exts)
+
+        return wrapClientHelloRecord(body: body)
     }
 
     private func buildServerHello() -> Data {
-        let random = generateRandomData(count: 32)
+        let random      = generateRandomData(count: 32)
+        let sessionEcho = generateRandomData(count: 32)
+        let verExt: [UInt8] = buildExt(0x002B, [0x03, 0x04])
 
         var body = Data()
-        body.append(contentsOf: [0x03, 0x03])  // legacy_version = TLS 1.2
+        body.append(contentsOf: [0x03, 0x03])
         body.append(random)
-        body.append(0x00)                       // session_id length = 0
-        body.append(contentsOf: [0x13, 0x01])  // cipher_suite: TLS_AES_128_GCM_SHA256
-        body.append(0x00)                       // compression_method: null
+        body.append(0x20)
+        body.append(sessionEcho)
+        body.append(contentsOf: [0x13, 0x01])
+        body.append(0x00)
+        body.append(contentsOf: u16(UInt16(verExt.count)))
+        body.append(contentsOf: verExt)
 
         return wrapHandshakeRecord(msgType: tlsHelloServer, body: body)
+    }
+
+    /// ClientHello record uses legacy version 0x0301 (TLS 1.0), not 0x0303.
+    private func wrapClientHelloRecord(body: Data) -> Data {
+        let hsLen = body.count
+        var hs = Data()
+        hs.append(tlsHelloClient)
+        hs.append(UInt8((hsLen >> 16) & 0xFF))
+        hs.append(UInt8((hsLen >>  8) & 0xFF))
+        hs.append(UInt8( hsLen        & 0xFF))
+        hs.append(body)
+
+        var rec = Data()
+        rec.append(tlsHandshake)
+        rec.append(0x03)
+        rec.append(0x01)  // legacy TLS 1.0 record version (Chrome/Firefox/Safari)
+        rec.append(UInt8((hs.count >> 8) & 0xFF))
+        rec.append(UInt8( hs.count       & 0xFF))
+        rec.append(hs)
+        return rec
     }
 
     private func wrapHandshakeRecord(msgType: UInt8, body: Data) -> Data {
