@@ -125,9 +125,12 @@ func TestBuildClientHelloWithSNIFormat(t *testing.T) {
 	if hello[0] != tlsRecordHandshake {
 		t.Errorf("content type = %02x, want handshake %02x", hello[0], tlsRecordHandshake)
 	}
-	// Version field
-	if hello[1] != tlsVersionMajor || hello[2] != tlsVersionMinor {
-		t.Errorf("record version = %02x%02x", hello[1], hello[2])
+	// Record version must be 0x03 0x01 (legacy TLS 1.0). Chrome and all major
+	// browsers use this in the ClientHello record header for backwards
+	// compatibility (RFC 8446 §5.1). Using 0x03 0x03 here is a known
+	// non-browser JA3 fingerprint signal that DPI systems detect.
+	if hello[1] != 0x03 || hello[2] != 0x01 {
+		t.Errorf("record version = %02x%02x, want 0301 (legacy TLS 1.0 per Chrome)", hello[1], hello[2])
 	}
 	// First byte of handshake payload must be ClientHello type
 	if hello[ObfsHeaderSize] != tlsHelloClient {
